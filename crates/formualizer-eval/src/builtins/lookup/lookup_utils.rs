@@ -112,6 +112,10 @@ impl<'a> PreparedLookupMatcher<'a> {
                 let folded_candidate = candidate_text.to_lowercase();
                 compiled.matches_folded(&folded_candidate)
             }
+            // Excel: an empty-string needle also matches a blank cell.
+            (Some(PreparedTextMatcher::Exact { folded_needle }), LiteralValue::Empty) => {
+                folded_needle.is_empty()
+            }
             // Excel exact lookups never match a text needle against a
             // non-text candidate: "20" does not find the number 20.
             (Some(_), _) => false,
@@ -471,6 +475,11 @@ pub fn find_exact_index_in_view(
     match needle {
         LiteralValue::Number(n) => find_exact_number_in_view(view, *n, vertical),
         LiteralValue::Int(i) => find_exact_number_in_view(view, *i as f64, vertical),
+        // Excel: an empty-string needle matches the first blank cell (blank
+        // and "" are the same value class at the formula level).
+        LiteralValue::Text(s) if s.is_empty() && !wildcard => {
+            find_exact_empty_in_view(view, vertical)
+        }
         LiteralValue::Text(s) => find_exact_text_in_view(view, s, wildcard, vertical),
         LiteralValue::Boolean(b) => find_exact_boolean_in_view(view, *b, vertical),
         LiteralValue::Empty => find_exact_empty_in_view(view, vertical),

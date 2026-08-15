@@ -4,6 +4,7 @@
 //!   supplied argument: a no-match returns #N/A, never the slot's implicit 0.
 //! - Exact match never crosses value classes: a text needle does not find a
 //!   number, whichever search direction or storage path is used.
+//! - An empty-string needle matches the first blank cell.
 
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -99,5 +100,50 @@ fn xlookup_text_needle_does_not_coerce_to_number() {
     assert_eq!(
         engine.get_cell_value("Sheet1", 12, 1),
         Some(LiteralValue::Number(200.0))
+    );
+}
+
+#[test]
+fn xlookup_empty_string_needle_matches_blank_cell() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // B1 blank, B2/B3 text; C1:C3 = 7,8,9.
+    engine
+        .set_cell_value("Sheet1", 2, 2, LiteralValue::Text("x".into()))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 3, 2, LiteralValue::Text("y".into()))
+        .unwrap();
+    for (row, v) in [(1u32, 7.0), (2, 8.0), (3, 9.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 3, LiteralValue::Number(v))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            10,
+            1,
+            parse("=XLOOKUP(\"\",B1:B3,C1:C3)").unwrap(),
+        )
+        .unwrap();
+    // Control: text needles still match text cells.
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            11,
+            1,
+            parse("=XLOOKUP(\"x\",B1:B3,C1:C3)").unwrap(),
+        )
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 10, 1),
+        Some(LiteralValue::Number(7.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 11, 1),
+        Some(LiteralValue::Number(8.0))
     );
 }
