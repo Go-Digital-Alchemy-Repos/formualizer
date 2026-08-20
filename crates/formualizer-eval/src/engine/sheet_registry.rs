@@ -108,6 +108,25 @@ impl SheetRegistry {
         Some(a.abs_diff(b) + 1)
     }
 
+    /// Active sheet IDs in workbook tab order between two inclusive endpoints.
+    pub fn active_span_ids(&self, first: &str, last: &str) -> Option<Vec<SheetId>> {
+        let first_id = self.get_id(first)? as usize;
+        let last_id = self.get_id(last)? as usize;
+        let (start, end) = if first_id <= last_id {
+            (first_id, last_id)
+        } else {
+            (last_id, first_id)
+        };
+        Some(
+            self.name_by_id[start..=end]
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| !name.is_empty())
+                .map(|(offset, _)| (start + offset) as SheetId)
+                .collect(),
+        )
+    }
+
     /// Get all sheet IDs and names (excluding removed sheets)
     pub fn all_sheets(&self) -> Vec<(SheetId, String)> {
         self.name_by_id
@@ -199,5 +218,23 @@ mod tests {
         assert_eq!(reg.id_for("Config"), id);
         // Original casing is preserved for display.
         assert_eq!(reg.name(id), "CONFIG");
+    }
+
+    #[test]
+    fn active_span_ids_follow_nonlexical_tab_order_and_include_endpoints() {
+        let mut reg = SheetRegistry::new();
+        let zed = reg.id_for("Zed");
+        let mid = reg.id_for("Mid");
+        let alpha = reg.id_for("Alpha");
+        assert_eq!(
+            reg.active_span_ids("Zed", "Alpha"),
+            Some(vec![zed, mid, alpha])
+        );
+        assert_eq!(reg.active_span_ids("Mid", "Mid"), Some(vec![mid]));
+        assert_eq!(
+            reg.active_span_ids("Alpha", "Zed"),
+            Some(vec![zed, mid, alpha])
+        );
+        assert_eq!(reg.active_span_ids("Zed", "Missing"), None);
     }
 }

@@ -693,10 +693,17 @@ impl<'a> Interpreter<'a> {
                     };
                 }
 
-                let left_calc = self.evaluate_arena_ast(*left_id, data_store, sheet_registry)?;
+                let evaluate_operand = |node_id| {
+                    match self.evaluate_arena_ast(node_id, data_store, sheet_registry) {
+                        Ok(value) => Ok(value),
+                        Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+                        Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+                    }
+                };
+                let left_calc = evaluate_operand(*left_id)?;
                 let left_format = left_calc.format_id();
                 let left = left_calc.into_literal();
-                let right_calc = self.evaluate_arena_ast(*right_id, data_store, sheet_registry)?;
+                let right_calc = evaluate_operand(*right_id)?;
                 let right_format = right_calc.format_id();
                 let right = right_calc.into_literal();
 
@@ -1208,10 +1215,15 @@ impl<'a> Interpreter<'a> {
         left_node: &ASTNode,
         right_node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        let left_calc = self.evaluate_ast(left_node)?;
+        let evaluate_operand = |node| match self.evaluate_ast(node) {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+        };
+        let left_calc = evaluate_operand(left_node)?;
         let left_format = left_calc.format_id();
         let left = left_calc.into_literal();
-        let right_calc = self.evaluate_ast(right_node)?;
+        let right_calc = evaluate_operand(right_node)?;
         let right_format = right_calc.format_id();
         let right = right_calc.into_literal();
         if matches!(op, "=" | "<>" | ">" | "<" | ">=" | "<=") {

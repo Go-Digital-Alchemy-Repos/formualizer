@@ -225,7 +225,14 @@ fn collect_plan_reference(
             *context.flags |= F_HAS_TABLES;
             context.per_tables.push(table.name.clone());
         }
-        SemanticReference::ThreeDimensional(_) | SemanticReference::Unsupported(_) => {}
+        SemanticReference::ThreeDimensional(reference) => {
+            let expanded =
+                crate::engine::refs::expand_three_dimensional(reference, context.sheet_reg)?;
+            for reference in &expanded {
+                collect_plan_reference(context, crate::engine::refs::classify(reference))?;
+            }
+        }
+        SemanticReference::Unsupported(_) => {}
     }
     Ok(())
 }

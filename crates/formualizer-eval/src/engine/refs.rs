@@ -147,6 +147,71 @@ pub(crate) fn classify(reference: &ReferenceType) -> SemanticReference<'_> {
     }
 }
 
+pub(crate) fn expand_three_dimensional(
+    reference: &ReferenceType,
+    sheet_registry: &SheetRegistry,
+) -> Result<Vec<ReferenceType>, ExcelError> {
+    let (first, last) = match reference {
+        ReferenceType::Cell3D {
+            sheet_first,
+            sheet_last,
+            ..
+        }
+        | ReferenceType::Range3D {
+            sheet_first,
+            sheet_last,
+            ..
+        } => (sheet_first, sheet_last),
+        _ => return Ok(vec![reference.clone()]),
+    };
+    let sheet_ids = sheet_registry
+        .active_span_ids(first, last)
+        .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+    Ok(sheet_ids
+        .into_iter()
+        .map(|sheet_id| {
+            let sheet = Some(sheet_registry.name(sheet_id).to_string());
+            match reference {
+                ReferenceType::Cell3D {
+                    row,
+                    col,
+                    row_abs,
+                    col_abs,
+                    ..
+                } => ReferenceType::Cell {
+                    sheet,
+                    row: *row,
+                    col: *col,
+                    row_abs: *row_abs,
+                    col_abs: *col_abs,
+                },
+                ReferenceType::Range3D {
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    start_row_abs,
+                    start_col_abs,
+                    end_row_abs,
+                    end_col_abs,
+                    ..
+                } => ReferenceType::Range {
+                    sheet,
+                    start_row: *start_row,
+                    start_col: *start_col,
+                    end_row: *end_row,
+                    end_col: *end_col,
+                    start_row_abs: *start_row_abs,
+                    start_col_abs: *start_col_abs,
+                    end_row_abs: *end_row_abs,
+                    end_col_abs: *end_col_abs,
+                },
+                _ => unreachable!(),
+            }
+        })
+        .collect())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LocalBindingStyle {
     #[default]

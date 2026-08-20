@@ -496,7 +496,19 @@ impl<'a> IngestPipeline<'a> {
                         .with_message(format!("Undefined table: {}", tref.name)))
                 }
             }
-            SemanticReference::ThreeDimensional(_) | SemanticReference::Unsupported(_) => Ok(()),
+            SemanticReference::ThreeDimensional(reference) => {
+                let expanded =
+                    crate::engine::refs::expand_three_dimensional(reference, self.sheet_registry)?;
+                for reference in &expanded {
+                    self.collect_reference(
+                        crate::engine::refs::classify(reference),
+                        current_sheet_id,
+                        plan,
+                    )?;
+                }
+                Ok(())
+            }
+            SemanticReference::Unsupported(_) => Ok(()),
         }
     }
 
@@ -2104,7 +2116,20 @@ mod tests {
                             .with_message(format!("Undefined table: {}", tref.name)))
                     }
                 }
-                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => Ok(()),
+                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => {
+                    let expanded = crate::engine::refs::expand_three_dimensional(
+                        reference,
+                        self.sheet_registry,
+                    )?;
+                    for reference in &expanded {
+                        self.collect_reference(
+                            crate::engine::refs::classify(reference),
+                            current_sheet_id,
+                            plan,
+                        )?;
+                    }
+                    Ok(())
+                }
             }
         }
     }

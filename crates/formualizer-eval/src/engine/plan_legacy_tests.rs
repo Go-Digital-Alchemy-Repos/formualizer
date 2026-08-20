@@ -11,6 +11,48 @@ use formualizer_common::{Coord as AbsCoord, CoordBuildHasher, ExcelError, Packed
 use formualizer_parse::parser::{CollectPolicy, ReferenceType};
 use std::collections::HashMap;
 
+fn legacy_expand_reference(
+    reference: &ReferenceType,
+    sheet_reg: &SheetRegistry,
+    policy: &CollectPolicy,
+) -> Result<Vec<ReferenceType>, ExcelError> {
+    let expanded = crate::engine::refs::expand_three_dimensional(reference, sheet_reg)?;
+    let mut out = Vec::new();
+    for reference in expanded {
+        if let ReferenceType::Range {
+            sheet,
+            start_row: Some(start_row),
+            start_col: Some(start_col),
+            end_row: Some(end_row),
+            end_col: Some(end_col),
+            start_row_abs,
+            start_col_abs,
+            end_row_abs,
+            end_col_abs,
+        } = &reference
+            && policy.expand_small_ranges
+            && u64::from(end_row.saturating_sub(*start_row).saturating_add(1))
+                * u64::from(end_col.saturating_sub(*start_col).saturating_add(1))
+                <= policy.range_expansion_limit as u64
+        {
+            for row in *start_row..=*end_row {
+                for col in *start_col..=*end_col {
+                    out.push(ReferenceType::Cell {
+                        sheet: sheet.clone(),
+                        row,
+                        col,
+                        row_abs: *start_row_abs && *end_row_abs,
+                        col_abs: *start_col_abs && *end_col_abs,
+                    });
+                }
+            }
+        } else {
+            out.push(reference);
+        }
+    }
+    Ok(out)
+}
+
 fn legacy_collect_references_arena(
     data_store: &DataStore,
     ast_id: AstNodeId,
@@ -171,7 +213,10 @@ where
         let mut per_tables: Vec<String> = Vec::new();
 
         // Collect references using core collector (may expand small ranges per policy)
-        let refs = ast.collect_references(policy);
+        let mut refs = Vec::new();
+        for reference in ast.collect_references(policy) {
+            refs.extend(legacy_expand_reference(&reference, sheet_reg, policy)?);
+        }
         for r in refs {
             match r {
                 ReferenceType::Cell {
@@ -257,10 +302,7 @@ where
                     flags |= F_HAS_TABLES;
                     per_tables.push(tref.name);
                 }
-                // 3D refs are parsed but not yet planned. They neither create
-                // dependencies nor participate in the cell/range plan; the
-                // evaluator will surface #N/IMPL! when one is encountered.
-                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => {}
+                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => unreachable!(),
             }
         }
 
@@ -327,12 +369,16 @@ where
         let mut per_names: Vec<String> = Vec::new();
         let mut per_tables: Vec<String> = Vec::new();
 
-        let refs = match ast {
+        let raw_refs = match ast {
             DependencyPlanAst::Tree(ast) => ast.collect_references(policy).into_iter().collect(),
             DependencyPlanAst::Arena(ast_id) => {
                 legacy_collect_references_arena(data_store, ast_id, sheet_reg, policy)?
             }
         };
+        let mut refs = Vec::new();
+        for reference in raw_refs {
+            refs.extend(legacy_expand_reference(&reference, sheet_reg, policy)?);
+        }
         for r in refs {
             match r {
                 ReferenceType::Cell {
@@ -417,7 +463,7 @@ where
                     flags |= F_HAS_TABLES;
                     per_tables.push(tref.name);
                 }
-                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => {}
+                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => unreachable!(),
             }
         }
 

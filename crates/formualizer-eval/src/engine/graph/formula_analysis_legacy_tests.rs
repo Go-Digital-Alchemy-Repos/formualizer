@@ -253,11 +253,30 @@ impl DependencyGraph {
                             .with_message(format!("Undefined table: {}", tref.name)));
                     }
                 }
-                // 3D references parse correctly but aren't yet wired through
-                // the dependency graph; treat them as no-op dependencies for
-                // now so formulas containing them still load. Evaluation will
-                // surface #N/IMPL! via the Resolver path.
-                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => {}
+                reference @ (ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. }) => {
+                    let expanded =
+                        crate::engine::refs::expand_three_dimensional(reference, self.sheet_reg())?;
+                    for reference in expanded {
+                        let node = ASTNode::new(
+                            ASTNodeType::Reference {
+                                original: String::new(),
+                                reference,
+                            },
+                            None,
+                        );
+                        self.legacy_extract_dependencies_recursive(
+                            &node,
+                            current_sheet_id,
+                            dependencies,
+                            range_dependencies,
+                            created_placeholders,
+                            named_dependencies,
+                            unresolved_names,
+                            local_scopes,
+                            unresolved_name_policy,
+                        )?;
+                    }
+                }
             },
             ASTNodeType::BinaryOp { left, right, .. } => {
                 self.legacy_extract_dependencies_recursive(

@@ -23596,7 +23596,22 @@ where
 }
 
 // The Engine is a Resolver because it implements the constituent traits.
-impl<R> crate::traits::Resolver for Engine<R> where R: EvaluationContext {}
+impl<R> crate::traits::Resolver for Engine<R>
+where
+    R: EvaluationContext,
+{
+    fn resolve_sheet_span(&self, first: &str, last: &str) -> Result<Vec<String>, ExcelError> {
+        let ids = self
+            .graph
+            .sheet_reg()
+            .active_span_ids(first, last)
+            .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+        Ok(ids
+            .into_iter()
+            .map(|id| self.graph.sheet_name(id).to_string())
+            .collect())
+    }
+}
 
 // The Engine provides functions by delegating to its internal resolver.
 impl<R> crate::traits::FunctionProvider for Engine<R>
@@ -24434,9 +24449,73 @@ where
                 let owned = boxed.materialise().into_owned();
                 Ok(RangeView::from_owned_rows(owned, self.config.date_system))
             }
-            ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => {
-                Err(ExcelError::new(ExcelErrorKind::NImpl)
-                    .with_message("3D references are not yet supported".to_string()))
+            ReferenceType::Cell3D {
+                sheet_first,
+                sheet_last,
+                row,
+                col,
+                row_abs,
+                col_abs,
+            } => {
+                let sheet_ids = self
+                    .graph
+                    .sheet_reg()
+                    .active_span_ids(sheet_first, sheet_last)
+                    .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+                let mut rows = Vec::with_capacity(sheet_ids.len());
+                for sheet_id in sheet_ids {
+                    let reference = ReferenceType::Cell {
+                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
+                        row: *row,
+                        col: *col,
+                        row_abs: *row_abs,
+                        col_abs: *col_abs,
+                    };
+                    let view = self.resolve_range_view(&reference, current_sheet)?;
+                    view.for_each_row(&mut |row| {
+                        rows.push(row.to_vec());
+                        Ok(())
+                    })?;
+                }
+                Ok(RangeView::from_owned_rows(rows, self.config.date_system))
+            }
+            ReferenceType::Range3D {
+                sheet_first,
+                sheet_last,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                start_row_abs,
+                start_col_abs,
+                end_row_abs,
+                end_col_abs,
+            } => {
+                let sheet_ids = self
+                    .graph
+                    .sheet_reg()
+                    .active_span_ids(sheet_first, sheet_last)
+                    .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+                let mut rows = Vec::new();
+                for sheet_id in sheet_ids {
+                    let reference = ReferenceType::Range {
+                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
+                        start_row: *start_row,
+                        start_col: *start_col,
+                        end_row: *end_row,
+                        end_col: *end_col,
+                        start_row_abs: *start_row_abs,
+                        start_col_abs: *start_col_abs,
+                        end_row_abs: *end_row_abs,
+                        end_col_abs: *end_col_abs,
+                    };
+                    let view = self.resolve_range_view(&reference, current_sheet)?;
+                    view.for_each_row(&mut |row| {
+                        rows.push(row.to_vec());
+                        Ok(())
+                    })?;
+                }
+                Ok(RangeView::from_owned_rows(rows, self.config.date_system))
             }
         }
     }

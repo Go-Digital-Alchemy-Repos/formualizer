@@ -1439,6 +1439,12 @@ pub trait SourceResolver: Send + Sync {
 }
 
 pub trait Resolver: ReferenceResolver + RangeResolver + NamedRangeResolver + TableResolver {
+    /// Sheet names in workbook tab order between two inclusive 3-D endpoints.
+    fn resolve_sheet_span(&self, _first: &str, _last: &str) -> Result<Vec<String>, ExcelError> {
+        Err(ExcelError::new(ExcelErrorKind::Ref)
+            .with_message("3D reference endpoint is unavailable".to_string()))
+    }
+
     fn resolve_range_like(&self, r: &ReferenceType) -> Result<Box<dyn Range>, ExcelError> {
         match r {
             ReferenceType::Range {
@@ -1587,9 +1593,44 @@ pub trait Resolver: ReferenceResolver + RangeResolver + NamedRangeResolver + Tab
                 let v = self.resolve_cell_reference(sheet.as_deref(), *row, *col)?;
                 Ok(Box::new(InMemoryRange::new(vec![vec![v]])))
             }
-            ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. } => {
-                Err(ExcelError::new(ExcelErrorKind::NImpl)
-                    .with_message("3D references are not yet supported".to_string()))
+            ReferenceType::Cell3D {
+                sheet_first,
+                sheet_last,
+                row,
+                col,
+                ..
+            } => {
+                let mut rows = Vec::new();
+                for sheet in self.resolve_sheet_span(sheet_first, sheet_last)? {
+                    rows.push(vec![self.resolve_cell_reference(
+                        Some(&sheet),
+                        *row,
+                        *col,
+                    )?]);
+                }
+                Ok(Box::new(InMemoryRange::new(rows)))
+            }
+            ReferenceType::Range3D {
+                sheet_first,
+                sheet_last,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            } => {
+                let mut rows = Vec::new();
+                for sheet in self.resolve_sheet_span(sheet_first, sheet_last)? {
+                    let range = self.resolve_range_reference(
+                        Some(&sheet),
+                        *start_row,
+                        *start_col,
+                        *end_row,
+                        *end_col,
+                    )?;
+                    rows.extend(range.iter_rows());
+                }
+                Ok(Box::new(InMemoryRange::new(rows)))
             }
         }
     }

@@ -198,7 +198,17 @@ fn collect_graph_reference(
             }
             Ok(())
         }
-        SemanticReference::ThreeDimensional(_) | SemanticReference::Unsupported(_) => Ok(()),
+        SemanticReference::ThreeDimensional(reference) => {
+            let expanded = crate::engine::refs::expand_three_dimensional(
+                reference,
+                context.graph.sheet_reg(),
+            )?;
+            for reference in &expanded {
+                collect_graph_reference(context, crate::engine::refs::classify(reference))?;
+            }
+            Ok(())
+        }
+        SemanticReference::Unsupported(_) => Ok(()),
     }
 }
 impl DependencyGraph {

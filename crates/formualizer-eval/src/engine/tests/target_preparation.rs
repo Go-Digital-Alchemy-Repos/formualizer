@@ -313,7 +313,7 @@ fn package_fallback_table_reference_discovers_the_same_staged_closure_as_ordinar
 }
 
 #[test]
-fn package_fallback_opaque_3d_reference_widens_and_matches_prepare_all_error() {
+fn package_fallback_opaque_3d_reference_widens_and_matches_prepare_all_result() {
     let setup = || {
         let mut engine = engine(FormulaPlaneMode::Off);
         engine.stage_formula_text("Inputs", 9, 9, "=99".into());
@@ -341,7 +341,7 @@ fn package_fallback_opaque_3d_reference_widens_and_matches_prepare_all_error() {
         target.evaluate_cell("Outputs", 1, 1).unwrap(),
         oracle.evaluate_cell("Outputs", 1, 1).unwrap()
     );
-    assert!(matches!(
+    assert!(!matches!(
         target.evaluate_cell("Outputs", 1, 1).unwrap(),
         Some(LiteralValue::Error(ref error))
             if error.kind == formualizer_common::ExcelErrorKind::NImpl
