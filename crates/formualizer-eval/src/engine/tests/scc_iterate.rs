@@ -157,6 +157,47 @@ fn self_reference_ingest_is_accepted_only_under_iterate() {
     assert_eq!(err.kind, ExcelErrorKind::Circ);
 }
 
+#[test]
+fn saved_formula_values_seed_first_iterative_pass() {
+    let mut engine = iterate_engine(100, 0.001);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+C1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1*0.4");
+    set_formula(&mut engine, "Sheet1", 1, 3, "=A1*0.6");
+    engine
+        .seed_saved_formula_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    engine
+        .seed_saved_formula_value("Sheet1", 1, 2, LiteralValue::Number(4.0))
+        .unwrap();
+    engine
+        .seed_saved_formula_value("Sheet1", 1, 3, LiteralValue::Number(6.0))
+        .unwrap();
+
+    let result = engine.evaluate_all().expect("evaluate_all");
+    assert_eq!(result.cycle_errors, 0);
+    assert!((num(&engine, "Sheet1", 1, 1) - 10.0).abs() < 0.001);
+    assert!((num(&engine, "Sheet1", 1, 2) - 4.0).abs() < 0.001);
+    assert!((num(&engine, "Sheet1", 1, 3) - 6.0).abs() < 0.001);
+}
+
+#[test]
+fn formula_edit_before_first_recalc_invalidates_saved_seed() {
+    let mut engine = iterate_engine(100, 0.001);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+C1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1*0.4");
+    set_formula(&mut engine, "Sheet1", 1, 3, "=A1*0.6");
+    engine
+        .seed_saved_formula_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+
+    // Replace the loaded formula before its first recalc. The replacement is
+    // a self-reference that adds one per pass. A stale seed would finish at
+    // 110; invalidation makes the normal Empty-to-zero start finish at 100.
+    set_formula(&mut engine, "Sheet1", 1, 1, "=A1+1");
+    engine.evaluate_all().expect("evaluate_all");
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 100.0);
+}
+
 /* ───────────────────────── §7.1 self-reference ───────────────────────── */
 
 #[test]

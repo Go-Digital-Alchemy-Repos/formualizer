@@ -1046,18 +1046,27 @@ pub struct WorkbookConfig {
 
 impl WorkbookConfig {
     pub fn ephemeral() -> Self {
+        let mut eval = formualizer_eval::engine::EvalConfig::default();
+        eval.cycle = formualizer_eval::engine::CycleConfig {
+            detection: formualizer_eval::engine::CycleDetection::Runtime,
+            policy: formualizer_eval::engine::CyclePolicy::Error,
+        };
         Self {
-            eval: formualizer_eval::engine::EvalConfig::default(),
+            eval,
             enable_changelog: false,
             ingest_limits: formualizer_eval::engine::WorkbookLoadLimits::default(),
         }
     }
 
     pub fn interactive() -> Self {
-        let eval = formualizer_eval::engine::EvalConfig {
+        let mut eval = formualizer_eval::engine::EvalConfig {
             defer_graph_building: true,
             formula_parse_policy: formualizer_eval::engine::FormulaParsePolicy::CoerceToError,
             ..Default::default()
+        };
+        eval.cycle = formualizer_eval::engine::CycleConfig {
+            detection: formualizer_eval::engine::CycleDetection::Runtime,
+            policy: formualizer_eval::engine::CyclePolicy::Error,
         };
         Self {
             eval,

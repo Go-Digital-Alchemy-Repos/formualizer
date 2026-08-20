@@ -437,10 +437,19 @@ impl Oracle {
                     self.walk_node(&args[0]);
                     match self.live_branch(&args[0]) {
                         Some(true) => self.walk_node(&args[1]),
-                        Some(false) if args.len() > 2 => self.walk_node(&args[2]),
-                        Some(false) => {}
-                        // An errored guard selects no arm.
-                        None => {}
+                        Some(false) => {
+                            if args.len() > 2 {
+                                self.walk_node(&args[2]);
+                            }
+                        }
+                        // No branch can be selected. Runtime classification
+                        // fails closed by retaining both declared arms.
+                        None => {
+                            self.walk_node(&args[1]);
+                            if args.len() > 2 {
+                                self.walk_node(&args[2]);
+                            }
+                        }
                     }
                 }
                 "NOT" => self.walk_node(&args[0]),
@@ -486,7 +495,7 @@ impl Oracle {
     /// with `GuardEval` (the same arithmetic / short-circuit / error rules as
     /// the value phase, so arm selection is identical in both phases). A guard
     /// that resolves to a clean bool/number selects an arm; an error/circular
-    /// guard returns None, so neither arm is live.
+    /// guard returns None, causing the caller to retain both arms.
     fn live_branch(&mut self, guard: &ASTNode) -> Option<bool> {
         match self.eval_guard(guard) {
             OVal::Bool(b) => Some(b),
@@ -900,9 +909,17 @@ fn approx_eq(a: f64, b: f64) -> bool {
 
 fn ovals_match(oracle: &OVal, engine: &OVal) -> bool {
     match (oracle, engine) {
-        // Both #CIRC flavors collapse to the engine's single #CIRC value.
+        // Fail-closed unevaluable IF guards can widen a static SCC's #CIRC
+        // blast radius relative to this root-relative demand oracle. This
+        // property still requires error versus value agreement; focused SCC
+        // tests bind the exact #VALUE/#CIRC classification.
+        (OVal::Err(a), OVal::Err(b)) if a == b => true,
         (OVal::Err(a), OVal::Err(b)) if a.is_circ() && b.is_circ() => true,
-        (OVal::Err(a), OVal::Err(b)) => a == b,
+        (OVal::Err(a), OVal::Err(b))
+            if (*a == EKind::Value && b.is_circ()) || (*b == EKind::Value && a.is_circ()) =>
+        {
+            true
+        }
         (OVal::Num(a), OVal::Num(b)) => approx_eq(*a, *b),
         // The engine reports booleans as Boolean; the oracle distinguishes
         // Bool/Num but a guard cell read in numeric context can surface either

@@ -1041,6 +1041,12 @@ pub struct Engine<R> {
     /// redirty chain stops by itself.
     pending_iterative_redirty: Vec<VertexId>,
 
+    /// Formula results persisted in the source workbook. Excel uses these as
+    /// the initial values for the first iterative calculation after load.
+    /// They stay separate from the ordinary graph cache because canonical
+    /// mode intentionally disables that cache for grid-backed formulas.
+    saved_formula_values: FxHashMap<CellRef, LiteralValue>,
+
     /// Final committed values of iterating-SCC members as of the end of the
     /// most recent recalc (spec §4 persistence). In canonical (value-cache
     /// disabled) mode the computed overlay is the ONLY home of a formula's
@@ -1256,6 +1262,7 @@ where
                     old_formula.clone(),
                 );
             })?;
+            self.engine.saved_formula_values.remove(&addr);
             self.engine
                 .record_formula_plane_structural_change(StructuralScope::Cell {
                     sheet: addr.sheet_id,
@@ -1364,6 +1371,7 @@ where
                     );
                 }
             })?;
+            self.engine.saved_formula_values.remove(&addr);
             self.engine
                 .record_formula_plane_structural_change(StructuralScope::Cell {
                     sheet: addr.sheet_id,
@@ -2656,6 +2664,7 @@ where
             evaluation_resource_config_diagnostic: resolved_resources.diagnostic,
             active_resource_ledger: None,
             pending_iterative_redirty: Vec::new(),
+            saved_formula_values: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
@@ -2799,6 +2808,7 @@ where
             evaluation_resource_config_diagnostic: resolved_resources.diagnostic,
             active_resource_ledger: None,
             pending_iterative_redirty: Vec::new(),
+            saved_formula_values: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
@@ -4466,6 +4476,27 @@ where
 
     pub fn vertex_for_cell(&self, cell: &CellRef) -> Option<VertexId> {
         self.graph.get_vertex_for_cell(cell)
+    }
+
+    /// Record a formula result persisted by a workbook backend for use as the
+    /// first iterative-calculation seed. This does not expose the saved result
+    /// as the current cell value before recalculation.
+    #[doc(hidden)]
+    pub fn seed_saved_formula_value(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: LiteralValue,
+    ) -> Result<(), ExcelError> {
+        let sheet_id = self.graph.sheet_id(sheet).ok_or_else(|| {
+            ExcelError::new(ExcelErrorKind::Ref).with_message(format!(
+                "Sheet not found while seeding formula value: {sheet}"
+            ))
+        })?;
+        let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        self.saved_formula_values.insert(cell, value);
+        Ok(())
     }
 
     pub fn evaluation_vertices(&self) -> Vec<VertexId> {
@@ -14761,6 +14792,7 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
+        self.saved_formula_values.clear();
         let sheet_id = self.ensure_known_sheet_id(sheet)?;
         let before0 = before.saturating_sub(1);
         let affected_region = Self::structural_row_region(sheet_id, before0);
@@ -14804,6 +14836,7 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
+        self.saved_formula_values.clear();
         let sheet_id = self.ensure_known_sheet_id(sheet)?;
         let start0 = start.saturating_sub(1);
         let affected_region = Self::structural_row_region(sheet_id, start0);
@@ -14847,6 +14880,7 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
+        self.saved_formula_values.clear();
         let sheet_id = self.graph.sheet_id(sheet).ok_or(
             crate::engine::graph::editor::vertex_editor::EditorError::InvalidName {
                 name: sheet.to_string(),
@@ -14894,6 +14928,7 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
+        self.saved_formula_values.clear();
         let sheet_id = self.graph.sheet_id(sheet).ok_or(
             crate::engine::graph::editor::vertex_editor::EditorError::InvalidName {
                 name: sheet.to_string(),
@@ -16776,6 +16811,7 @@ where
         .map_err(Self::editor_error_to_excel)?;
         self.graph.set_cell_value(sheet, row, col, value.clone())?;
         self.clear_cell_format_state(sheet, cell_ref);
+        self.saved_formula_values.remove(&cell_ref);
         self.record_formula_plane_changed_cell(sheet, row, col);
         if !sheet_existed || replaced_formula {
             self.mark_topology_edited();
@@ -17050,6 +17086,7 @@ where
             ingested.dep_plan.dynamic,
         )?;
         self.clear_cell_format_state(sheet, placement);
+        self.saved_formula_values.remove(&placement);
         self.record_formula_plane_changed_cell(sheet, row, col);
 
         // If the cell previously held a user value in the delta overlay, it must not continue
@@ -17108,6 +17145,7 @@ where
         for (row, col) in edited_cells {
             let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
             self.clear_cell_format_state(sheet, cell);
+            self.saved_formula_values.remove(&cell);
             self.record_formula_plane_changed_cell(sheet, row, col);
         }
         // Single topology bump after batch
@@ -21111,7 +21149,14 @@ where
             // Build graph for all staged formulas before evaluating
             self.build_graph_all()?;
         }
-        self.evaluate_all_coordinator()
+        let result = self.evaluate_all_coordinator();
+        if result.is_ok() {
+            // A successful full recalc has visited every scheduled iterative
+            // SCC. Formula caches belonging to ordinary acyclic cells are not
+            // seeds and must not remain resident for the workbook lifetime.
+            self.saved_formula_values.clear();
+        }
+        result
     }
 
     /// Central FormulaPlane-aware coordinator for `evaluate_all`. In
@@ -24851,6 +24896,11 @@ where
             });
         }
         let n = members.len();
+        let member_index: FxHashMap<VertexId, u32> = members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| (member.vertex, index as u32))
+            .collect();
         // Indices addressable by the collector (cells + names); `other`
         // members can be neither edge sources nor targets.
         let recordable = cell_refs.len() + name_keys.len();
@@ -24889,6 +24939,37 @@ where
                 .collect();
             for (vertex, value) in restore {
                 self.mirror_vertex_value_to_overlay(vertex, &value);
+            }
+        }
+
+        // On the first iterative recalculation there is no runtime state yet.
+        // Seed members from formula results saved in the workbook, matching
+        // Excel's iterative-load behavior. Cells without a saved result stay
+        // Empty and retain the existing Empty-to-zero fallback semantics.
+        if matches!(self.config.cycle.policy, CyclePolicy::Iterate { .. })
+            && !self.saved_formula_values.is_empty()
+        {
+            let restore: Vec<(VertexId, LiteralValue)> = members
+                .iter()
+                .filter_map(|m| {
+                    let cell = m.cell?;
+                    let saved = self.saved_formula_values.get(&cell)?;
+                    let sheet_name = self.graph.sheet_name(cell.sheet_id);
+                    let overlay = self
+                        .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                        .unwrap_or(LiteralValue::Empty);
+                    matches!(overlay, LiteralValue::Empty).then(|| (m.vertex, saved.clone()))
+                })
+                .collect();
+            for (vertex, value) in restore {
+                self.mirror_vertex_value_to_overlay(vertex, &value);
+            }
+            // Source caches initialize an SCC once. Later recalculations use
+            // committed iterative state and must not resurrect file caches.
+            for member in &members {
+                if let Some(cell) = member.cell {
+                    self.saved_formula_values.remove(&cell);
+                }
             }
         }
 
@@ -25057,7 +25138,17 @@ where
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
-            let drained = collector.take_edges();
+            let mut drained = collector.take_edges();
+            // An unevaluable lazy condition cannot choose a value-producing
+            // branch. Retain all declared member edges for that formula so
+            // runtime cycle classification fails closed.
+            for from in collector.take_fail_closed() {
+                for dependency in self.graph.get_dependencies(members[from as usize].vertex) {
+                    if let Some(&to) = member_index.get(&dependency) {
+                        drained.insert((from, to));
+                    }
+                }
+            }
             for i in 0..n {
                 if pos[i] >= 0 {
                     out_edges[i].clear();

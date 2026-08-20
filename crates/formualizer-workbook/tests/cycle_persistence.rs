@@ -59,6 +59,27 @@ fn json_with_self_reference() -> Vec<u8> {
     adapter.save_to_bytes().unwrap()
 }
 
+fn json_with_inactive_if_self_reference() -> Vec<u8> {
+    let mut adapter = JsonAdapter::new();
+    adapter.create_sheet("Sheet1").unwrap();
+    adapter
+        .write_cell("Sheet1", 1, 1, CellData::from_formula("=IF(FALSE,A1,7)"))
+        .unwrap();
+    adapter.save_to_bytes().unwrap()
+}
+
+#[test]
+fn workbook_defaults_ignore_inactive_if_self_reference() {
+    for config in [WorkbookConfig::ephemeral(), WorkbookConfig::interactive()] {
+        let adapter = JsonAdapter::open_bytes(json_with_inactive_if_self_reference()).unwrap();
+        let mut wb = Workbook::from_reader(adapter, LoadStrategy::EagerAll, config).unwrap();
+
+        wb.evaluate_all().unwrap();
+
+        assert_eq!(num(&wb, "Sheet1", 1, 1), 7.0);
+    }
+}
+
 /* ──────────────── direction 1: iterate workbook → default reload ─────────── */
 
 /// A workbook built under Runtime+Iterate containing `A1 = =A1+1`, saved via

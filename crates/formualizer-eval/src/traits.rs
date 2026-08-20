@@ -1690,6 +1690,11 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
+    /// Notify cycle-edge recording that a lazy condition could not select a
+    /// branch. Ordinary contexts ignore this; recording contexts retain the
+    /// formula's declared dependencies so cycle classification fails closed.
+    fn mark_lazy_condition_unevaluable(&self) {}
+
     /// Resolve a reference into a `RangeView` with clear bounds.
     /// Implementations should resolve un/partially bounded references using used-region.
     fn resolve_range_view<'c>(
@@ -1958,6 +1963,9 @@ pub trait FunctionContext<'ctx> {
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken>;
     fn chunk_hint(&self) -> Option<usize>;
 
+    /// See [`EvaluationContext::mark_lazy_condition_unevaluable`].
+    fn mark_lazy_condition_unevaluable(&self) {}
+
     /// Current formula sheet name.
     fn current_sheet(&self) -> &str;
 
@@ -2126,6 +2134,9 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     }
     fn chunk_hint(&self) -> Option<usize> {
         self.base.chunk_hint()
+    }
+    fn mark_lazy_condition_unevaluable(&self) {
+        self.base.mark_lazy_condition_unevaluable();
     }
 
     fn volatile_level(&self) -> VolatileLevel {

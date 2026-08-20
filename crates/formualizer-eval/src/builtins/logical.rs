@@ -488,7 +488,7 @@ impl Function for IfFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 || args.len() > 3 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -507,6 +507,7 @@ impl Function for IfFn {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
             }
             _ => {
+                ctx.mark_lazy_condition_unevaluable();
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("IF condition must be boolean or number"),
                 )));

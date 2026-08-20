@@ -67,6 +67,81 @@ fn inject_calc_pr(xlsx: &[u8], calc_pr_xml: &str) -> Vec<u8> {
     out
 }
 
+/// Inject numeric cached results into formula cells in worksheet XML records.
+fn inject_formula_caches(xlsx: &[u8], replacements: &[(&str, f64)]) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(xlsx)).unwrap();
+    let mut out = Vec::new();
+    let mut replaced = vec![false; replacements.len()];
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(&name, opts).unwrap();
+            if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
+                let mut xml = String::new();
+                entry.read_to_string(&mut xml).unwrap();
+                for (index, (formula, cached)) in replacements.iter().enumerate() {
+                    let empty = format!("<f>{formula}</f><v/>");
+                    let populated = format!("<f>{formula}</f><v>{cached}</v>");
+                    if xml.contains(&empty) {
+                        xml = xml.replace(&empty, &populated);
+                        replaced[index] = true;
+                    }
+                }
+                writer.write_all(xml.as_bytes()).unwrap();
+            } else {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    for (index, (formula, _)) in replacements.iter().enumerate() {
+        assert!(
+            replaced[index],
+            "formula cell missing from fixture: {formula}"
+        );
+    }
+    out
+}
+
+/// Remove worksheet `<dimension>` elements, matching the frozen invented
+/// GOD-183 package and exercising the iterative cache fallback path.
+fn strip_worksheet_dimensions(xlsx: &[u8]) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(xlsx)).unwrap();
+    let mut out = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(&name, opts).unwrap();
+            if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
+                let mut xml = String::new();
+                entry.read_to_string(&mut xml).unwrap();
+                if let Some(start) = xml.find("<dimension ")
+                    && let Some(end) = xml[start..].find("/>")
+                {
+                    xml.replace_range(start..start + end + 2, "");
+                }
+                writer.write_all(xml.as_bytes()).unwrap();
+            } else {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    out
+}
+
 fn simple_fixture() -> Vec<u8> {
     build_xlsx_bytes(|ws| {
         ws.get_cell_mut((1, 1)).set_value_number(10); // A1
@@ -222,6 +297,85 @@ fn from_reader_iterate_converges_arithmetic_cycle() {
     let c1 = num(&wb, "Sheet1", 1, 3);
     assert!((b1 - 40.0 / 3.0).abs() < 0.01, "B1 converged to {b1}");
     assert!((c1 - 50.0 / 3.0).abs() < 0.01, "C1 converged to {c1}");
+}
+
+#[test]
+fn from_reader_iterate_starts_from_saved_formula_caches() {
+    // These three saved results are already a fixed point. Excel starts an
+    // iterative recalc from them, so the cycle remains 10/4/6. Starting from
+    // Empty instead produces the different fixed point 0/0/0.
+    let fixture = build_xlsx_bytes(|ws| {
+        ws.get_cell_mut((1, 1)).set_formula("B1+C1");
+        ws.get_cell_mut((2, 1)).set_formula("A1*0.4");
+        ws.get_cell_mut((3, 1)).set_formula("A1*0.6");
+    });
+    let fixture = inject_formula_caches(
+        &fixture,
+        &[("B1+C1", 10.0), ("A1*0.4", 4.0), ("A1*0.6", 6.0)],
+    );
+    let bytes = inject_calc_pr(
+        &fixture,
+        r#"<calcPr calcId="122211" iterate="1" iterateCount="100" iterateDelta="0.001"/>"#,
+    );
+    let adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut wb =
+        Workbook::from_reader(adapter, LoadStrategy::EagerAll, WorkbookConfig::ephemeral())
+            .unwrap();
+
+    let res = wb.evaluate_all().expect("evaluate_all");
+    assert_eq!(res.cycle_errors, 0);
+    assert!((num(&wb, "Sheet1", 1, 1) - 10.0).abs() < 0.001);
+    assert!((num(&wb, "Sheet1", 1, 2) - 4.0).abs() < 0.001);
+    assert!((num(&wb, "Sheet1", 1, 3) - 6.0).abs() < 0.001);
+}
+
+#[test]
+fn from_reader_iterate_starts_cross_sheet_3d_cycle_from_saved_formula_caches() {
+    // Exact invented GOD-183 D2 shape: two account sheets read the Calc
+    // accumulator, while Calc sums the same coordinate over both account
+    // sheets through a 3D reference. The persisted 10/4/6 values are a fixed
+    // point. Losing any load-time seed makes the SCC settle at 0/0/0 instead.
+    let mut book = umya_spreadsheet::new_file();
+    book.get_sheet_mut(&0).unwrap().set_name("Acct1");
+    book.new_sheet("Acct2").unwrap();
+    book.new_sheet("Calc").unwrap();
+    book.get_sheet_by_name_mut("Acct1")
+        .unwrap()
+        .get_cell_mut((1, 1))
+        .set_formula("Calc!A1*0.4");
+    book.get_sheet_by_name_mut("Acct2")
+        .unwrap()
+        .get_cell_mut((1, 1))
+        .set_formula("Calc!A1*0.6");
+    book.get_sheet_by_name_mut("Calc")
+        .unwrap()
+        .get_cell_mut((1, 1))
+        .set_formula("SUM(Acct1:Acct2!A1)");
+    let mut fixture = Vec::new();
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut fixture).unwrap();
+    let fixture = strip_worksheet_dimensions(&fixture);
+    let fixture = inject_formula_caches(
+        &fixture,
+        &[
+            ("Calc!A1*0.4", 4.0),
+            ("Calc!A1*0.6", 6.0),
+            ("SUM(Acct1:Acct2!A1)", 10.0),
+        ],
+    );
+    let bytes = inject_calc_pr(
+        &fixture,
+        r#"<calcPr calcId="122211" iterate="1" iterateCount="100" iterateDelta="0.001"/>"#,
+    );
+    for config in [WorkbookConfig::ephemeral(), WorkbookConfig::interactive()] {
+        let adapter = CalamineAdapter::open_bytes(bytes.clone()).unwrap();
+        let mut wb = Workbook::from_reader(adapter, LoadStrategy::EagerAll, config).unwrap();
+
+        let res = wb.evaluate_all().expect("evaluate_all");
+        assert_eq!(res.cycle_errors, 0);
+        assert!((num(&wb, "Acct1", 1, 1) - 4.0).abs() < 0.001);
+        assert!((num(&wb, "Acct2", 1, 1) - 6.0).abs() < 0.001);
+        assert!((num(&wb, "Calc", 1, 1) - 10.0).abs() < 0.001);
+    }
 }
 
 fn num(wb: &Workbook, sheet: &str, row: u32, col: u32) -> f64 {

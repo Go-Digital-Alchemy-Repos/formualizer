@@ -117,6 +117,7 @@ struct StreamedSheet {
     formulas_observed: usize,
     formulas_handed_to_engine: usize,
     formulas: Vec<FormulaIngestRecord>,
+    saved_formula_values: Vec<(u32, u32, LiteralValue)>,
     formula_source_report: FormulaCompressedSourceReport,
     compressed_families: Vec<SourceFormulaFamily>,
     partitioned_families: Vec<PartitionedSourceFormulaFamily>,
@@ -157,6 +158,36 @@ fn data_ref_to_literal(value: &DataRef<'_>, date_system: DateSystem) -> Option<L
         ),
         DataRef::DateTimeIso(s) => Some(LiteralValue::Text(s.clone())),
         DataRef::DurationIso(s) => Some(LiteralValue::Text(s.clone())),
+    }
+}
+
+#[inline]
+fn data_to_literal(value: &Data, date_system: DateSystem) -> Option<LiteralValue> {
+    match value {
+        Data::Empty => None,
+        Data::String(s) if s.is_empty() => None,
+        Data::String(s) => Some(LiteralValue::Text(s.clone())),
+        Data::Float(f) => Some(LiteralValue::Number(*f)),
+        Data::Int(i) => Some(LiteralValue::Int(*i)),
+        Data::Bool(b) => Some(LiteralValue::Boolean(*b)),
+        Data::Error(e) => Some(LiteralValue::Error(ExcelError::new(
+            match CalamineAdapter::calamine_error_code(e) {
+                1 => ExcelErrorKind::Null,
+                2 => ExcelErrorKind::Ref,
+                3 => ExcelErrorKind::Name,
+                4 => ExcelErrorKind::Value,
+                5 => ExcelErrorKind::Div,
+                6 => ExcelErrorKind::Na,
+                7 => ExcelErrorKind::Num,
+                _ => ExcelErrorKind::Error,
+            },
+        ))),
+        Data::DateTime(dt) => Some(
+            LiteralValue::try_from_serial_number_for(date_system, dt.as_f64())
+                .unwrap_or_else(LiteralValue::Error),
+        ),
+        Data::DateTimeIso(s) => Some(LiteralValue::Text(s.clone())),
+        Data::DurationIso(s) => Some(LiteralValue::Text(s.clone())),
     }
 }
 
@@ -340,6 +371,18 @@ impl CalamineAdapter {
             workbook_spool_usage,
             shadow_relocation_comparator,
         } = options;
+        // The streaming reader can omit cached formula results when an XLSX
+        // producer leaves out worksheet dimensions. Iterative workbooks need
+        // those results exactly once as SCC seeds, so use Calamine's ordinary
+        // range parser as a bounded fallback only for that opt-in mode.
+        let saved_formula_range = if matches!(
+            engine.config.cycle.policy,
+            formualizer_eval::engine::CyclePolicy::Iterate { .. }
+        ) {
+            Some(workbook.worksheet_range(sheet)?)
+        } else {
+            None
+        };
         let mut reader = workbook
             .worksheet_cells_reader(sheet)
             .map_err(calamine::Error::Xlsx)?;
@@ -380,6 +423,7 @@ impl CalamineAdapter {
         let mut values_handed_to_engine = 0usize;
         let mut formula_staging = FormulaStaging::new();
         let mut formula_count = 0usize;
+        let mut saved_formula_values = Vec::new();
         let mut deferred_source_coordinates = engine.config.defer_graph_building.then(Vec::new);
         let mut formula_evidence = MonotonicFormulaEvidence::new();
         let spool_limits = engine.workbook_load_limits();
@@ -427,6 +471,16 @@ impl CalamineAdapter {
 
             let has_formula = record.formula.is_some();
             if let Some(metadata) = record.formula {
+                let saved =
+                    data_ref_to_literal(&record.value, engine.config.date_system).or_else(|| {
+                        saved_formula_range
+                            .as_ref()
+                            .and_then(|range| range.get_value((row0, col0)))
+                            .and_then(|value| data_to_literal(value, engine.config.date_system))
+                    });
+                if let Some(value) = saved {
+                    saved_formula_values.push((row0 + 1, col0 + 1, value));
+                }
                 if u64::try_from(value_cells_observed)
                     .unwrap_or(u64::MAX)
                     .saturating_add(u64::try_from(formula_count).unwrap_or(u64::MAX))
@@ -546,8 +600,9 @@ impl CalamineAdapter {
                 formula_count += 1;
             }
 
-            // Preserve existing KeepCachedValue behavior: a formula's cached
-            // value is not handed to the value plane.
+            // Formula caches seed iterative SCCs through the engine's
+            // dedicated saved-value map. They are not handed to the ordinary
+            // value plane, preserving KeepCachedValue behavior before recalc.
             if has_formula {
                 continue;
             }
@@ -865,6 +920,7 @@ impl CalamineAdapter {
             formulas_observed: formula_count,
             formulas_handed_to_engine: formula_count,
             formulas: formula_staging.formulas,
+            saved_formula_values,
             formula_source_report,
             compressed_families,
             partitioned_families,
@@ -1554,6 +1610,7 @@ where
                 FormulaCompressedSourceReport,
                 FormulaCompressedPreparation,
             )> = Vec::new();
+            let mut saved_formula_values_by_sheet = Vec::new();
 
             for (sheet_instance, n) in names.iter().enumerate() {
                 let t_sheet = DebugTimer::start();
@@ -1611,6 +1668,7 @@ where
                     formulas_observed: parsed_n,
                     formulas_handed_to_engine: formula_handed_to_engine,
                     formulas,
+                    saved_formula_values,
                     formula_source_report,
                     compressed_families,
                     partitioned_families,
@@ -1663,6 +1721,9 @@ where
 
                 total_formulas += parsed_n;
                 total_formula_handed_to_engine += formula_handed_to_engine;
+                if !saved_formula_values.is_empty() {
+                    saved_formula_values_by_sheet.push((n.clone(), saved_formula_values));
+                }
                 if debug {
                     eprintln!(
                         "[fz][load]    streamed rows={} cols={} max_record_col={} sparse_fallback={} values={} formulas={} in {} ms",
@@ -1798,6 +1859,16 @@ where
             }
             for n in &names {
                 engine.finalize_sheet_index(n);
+            }
+            // Attach coordinate-bound saved results only after every load-time
+            // topology mutation has finished. Topology edits deliberately
+            // invalidate these one-shot seeds.
+            for (sheet, values) in saved_formula_values_by_sheet {
+                for (row, col, value) in values {
+                    engine
+                        .seed_saved_formula_value(&sheet, row, col, value)
+                        .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?;
+                }
             }
 
             self.load_stats = AdapterLoadStats {

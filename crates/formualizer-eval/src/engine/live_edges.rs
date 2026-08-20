@@ -75,6 +75,9 @@ struct CollectorState {
     /// Live edges as `(from_member_idx, to_member_idx)`. Self-edges `(i, i)`
     /// are recorded (e.g. a member whose range argument includes itself).
     edges: FxHashSet<(u32, u32)>,
+    /// Members whose lazy condition could not select a branch. Their static
+    /// dependencies are merged by the SCC evaluator before classification.
+    fail_closed: FxHashSet<u32>,
 }
 
 /// Records which reads actually occurred targeting SCC members during a
@@ -203,6 +206,19 @@ impl LiveEdgeCollector {
     /// attribution is preserved).
     pub fn take_edges(&self) -> FxHashSet<(u32, u32)> {
         std::mem::take(&mut self.state.lock().unwrap().edges)
+    }
+
+    /// Mark the current member for conservative declared-edge retention.
+    pub fn mark_current_fail_closed(&self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(current) = state.current {
+            state.fail_closed.insert(current);
+        }
+    }
+
+    /// Drain members marked by unevaluable lazy conditions.
+    pub fn take_fail_closed(&self) -> FxHashSet<u32> {
+        std::mem::take(&mut self.state.lock().unwrap().fail_closed)
     }
 }
 
@@ -461,6 +477,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     }
     fn chunk_hint(&self) -> Option<usize> {
         self.engine.chunk_hint()
+    }
+    fn mark_lazy_condition_unevaluable(&self) {
+        self.collector.mark_current_fail_closed();
     }
     fn locale(&self) -> crate::locale::Locale {
         self.engine.locale()

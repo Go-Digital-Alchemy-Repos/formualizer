@@ -73,6 +73,19 @@ fn build_99_pair(engine: &mut Engine<TestWorkbook>, guard: bool) {
 
 /* ───────────────────────── 7.1 self-reference ───────────────────────── */
 
+#[test]
+fn unevaluable_if_condition_fails_closed_over_both_branches() {
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(1/0,A2,7)");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
+
+    engine.evaluate_all().unwrap();
+
+    assert!(is_circ(&engine, "Sheet1", 1, 1));
+    assert!(is_circ(&engine, "Sheet1", 2, 1));
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+}
+
 /// Engine rule that PRE-EMPTS spec §7.1's eval-time `#CIRC!`: a direct
 /// self-reference (`=A1+1` in A1, or an expanded range containing the cell)
 /// is rejected when the formula is SET ("Self-reference detected"). Runtime
