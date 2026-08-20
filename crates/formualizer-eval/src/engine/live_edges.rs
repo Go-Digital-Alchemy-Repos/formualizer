@@ -68,6 +68,21 @@ struct MemberCell {
     col: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingLazyRect {
+    sheet_id: SheetId,
+    sr: u32,
+    sc: u32,
+    er: u32,
+    ec: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PendingLazyScope {
+    rects: Vec<PendingLazyRect>,
+    names: FxHashSet<String>,
+}
+
 #[derive(Default)]
 struct CollectorState {
     /// Index (into `members`) of the member currently being evaluated.
@@ -81,12 +96,19 @@ struct CollectorState {
     /// to SCC members; this is required to prove the diagnostic edge universe.
     diagnostic_edges: FxHashMap<(u32, SheetId, u32, u32), DiagnosticRecordedEdge>,
     diagnostic_overflow: bool,
+    /// Selected non-IF lazy arms awaiting an actual read. These labels are
+    /// diagnostic metadata only: declaring an arm must never create a live
+    /// edge that evaluation did not observe.
+    pending_lazy_scopes: Vec<PendingLazyScope>,
 }
 
 const MAX_DIAGNOSTIC_EDGES: usize = 1_000_000;
 
 pub(crate) const EDGE_NESTED_FAIL_CLOSED: u8 = 1 << 0;
 pub(crate) const EDGE_RANGE_EXPANSION: u8 = 1 << 1;
+pub(crate) const EDGE_NON_IF_LAZY: u8 = 1 << 2;
+pub(crate) const EDGE_EVALUATED_SCALAR: u8 = 1 << 3;
+pub(crate) const EDGE_LAZY_INACTIVE_BRANCH: u8 = 1 << 4;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RecordedEdge {
@@ -252,13 +274,17 @@ impl LiveEdgeCollector {
     /// recorded reads are attributed to it.
     pub fn set_current(&self, member_idx: u32) {
         debug_assert!((member_idx as usize) < self.total_members);
-        self.state.lock().unwrap().current = Some(member_idx);
+        let mut state = self.state.lock().unwrap();
+        state.current = Some(member_idx);
+        state.pending_lazy_scopes.clear();
     }
 
     /// Stop attributing reads to any member (used between passes so that
     /// out-of-band reads — snapshots, deltas — never record edges).
     pub fn clear_current(&self) {
-        self.state.lock().unwrap().current = None;
+        let mut state = self.state.lock().unwrap();
+        state.current = None;
+        state.pending_lazy_scopes.clear();
     }
 
     pub(crate) fn replay_safe_scope(&self) -> ReplaySafeGuard<'_> {
@@ -268,19 +294,56 @@ impl LiveEdgeCollector {
 
     /// Record a scalar read of `(sheet_id, row, col)` (0-based).
     pub fn record_scalar(&self, sheet_id: SheetId, row: u32, col: u32) {
+        let mechanisms = {
+            let state = self.state.lock().unwrap();
+            if state
+                .pending_lazy_scopes
+                .iter()
+                .flat_map(|scope| &scope.rects)
+                .any(|rect| {
+                    rect.sheet_id == sheet_id
+                        && row >= rect.sr
+                        && row <= rect.er
+                        && col >= rect.sc
+                        && col <= rect.ec
+                })
+            {
+                EDGE_NON_IF_LAZY
+            } else {
+                EDGE_EVALUATED_SCALAR
+            }
+        };
+        // The older cycle-instrumentation API retains its baseline schema;
+        // D7's extra provenance bits belong only to stamped-SCC records.
         self.record_diagnostic_cell(sheet_id, row, col, true, 0);
         let Some(&to) = self.index.get(&(sheet_id, row, col)) else {
             return;
         };
-        self.record_edge(to, true, 0);
+        self.record_edge(to, true, mechanisms);
     }
 
     /// Record a rectangle read (0-based, inclusive corners). Intersection is
     /// O(|SCC|): each member is tested against the rect once; the rect is
     /// never enumerated per cell.
     pub fn record_rect(&self, sheet_id: SheetId, sr: u32, sc: u32, er: u32, ec: u32) {
+        let pending_rects: Vec<PendingLazyRect> = {
+            let state = self.state.lock().unwrap();
+            state
+                .pending_lazy_scopes
+                .iter()
+                .flat_map(|scope| scope.rects.iter().copied())
+                .collect()
+        };
         'rows: for row in sr..=er {
             for col in sc..=ec {
+                let lazy = pending_rects.iter().any(|rect| {
+                    rect.sheet_id == sheet_id
+                        && row >= rect.sr
+                        && row <= rect.er
+                        && col >= rect.sc
+                        && col <= rect.ec
+                });
+                let mechanisms = EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 };
                 if !self.record_diagnostic_cell(sheet_id, row, col, true, EDGE_RANGE_EXPANSION) {
                     break 'rows;
                 }
@@ -288,7 +351,18 @@ impl LiveEdgeCollector {
         }
         for (i, m) in self.members.iter().enumerate() {
             if m.sheet_id == sheet_id && m.row >= sr && m.row <= er && m.col >= sc && m.col <= ec {
-                self.record_edge(i as u32, true, EDGE_RANGE_EXPANSION);
+                let lazy = pending_rects.iter().any(|rect| {
+                    rect.sheet_id == sheet_id
+                        && m.row >= rect.sr
+                        && m.row <= rect.er
+                        && m.col >= rect.sc
+                        && m.col <= rect.ec
+                });
+                self.record_edge(
+                    i as u32,
+                    true,
+                    EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 },
+                );
             }
         }
     }
@@ -325,13 +399,46 @@ impl LiveEdgeCollector {
         }
     }
 
+    pub fn record_selected_non_if_lazy_rect(
+        &self,
+        sheet_id: SheetId,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+        _range_expansion: bool,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(scope) = state.pending_lazy_scopes.last_mut() {
+            scope.rects.push(PendingLazyRect {
+                sheet_id,
+                sr,
+                sc,
+                er,
+                ec,
+            });
+        }
+    }
+
     /// Record a read of a named entity by folded name key (e.g. a formula
     /// referencing a named-formula SCC member).
     pub fn record_name(&self, folded_name: &str) {
+        let mechanisms = if self
+            .state
+            .lock()
+            .unwrap()
+            .pending_lazy_scopes
+            .iter()
+            .any(|scope| scope.names.contains(folded_name))
+        {
+            EDGE_NON_IF_LAZY
+        } else {
+            EDGE_EVALUATED_SCALAR
+        };
         let Some(&to) = self.name_index.get(folded_name) else {
             return;
         };
-        self.record_edge(to, true, 0);
+        self.record_edge(to, true, mechanisms);
     }
 
     pub fn record_failed_name(&self, folded_name: &str) {
@@ -339,6 +446,25 @@ impl LiveEdgeCollector {
             return;
         };
         self.record_edge(to, false, EDGE_NESTED_FAIL_CLOSED);
+    }
+
+    pub fn record_selected_non_if_lazy_name(&self, folded_name: &str) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(scope) = state.pending_lazy_scopes.last_mut() {
+            scope.names.insert(folded_name.to_owned());
+        }
+    }
+
+    pub fn begin_selected_non_if_lazy_arm(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .pending_lazy_scopes
+            .push(PendingLazyScope::default());
+    }
+
+    pub fn end_selected_non_if_lazy_arm(&self) {
+        self.state.lock().unwrap().pending_lazy_scopes.pop();
     }
 
     /// Drain the collected edges, leaving the collector empty (current member
@@ -459,6 +585,22 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
         }
         if let Some(sid) = self.engine.sheet_id(view.sheet_name()) {
             self.collector.record_failed_rect(
+                sid,
+                view.start_row() as u32,
+                view.start_col() as u32,
+                view.end_row() as u32,
+                view.end_col() as u32,
+                matches!(reference, ReferenceType::Range { .. }),
+            );
+        }
+    }
+
+    fn record_selected_non_if_lazy_view(&self, reference: &ReferenceType, view: &RangeView<'_>) {
+        if view.is_empty() {
+            return;
+        }
+        if let Some(sid) = self.engine.sheet_id(view.sheet_name()) {
+            self.collector.record_selected_non_if_lazy_rect(
                 sid,
                 view.start_row() as u32,
                 view.start_col() as u32,
@@ -679,6 +821,27 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         if let Ok(view) = self.engine.resolve_range_view(reference, current_sheet) {
             self.record_failed_view(reference, &view);
         }
+    }
+    fn record_selected_non_if_lazy_reference(
+        &self,
+        reference: &ReferenceType,
+        current_sheet: &str,
+    ) {
+        if let ReferenceType::NamedRange(name) = reference {
+            let key = self.engine.graph.name_lookup_key(name);
+            self.collector.record_selected_non_if_lazy_name(&key);
+        }
+        if let Ok(view) = self.engine.resolve_range_view(reference, current_sheet) {
+            self.record_selected_non_if_lazy_view(reference, &view);
+        }
+    }
+
+    fn begin_selected_non_if_lazy_arm(&self) {
+        self.collector.begin_selected_non_if_lazy_arm();
+    }
+
+    fn end_selected_non_if_lazy_arm(&self) {
+        self.collector.end_selected_non_if_lazy_arm();
     }
     fn locale(&self) -> crate::locale::Locale {
         self.engine.locale()

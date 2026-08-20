@@ -320,7 +320,7 @@ impl Function for IfErrorFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -328,9 +328,25 @@ impl Function for IfErrorFn {
             )));
         }
         match args[0].value() {
-            Ok(cv) if matches!(cv.as_scalar(), Some(LiteralValue::Error(_))) => args[1].value(),
+            Ok(cv) if matches!(cv.as_scalar(), Some(LiteralValue::Error(_))) => {
+                ctx.begin_selected_non_if_lazy_arm();
+                for reference in args[1].declared_references() {
+                    ctx.record_selected_non_if_lazy_reference(&reference);
+                }
+                let result = args[1].value();
+                ctx.end_selected_non_if_lazy_arm();
+                result
+            }
             Ok(cv) => Ok(cv),
-            Err(_) => args[1].value(),
+            Err(_) => {
+                ctx.begin_selected_non_if_lazy_arm();
+                for reference in args[1].declared_references() {
+                    ctx.record_selected_non_if_lazy_reference(&reference);
+                }
+                let result = args[1].value();
+                ctx.end_selected_non_if_lazy_arm();
+                result
+            }
         }
     }
 }
@@ -409,7 +425,7 @@ impl Function for IfNaFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -419,7 +435,13 @@ impl Function for IfNaFn {
         let value = args[0].value()?;
         match value.as_scalar() {
             Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Na => {
-                args[1].value()
+                ctx.begin_selected_non_if_lazy_arm();
+                for reference in args[1].declared_references() {
+                    ctx.record_selected_non_if_lazy_reference(&reference);
+                }
+                let result = args[1].value();
+                ctx.end_selected_non_if_lazy_arm();
+                result
             }
             _ => Ok(value),
         }
@@ -510,7 +532,7 @@ impl Function for IfsFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 || !args.len().is_multiple_of(2) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -534,7 +556,13 @@ impl Function for IfsFn {
                 }
             };
             if is_true {
-                return pair[1].value();
+                ctx.begin_selected_non_if_lazy_arm();
+                for reference in pair[1].declared_references() {
+                    ctx.record_selected_non_if_lazy_reference(&reference);
+                }
+                let result = pair[1].value();
+                ctx.end_selected_non_if_lazy_arm();
+                return result;
             }
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -673,7 +701,7 @@ impl Function for SwitchFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 3 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -697,11 +725,24 @@ impl Function for SwitchFn {
         for chunk in rest[..pairs].chunks(2) {
             let candidate = chunk[0].value()?.into_literal();
             if switch_values_equal(&expr, &candidate) {
-                return chunk[1].value();
+                ctx.begin_selected_non_if_lazy_arm();
+                for reference in chunk[1].declared_references() {
+                    ctx.record_selected_non_if_lazy_reference(&reference);
+                }
+                let result = chunk[1].value();
+                ctx.end_selected_non_if_lazy_arm();
+                return result;
             }
         }
         if has_default {
-            return rest.last().unwrap().value();
+            let fallback = rest.last().unwrap();
+            ctx.begin_selected_non_if_lazy_arm();
+            for reference in fallback.declared_references() {
+                ctx.record_selected_non_if_lazy_reference(&reference);
+            }
+            let result = fallback.value();
+            ctx.end_selected_non_if_lazy_arm();
+            return result;
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_na(),

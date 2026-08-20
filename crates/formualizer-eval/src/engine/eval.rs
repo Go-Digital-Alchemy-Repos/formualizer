@@ -10,7 +10,8 @@ use crate::engine::graph::prepared_legacy_graph::{
 use crate::engine::graph::{FormulaDirtyEventSnapshot, FormulaDirtyLease, WholeSpanDirtyReason};
 use crate::engine::ingest_pipeline::{DependencyPlanRow, FormulaAstInput};
 use crate::engine::live_edges::{
-    DiagnosticRecordedEdge, EDGE_NESTED_FAIL_CLOSED, EDGE_RANGE_EXPANSION, LiveEdgeCollector,
+    DiagnosticRecordedEdge, EDGE_EVALUATED_SCALAR, EDGE_LAZY_INACTIVE_BRANCH,
+    EDGE_NESTED_FAIL_CLOSED, EDGE_NON_IF_LAZY, EDGE_RANGE_EXPANSION, LiveEdgeCollector,
     RecordedEdge, RecordingContext,
 };
 use crate::engine::live_graph::analyze_live_graph;
@@ -1956,35 +1957,13 @@ impl UpstreamDiagnosticsState {
         self.scc_indices.clear();
     }
 
-    fn admit_edge(&mut self, from: &str, to: &str) -> bool {
-        if self.stopped {
-            return false;
-        }
-        let identity = (from.to_string(), to.to_string());
-        if self.admitted_edges.contains(&identity) {
-            return true;
-        }
-        if self.admitted_edges.len() >= self.edge_limit {
-            self.overflow = true;
-            self.stopped = true;
-            return false;
-        }
-        self.admitted_edges.insert(identity);
-        true
-    }
-
     fn mark_overflow(&mut self) {
         self.overflow = true;
         self.stopped = true;
     }
 
-    fn record_scc(
-        &mut self,
-        members: Vec<String>,
-        mut edges: Vec<StampedSccDiagnosticEdge>,
-        complete: bool,
-    ) {
-        if !self.enabled {
+    fn record_scc(&mut self, members: Vec<String>, mut edges: Vec<StampedSccDiagnosticEdge>) {
+        if !self.enabled || self.stopped {
             return;
         }
         edges.sort_by(|left, right| left.from.cmp(&right.from).then(left.to.cmp(&right.to)));
@@ -2001,9 +1980,24 @@ impl UpstreamDiagnosticsState {
                 false
             }
         });
+        let existing_edges = self
+            .scc_indices
+            .get(&members)
+            .map(|&index| self.stamped_sccs[index].edges.as_slice())
+            .unwrap_or(&[]);
+        let new_identities: FxHashSet<(String, String)> = existing_edges
+            .iter()
+            .chain(edges.iter())
+            .map(|edge| (edge.from.clone(), edge.to.clone()))
+            .filter(|identity| !self.admitted_edges.contains(identity))
+            .collect();
+        if new_identities.len() > self.edge_limit.saturating_sub(self.admitted_edges.len()) {
+            self.mark_overflow();
+            return;
+        }
+        self.admitted_edges.extend(new_identities);
         if let Some(&index) = self.scc_indices.get(&members) {
             let existing = &mut self.stamped_sccs[index];
-            existing.complete &= complete;
             existing.edges.append(&mut edges);
             existing
                 .edges
@@ -2026,7 +2020,7 @@ impl UpstreamDiagnosticsState {
             self.scc_indices.insert(members.clone(), index);
             self.stamped_sccs.push(StampedSccDiagnostic {
                 members,
-                complete,
+                complete: true,
                 edges,
             });
         }
@@ -25491,14 +25485,13 @@ where
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
         let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
-        // Optional metadata is separately hard-bounded. The compact target
-        // graph above remains the sole unbounded structure required by normal
-        // SCC classification, including when diagnostics are disabled.
+        // Diagnostic mechanism metadata is retained in lockstep with the
+        // latest topology edge for each member. It is not an admitted census:
+        // D4 capacity is charged atomically only after runtime SCC discovery.
         let mut out_edge_records = self
             .upstream_diagnostics
             .enabled
-            .then(|| vec![FxHashMap::<u32, RecordedEdge>::default(); n]);
-        let mut out_edge_record_count = 0usize;
+            .then(|| vec![Vec::<RecordedEdge>::new(); n]);
         let mut diagnostic_edge_records: Vec<
             FxHashMap<(SheetId, u32, u32), DiagnosticRecordedEdge>,
         > = vec![FxHashMap::default(); n];
@@ -25623,7 +25616,8 @@ where
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
-            let drained = collector.take_edge_records();
+            let mut drained = collector.take_edge_records();
+            drained.sort_unstable_by_key(|record| (record.from, record.to));
             let (diagnostic_drained, diagnostic_overflow) =
                 collector.take_diagnostic_edge_records();
             if diagnostic_overflow {
@@ -25635,14 +25629,12 @@ where
                 if pos[i] >= 0 {
                     out_edges[i].clear();
                     if let Some(records) = out_edge_records.as_mut() {
-                        out_edge_record_count =
-                            out_edge_record_count.saturating_sub(records[i].len());
                         records[i].clear();
                     }
                     diagnostic_edge_records[i].clear();
                 }
             }
-            for record in drained {
+            for record in &drained {
                 let from = record.from;
                 let to = record.to;
                 debug_assert!(
@@ -25650,17 +25642,8 @@ where
                     "edge from a member that did not run"
                 );
                 out_edges[from as usize].push(to);
-                if let Some(records) = out_edge_records.as_mut()
-                    && !self.upstream_diagnostics.stopped
-                {
-                    let slot = &mut records[from as usize];
-                    if let Some(existing) = slot.get_mut(&to) {
-                        existing.selected |= record.selected;
-                        existing.mechanisms |= record.mechanisms;
-                    } else if out_edge_record_count < self.upstream_diagnostics.edge_limit {
-                        slot.insert(to, record);
-                        out_edge_record_count += 1;
-                    }
+                if let Some(records) = out_edge_records.as_mut() {
+                    records[from as usize].push(*record);
                 }
             }
             for record in diagnostic_drained {
@@ -25769,8 +25752,11 @@ where
                 match policy {
                     CyclePolicy::Error => {
                         if self.upstream_diagnostics.enabled && !self.upstream_diagnostics.stopped {
-                            let mut captures = Vec::new();
-                            for raw_component in &analysis.cyclic_components {
+                            let mut ordered_components = analysis.cyclic_components.clone();
+                            ordered_components.sort_unstable_by_key(|component| {
+                                component.iter().copied().min().unwrap_or(u32::MAX)
+                            });
+                            for raw_component in &ordered_components {
                                 if self.upstream_diagnostics.stopped {
                                     break;
                                 }
@@ -25790,10 +25776,12 @@ where
                                     .filter_map(|&index| member_addresses[index].clone())
                                     .collect();
                                 let mut captured_edges = Vec::new();
-                                let mut complete = !self.upstream_diagnostics.stopped;
-                                let records = out_edge_records
-                                    .as_ref()
-                                    .expect("enabled diagnostics allocate bounded metadata");
+                                let mut component_complete = true;
+                                let remaining_capacity = self
+                                    .upstream_diagnostics
+                                    .edge_limit
+                                    .saturating_sub(self.upstream_diagnostics.admitted_edges.len());
+                                let mut candidate_new_edges = FxHashSet::default();
                                 for &from in &component {
                                     let from_address = member_addresses[from]
                                         .as_ref()
@@ -25804,38 +25792,45 @@ where
                                         if !component_set.contains(&to) {
                                             continue;
                                         }
-                                        let Some(record) = records[from].get(&to_raw) else {
-                                            self.upstream_diagnostics.mark_overflow();
-                                            complete = false;
-                                            continue;
+                                        let records = out_edge_records
+                                            .as_ref()
+                                            .expect("enabled diagnostics retain edge metadata");
+                                        let Ok(record_index) = records[from]
+                                            .binary_search_by_key(&to_raw, |record| record.to)
+                                        else {
+                                            component_complete = false;
+                                            break;
                                         };
+                                        let record = &records[from][record_index];
                                         let to_address = member_addresses[to]
                                             .as_ref()
                                             .expect("cell-only component checked above");
+                                        let identity = (from_address.clone(), to_address.clone());
                                         if !self
                                             .upstream_diagnostics
-                                            .admit_edge(&from_address, to_address)
+                                            .admitted_edges
+                                            .contains(&identity)
+                                            && candidate_new_edges.insert(identity)
+                                            && candidate_new_edges.len() > remaining_capacity
                                         {
-                                            complete = false;
-                                            continue;
+                                            component_complete = false;
+                                            break;
                                         }
                                         let mut mechanisms = Vec::new();
                                         if record.mechanisms & EDGE_NESTED_FAIL_CLOSED != 0 {
                                             mechanisms.push("nested-fail-closed");
                                         }
-                                        if !record.selected
-                                            && record.mechanisms & EDGE_NESTED_FAIL_CLOSED == 0
-                                        {
+                                        if record.mechanisms & EDGE_LAZY_INACTIVE_BRANCH != 0 {
                                             mechanisms.push("lazy-inactive-branch");
                                         }
-                                        if record.selected && record.mechanisms == 0 {
+                                        if record.mechanisms & EDGE_EVALUATED_SCALAR != 0 {
+                                            mechanisms.push("evaluated-scalar");
+                                        }
+                                        if record.mechanisms & EDGE_NON_IF_LAZY != 0 {
                                             mechanisms.push("non-if-lazy");
                                         }
                                         if record.mechanisms & EDGE_RANGE_EXPANSION != 0 {
                                             mechanisms.push("range-expansion");
-                                        }
-                                        if mechanisms.is_empty() {
-                                            mechanisms.push("static-fallback");
                                         }
                                         mechanisms.sort_unstable();
                                         captured_edges.push(StampedSccDiagnosticEdge {
@@ -25844,15 +25839,16 @@ where
                                             mechanisms,
                                         });
                                     }
+                                    if !component_complete {
+                                        break;
+                                    }
                                 }
-                                captures.push((members, captured_edges, complete));
-                            }
-                            for (members, captured_edges, complete) in captures {
-                                self.upstream_diagnostics.record_scc(
-                                    members,
-                                    captured_edges,
-                                    complete,
-                                );
+                                if !component_complete {
+                                    self.upstream_diagnostics.mark_overflow();
+                                    break;
+                                }
+                                self.upstream_diagnostics
+                                    .record_scc(members, captured_edges);
                             }
                         }
                         // POLICY (Error): stamp every member of a live cycle,

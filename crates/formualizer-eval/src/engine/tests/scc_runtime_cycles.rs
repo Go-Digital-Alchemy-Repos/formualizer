@@ -120,6 +120,11 @@ fn cycle_instrumentation_records_first_witness_and_inactive_edge_mechanism() {
         }),
         "telemetry omitted an edge from an SCC member to an outside cell: {target:?}"
     );
+    assert!(target.edges.iter().all(|edge| {
+        edge.mechanisms
+            .iter()
+            .all(|mechanism| matches!(*mechanism, "nested-fail-closed" | "range-expansion"))
+    }));
 }
 
 #[test]
@@ -157,8 +162,7 @@ fn upstream_diagnostics_are_neutral_and_overflow_does_not_abort_stamping() {
     let snapshot = enabled.upstream_diagnostics();
     assert!(snapshot.overflow);
     assert!(!snapshot.complete);
-    assert_eq!(snapshot.stamped_sccs.len(), 1);
-    assert!(!snapshot.stamped_sccs[0].complete);
+    assert!(snapshot.stamped_sccs.is_empty());
 }
 
 #[test]
@@ -179,7 +183,12 @@ fn upstream_diagnostics_capture_complete_internal_live_scc() {
     assert!(
         scc.edges
             .iter()
-            .all(|edge| edge.mechanisms == vec!["non-if-lazy"])
+            .all(|edge| edge.mechanisms == vec!["evaluated-scalar"])
+    );
+    assert!(
+        scc.edges
+            .iter()
+            .all(|edge| !edge.mechanisms.contains(&"non-if-lazy"))
     );
 
     engine.build_graph_all().unwrap();
@@ -190,6 +199,106 @@ fn upstream_diagnostics_capture_complete_internal_live_scc() {
     let reset = engine.upstream_diagnostics();
     assert!(reset.complete);
     assert!(reset.stamped_sccs.is_empty());
+}
+
+#[test]
+fn upstream_diagnostics_static_mode_emits_no_live_scc_records() {
+    let mut engine = static_engine();
+    engine.set_upstream_diagnostics(true, 10);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1");
+    engine.evaluate_all().unwrap();
+    assert!(engine.upstream_diagnostics().stamped_sccs.is_empty());
+}
+
+#[test]
+fn upstream_diagnostics_admits_sccs_atomically_before_overflow() {
+    let mut engine = runtime_engine();
+    engine.set_upstream_diagnostics(true, 2);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=B2+1");
+    set_formula(&mut engine, "Sheet1", 2, 2, "=A2+1");
+    engine.evaluate_all().unwrap();
+    let snapshot = engine.upstream_diagnostics();
+    assert!(snapshot.overflow);
+    assert!(!snapshot.complete);
+    assert_eq!(snapshot.stamped_sccs.len(), 1);
+    assert!(snapshot.stamped_sccs[0].complete);
+    assert_eq!(snapshot.stamped_sccs[0].edges.len(), 2);
+}
+
+#[test]
+fn upstream_diagnostics_atomically_admits_split_runtime_sccs_in_census_order() {
+    let mut engine = runtime_engine();
+    engine.set_upstream_diagnostics(true, 2);
+    // Untaken cross-links make one static candidate. Runtime selection splits
+    // it into A1/B1 then C1/D1, so only the first two-edge SCC fits.
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+IF(FALSE,C1,0)");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1");
+    set_formula(&mut engine, "Sheet1", 1, 3, "=D1+IF(FALSE,A1,0)");
+    set_formula(&mut engine, "Sheet1", 1, 4, "=C1");
+    engine.evaluate_all().unwrap();
+    let snapshot = engine.upstream_diagnostics();
+    assert!(snapshot.overflow);
+    assert!(!snapshot.complete);
+    assert_eq!(snapshot.stamped_sccs.len(), 1);
+    assert_eq!(
+        snapshot.stamped_sccs[0].members,
+        vec!["Sheet1!A1", "Sheet1!B1"]
+    );
+    assert_eq!(snapshot.stamped_sccs[0].edges.len(), 2);
+}
+
+#[test]
+fn upstream_diagnostics_literal_mechanism_emission_sites() {
+    let run = |left: &str, right: &str| {
+        let mut engine = runtime_engine();
+        engine.set_upstream_diagnostics(true, 20);
+        set_formula(&mut engine, "Sheet1", 1, 1, left);
+        set_formula(&mut engine, "Sheet1", 1, 2, right);
+        engine.evaluate_all().unwrap();
+        engine.upstream_diagnostics().stamped_sccs[0]
+            .edges
+            .iter()
+            .flat_map(|edge| edge.mechanisms.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let scalar = run("=B1+1", "=A1+1");
+    assert_eq!(
+        scalar,
+        std::collections::BTreeSet::from(["evaluated-scalar"])
+    );
+    assert!(!scalar.contains("non-if-lazy"));
+
+    let range = run("=SUM(B1:B1)", "=A1+1");
+    assert!(range.contains("range-expansion"));
+
+    let nested = run("=IF(1/0,B1,0)", "=A1+1");
+    assert!(nested.contains("nested-fail-closed"));
+
+    let non_if = run("=CHOOSE(1,B1)", "=A1+1");
+    assert!(non_if.contains("non-if-lazy"));
+
+    let scoped = run("=CHOOSE(1,IF(TRUE,1,B1))+B1", "=A1+1");
+    assert_eq!(
+        scoped,
+        std::collections::BTreeSet::from(["evaluated-scalar"]),
+        "an unread nested arm must not relabel a later ordinary scalar read"
+    );
+
+    let nested_and_scalar = run("=B1+IF(1/0,B1,0)", "=A1+1");
+    assert_eq!(
+        nested_and_scalar,
+        std::collections::BTreeSet::from(["evaluated-scalar", "nested-fail-closed"])
+    );
+
+    let range_and_scalar = run("=B1+SUM(B1:B1)", "=A1+1");
+    assert_eq!(
+        range_and_scalar,
+        std::collections::BTreeSet::from(["evaluated-scalar", "range-expansion"])
+    );
 }
 
 #[test]
@@ -947,6 +1056,7 @@ fn branch_flip_during_settle_creating_live_cycle_is_circ() {
     // Pass 1 is acyclic; C1's settle re-eval flips its branch onto C3,
     // closing a live cycle C1↔C3 that only classification-after-settle sees.
     let mut engine = runtime_engine();
+    engine.set_upstream_diagnostics(true, 10);
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(A2=999,A3,7)");
     set_formula(&mut engine, "Sheet1", 2, 1, "=IF(TRUE,999,A1)");
     set_formula(&mut engine, "Sheet1", 3, 1, "=IF(TRUE,A1,8)");
@@ -958,6 +1068,35 @@ fn branch_flip_during_settle_creating_live_cycle_is_circ() {
     assert_eq!(t.live_cycles_witnessed, 1);
     assert_eq!(t.circ_cells_stamped, 2);
     assert_eq!(t.capped_sccs, 0);
+    let diagnostics = engine.upstream_diagnostics();
+    assert!(diagnostics.complete);
+    assert!(!diagnostics.overflow);
+    assert_eq!(diagnostics.stamped_sccs.len(), 1);
+    assert_eq!(
+        diagnostics.stamped_sccs[0].members,
+        vec!["Sheet1!A1", "Sheet1!A3"]
+    );
+}
+
+#[test]
+fn cycle_instrumentation_overflow_preserves_nimpl_with_upstream_diagnostics_on_or_off() {
+    for upstream_enabled in [false, true] {
+        let mut engine = runtime_engine();
+        engine.set_cycle_instrumentation_targets(vec![("Sheet1".to_string(), 1, 1)]);
+        if upstream_enabled {
+            engine.set_upstream_diagnostics(true, 10);
+        }
+        set_formula(&mut engine, "Sheet1", 1, 1, "=SUM(A1:XFD62)");
+        let error = engine.evaluate_all().unwrap_err();
+        assert_eq!(error.kind, ExcelErrorKind::NImpl);
+        assert!(
+            error
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("cycle instrumentation exceeded")
+        );
+    }
 }
 
 /* ───────────────────────────── side effects ──────────────────────────── */

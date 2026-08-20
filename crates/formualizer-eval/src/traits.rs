@@ -1705,6 +1705,20 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     /// recording contexts retain only the failed conditional's arm edges.
     fn record_failed_lazy_arm_reference(&self, _reference: &ReferenceType, _current_sheet: &str) {}
 
+    /// Mark a declared reference from the selected arm of a short-circuiting
+    /// function other than IF. Diagnostic recording contexts use this only
+    /// to label the already-selected live edge.
+    fn record_selected_non_if_lazy_reference(
+        &self,
+        _reference: &ReferenceType,
+        _current_sheet: &str,
+    ) {
+    }
+
+    fn begin_selected_non_if_lazy_arm(&self) {}
+
+    fn end_selected_non_if_lazy_arm(&self) {}
+
     /// Resolve a reference into a `RangeView` with clear bounds.
     /// Implementations should resolve un/partially bounded references using used-region.
     fn resolve_range_view<'c>(
@@ -1976,6 +1990,13 @@ pub trait FunctionContext<'ctx> {
     /// See [`EvaluationContext::record_failed_lazy_arm_reference`].
     fn record_failed_lazy_arm_reference(&self, _reference: &ReferenceType) {}
 
+    /// See [`EvaluationContext::record_selected_non_if_lazy_reference`].
+    fn record_selected_non_if_lazy_reference(&self, _reference: &ReferenceType) {}
+
+    fn begin_selected_non_if_lazy_arm(&self) {}
+
+    fn end_selected_non_if_lazy_arm(&self) {}
+
     /// Current formula sheet name.
     fn current_sheet(&self) -> &str;
 
@@ -2148,6 +2169,19 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     fn record_failed_lazy_arm_reference(&self, reference: &ReferenceType) {
         self.base
             .record_failed_lazy_arm_reference(reference, self.current_sheet);
+    }
+
+    fn record_selected_non_if_lazy_reference(&self, reference: &ReferenceType) {
+        self.base
+            .record_selected_non_if_lazy_reference(reference, self.current_sheet);
+    }
+
+    fn begin_selected_non_if_lazy_arm(&self) {
+        self.base.begin_selected_non_if_lazy_arm();
+    }
+
+    fn end_selected_non_if_lazy_arm(&self) {
+        self.base.end_selected_non_if_lazy_arm();
     }
 
     fn volatile_level(&self) -> VolatileLevel {

@@ -135,7 +135,7 @@ impl Function for ChooseFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -171,7 +171,13 @@ impl Function for ChooseFn {
 
         // Return the selected value (1-based indexing for the choice)
         let selected_arg = &args[index as usize];
-        selected_arg.value()
+        ctx.begin_selected_non_if_lazy_arm();
+        for reference in selected_arg.declared_references() {
+            ctx.record_selected_non_if_lazy_reference(&reference);
+        }
+        let result = selected_arg.value();
+        ctx.end_selected_non_if_lazy_arm();
+        result
     }
 }
 

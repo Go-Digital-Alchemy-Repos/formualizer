@@ -31,8 +31,7 @@ def test_enabled_diagnostics_preserve_status_and_typed_results_on_overflow():
         "overflow": True,
         "named_formula_member_seen": False,
     }
-    assert len(dump["stamped_sccs"]) == 1
-    assert dump["stamped_sccs"][0]["complete"] is False
+    assert dump["stamped_sccs"] == []
 
 
 def test_complete_diagnostics_and_formula_free_three_dimensional_expansion():
@@ -43,6 +42,10 @@ def test_complete_diagnostics_and_formula_free_three_dimensional_expansion():
     assert dump["diagnostics"]["complete"] is True
     assert dump["stamped_sccs"][0]["members"] == ["Sheet1!A1", "Sheet1!B1"]
     assert len(dump["stamped_sccs"][0]["edges"]) == 2
+    assert all(
+        edge["mechanisms"] == ["evaluated-scalar"]
+        for edge in dump["stamped_sccs"][0]["edges"]
+    )
 
     inspect = fz.Workbook()
     inspect.add_sheet("Mid")
