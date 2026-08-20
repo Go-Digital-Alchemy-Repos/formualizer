@@ -110,6 +110,18 @@ impl SheetRegistry {
 
     /// Active sheet IDs in workbook tab order between two inclusive endpoints.
     pub fn active_span_ids(&self, first: &str, last: &str) -> Option<Vec<SheetId>> {
+        self.active_span_ids_bounded(first, last, usize::MAX)
+            .map(|(ids, _)| ids)
+    }
+
+    /// Active sheet IDs in tab order, allocating at most `limit` entries.
+    /// The boolean reports whether another active sheet was omitted.
+    pub fn active_span_ids_bounded(
+        &self,
+        first: &str,
+        last: &str,
+        limit: usize,
+    ) -> Option<(Vec<SheetId>, bool)> {
         let first_id = self.get_id(first)? as usize;
         let last_id = self.get_id(last)? as usize;
         let (start, end) = if first_id <= last_id {
@@ -117,14 +129,19 @@ impl SheetRegistry {
         } else {
             (last_id, first_id)
         };
-        Some(
-            self.name_by_id[start..=end]
-                .iter()
-                .enumerate()
-                .filter(|(_, name)| !name.is_empty())
-                .map(|(offset, _)| (start + offset) as SheetId)
-                .collect(),
-        )
+        let mut ids = Vec::with_capacity(limit.min(end - start + 1));
+        let mut incomplete = false;
+        for (offset, name) in self.name_by_id[start..=end].iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            if ids.len() == limit {
+                incomplete = true;
+                break;
+            }
+            ids.push((start + offset) as SheetId);
+        }
+        Some((ids, incomplete))
     }
 
     /// Get all sheet IDs and names (excluding removed sheets)

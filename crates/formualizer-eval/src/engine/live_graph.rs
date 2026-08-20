@@ -24,6 +24,10 @@ pub(crate) struct LiveGraphAnalysis {
     pub in_cycle: Vec<bool>,
     /// Number of distinct live cycles (cyclic live SCCs).
     pub cycle_count: usize,
+    /// Exact cyclic SCC member lists in Tarjan emission order.
+    pub cyclic_components: Vec<Vec<u32>>,
+    /// Cyclic component index for each node, if the node is cyclic.
+    pub cyclic_component_by_node: Vec<Option<usize>>,
     /// All member indices in live-topological order: every member appears
     /// after all members it has a live edge *to* (its live dependencies).
     /// Members of one cyclic SCC appear contiguously (their internal order is
@@ -70,6 +74,8 @@ pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAna
 
     let mut in_cycle = vec![false; n];
     let mut cycle_count = 0usize;
+    let mut cyclic_components = Vec::new();
+    let mut cyclic_component_by_node = vec![None; n];
     // Tarjan emits an SCC only after all SCCs it depends on were emitted, so
     // emission order == live-topological order (dependencies first).
     let mut topo: Vec<u32> = Vec::with_capacity(n);
@@ -119,10 +125,13 @@ pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAna
                     members.sort_unstable();
                     let cyclic = members.len() > 1 || adj(vu).iter().any(|&(_, w)| w == v); // self-loop
                     if cyclic {
+                        let component_index = cyclic_components.len();
                         cycle_count += 1;
                         for &m in topo[scc_start..].iter() {
                             in_cycle[m as usize] = true;
+                            cyclic_component_by_node[m as usize] = Some(component_index);
                         }
+                        cyclic_components.push(topo[scc_start..].to_vec());
                     }
                 }
                 frames.pop();
@@ -137,6 +146,8 @@ pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAna
     LiveGraphAnalysis {
         in_cycle,
         cycle_count,
+        cyclic_components,
+        cyclic_component_by_node,
         topo,
     }
 }

@@ -11,7 +11,7 @@ use crate::engine::graph::{FormulaDirtyEventSnapshot, FormulaDirtyLease, WholeSp
 use crate::engine::ingest_pipeline::{DependencyPlanRow, FormulaAstInput};
 use crate::engine::live_edges::{
     DiagnosticRecordedEdge, EDGE_NESTED_FAIL_CLOSED, EDGE_RANGE_EXPANSION, LiveEdgeCollector,
-    RecordingContext,
+    RecordedEdge, RecordingContext,
 };
 use crate::engine::live_graph::analyze_live_graph;
 use crate::engine::lookup_index_cache::{
@@ -77,7 +77,7 @@ use crate::reference::{CellRef, Coord, RangeRef};
 use crate::traits::FunctionProvider;
 use crate::traits::{EvaluationContext, ReferenceInfo, Resolver};
 use formualizer_common::{
-    CoordBuildHasher, LiteralValue, col_letters_from_1based, parse_a1_1based,
+    CoordBuildHasher, LiteralValue, col_letters_from_1based, format_a1_sheet_name, parse_a1_1based,
 };
 use formualizer_parse::parser::ReferenceType;
 use formualizer_parse::{ASTNode, ASTNodeType, ExcelError, ExcelErrorKind};
@@ -1017,6 +1017,7 @@ pub struct Engine<R> {
     // Runtime-cycle SCC evaluation telemetry (RFC #112, Stage 2)
     last_cycle_telemetry: CycleTelemetry,
     cycle_instrumentation: CycleInstrumentationState,
+    upstream_diagnostics: UpstreamDiagnosticsState,
 
     // C0 evaluation-resource observability. IDs are never reset or reused.
     next_evaluation_resource_request_id: u64,
@@ -1893,32 +1894,143 @@ struct CycleInstrumentationState {
     next_step: usize,
 }
 
-fn live_component_indices(n: usize, edges: &[(u32, u32)], target: usize) -> Vec<usize> {
-    fn reachable(n: usize, edges: &[(u32, u32)], target: usize, reverse: bool) -> Vec<bool> {
-        let mut seen = vec![false; n];
-        let mut stack = vec![target];
-        seen[target] = true;
-        while let Some(node) = stack.pop() {
-            for &(from, to) in edges {
-                let (source, destination) = if reverse {
-                    (to as usize, from as usize)
-                } else {
-                    (from as usize, to as usize)
-                };
-                if source == node && !seen[destination] {
-                    seen[destination] = true;
-                    stack.push(destination);
-                }
-            }
+/// One sanitized internal live edge retained by the bounded GOD-184c logger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedSccDiagnosticEdge {
+    pub from: String,
+    pub to: String,
+    pub mechanisms: Vec<&'static str>,
+}
+
+/// One live SCC that caused `#CIRC!` stamping during the last evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedSccDiagnostic {
+    pub members: Vec<String>,
+    pub complete: bool,
+    pub edges: Vec<StampedSccDiagnosticEdge>,
+}
+
+/// Formula-free snapshot of the bounded stamped-SCC diagnostic logger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamDiagnosticsSnapshot {
+    pub complete: bool,
+    pub overflow: bool,
+    pub named_formula_member_seen: bool,
+    pub stamped_sccs: Vec<StampedSccDiagnostic>,
+}
+
+#[derive(Debug, Clone)]
+struct UpstreamDiagnosticsState {
+    enabled: bool,
+    edge_limit: usize,
+    overflow: bool,
+    named_formula_member_seen: bool,
+    stopped: bool,
+    admitted_edges: FxHashSet<(String, String)>,
+    stamped_sccs: Vec<StampedSccDiagnostic>,
+    scc_indices: FxHashMap<Vec<String>, usize>,
+}
+
+impl Default for UpstreamDiagnosticsState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            edge_limit: 1_000_000,
+            overflow: false,
+            named_formula_member_seen: false,
+            stopped: false,
+            admitted_edges: FxHashSet::default(),
+            stamped_sccs: Vec::new(),
+            scc_indices: FxHashMap::default(),
         }
-        seen
+    }
+}
+
+impl UpstreamDiagnosticsState {
+    fn reset_results(&mut self) {
+        self.overflow = false;
+        self.named_formula_member_seen = false;
+        self.stopped = false;
+        self.admitted_edges.clear();
+        self.stamped_sccs.clear();
+        self.scc_indices.clear();
     }
 
-    let forward = reachable(n, edges, target, false);
-    let reverse = reachable(n, edges, target, true);
-    (0..n)
-        .filter(|&index| forward[index] && reverse[index])
-        .collect()
+    fn admit_edge(&mut self, from: &str, to: &str) -> bool {
+        if self.stopped {
+            return false;
+        }
+        let identity = (from.to_string(), to.to_string());
+        if self.admitted_edges.contains(&identity) {
+            return true;
+        }
+        if self.admitted_edges.len() >= self.edge_limit {
+            self.overflow = true;
+            self.stopped = true;
+            return false;
+        }
+        self.admitted_edges.insert(identity);
+        true
+    }
+
+    fn mark_overflow(&mut self) {
+        self.overflow = true;
+        self.stopped = true;
+    }
+
+    fn record_scc(
+        &mut self,
+        members: Vec<String>,
+        mut edges: Vec<StampedSccDiagnosticEdge>,
+        complete: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        edges.sort_by(|left, right| left.from.cmp(&right.from).then(left.to.cmp(&right.to)));
+        edges.dedup_by(|left, right| {
+            if left.from == right.from && left.to == right.to {
+                for mechanism in right.mechanisms.clone() {
+                    if !left.mechanisms.contains(&mechanism) {
+                        left.mechanisms.push(mechanism);
+                    }
+                }
+                left.mechanisms.sort_unstable();
+                true
+            } else {
+                false
+            }
+        });
+        if let Some(&index) = self.scc_indices.get(&members) {
+            let existing = &mut self.stamped_sccs[index];
+            existing.complete &= complete;
+            existing.edges.append(&mut edges);
+            existing
+                .edges
+                .sort_by(|left, right| left.from.cmp(&right.from).then(left.to.cmp(&right.to)));
+            existing.edges.dedup_by(|left, right| {
+                if left.from == right.from && left.to == right.to {
+                    for mechanism in right.mechanisms.clone() {
+                        if !left.mechanisms.contains(&mechanism) {
+                            left.mechanisms.push(mechanism);
+                        }
+                    }
+                    left.mechanisms.sort_unstable();
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
+            let index = self.stamped_sccs.len();
+            self.scc_indices.insert(members.clone(), index);
+            self.stamped_sccs.push(StampedSccDiagnostic {
+                members,
+                complete,
+                edges,
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2736,6 +2848,7 @@ where
             virtual_dep_fallback_activations: 0,
             last_cycle_telemetry: CycleTelemetry::default(),
             cycle_instrumentation: CycleInstrumentationState::default(),
+            upstream_diagnostics: UpstreamDiagnosticsState::default(),
             next_evaluation_resource_request_id: 1,
             evaluation_resource_request_depth: 0,
             active_evaluation_resource_request: None,
@@ -2881,6 +2994,7 @@ where
             virtual_dep_fallback_activations: 0,
             last_cycle_telemetry: CycleTelemetry::default(),
             cycle_instrumentation: CycleInstrumentationState::default(),
+            upstream_diagnostics: UpstreamDiagnosticsState::default(),
             next_evaluation_resource_request_id: 1,
             evaluation_resource_request_depth: 0,
             active_evaluation_resource_request: None,
@@ -2976,6 +3090,24 @@ where
 
     pub fn cycle_instrumentation_targets(&self) -> &[CycleInstrumentationTarget] {
         &self.cycle_instrumentation.targets
+    }
+
+    /// Configure the observational stamped-SCC logger. The limit counts
+    /// distinct internal live-edge identities admitted during one public
+    /// evaluation request.
+    pub fn set_upstream_diagnostics(&mut self, enabled: bool, edge_limit: usize) {
+        self.upstream_diagnostics.enabled = enabled;
+        self.upstream_diagnostics.edge_limit = edge_limit.clamp(1, 1_000_000);
+    }
+
+    pub fn upstream_diagnostics(&self) -> UpstreamDiagnosticsSnapshot {
+        UpstreamDiagnosticsSnapshot {
+            complete: !self.upstream_diagnostics.overflow
+                && !self.upstream_diagnostics.named_formula_member_seen,
+            overflow: self.upstream_diagnostics.overflow,
+            named_formula_member_seen: self.upstream_diagnostics.named_formula_member_seen,
+            stamped_sccs: self.upstream_diagnostics.stamped_sccs.clone(),
+        }
     }
 
     fn reset_cycle_instrumentation_results(&mut self) {
@@ -3655,6 +3787,7 @@ where
         }
         self.last_cycle_telemetry = CycleTelemetry::default();
         self.reset_cycle_instrumentation_results();
+        self.upstream_diagnostics.reset_results();
         // Defensive: consumed at the end of the previous request; a request
         // that errored out mid-walk must not leak its members into this one.
         self.pending_iterative_redirty.clear();
@@ -3662,6 +3795,12 @@ where
         // read within this request (including SCC iteration passes) observes
         // this sample.
         self.clock.refresh();
+    }
+
+    fn begin_public_upstream_diagnostic_request(&mut self) {
+        if self.evaluation_resource_request_depth == 0 {
+            self.upstream_diagnostics.reset_results();
+        }
     }
 
     /// End-of-recalc redirty: volatile vertices (as always) plus members of
@@ -17553,6 +17692,13 @@ where
         out
     }
 
+    /// Return the stored value without public-read numeric normalization.
+    /// Intended for read-only diagnostic bindings that must distinguish Int
+    /// from Number and preserve the latter's IEEE-754 payload exactly.
+    pub fn get_typed_cell_value(&self, sheet: &str, row: u32, col: u32) -> Option<LiteralValue> {
+        self.read_cell_value(sheet, row, col)
+    }
+
     /// Unified internal read API for a single cell value (Arrow-truth).
     pub(crate) fn read_cell_value(&self, sheet: &str, row: u32, col: u32) -> Option<LiteralValue> {
         let asheet = self.sheet_store().sheet(sheet)?;
@@ -17733,6 +17879,7 @@ where
     }
 
     pub fn evaluate_vertex(&mut self, vertex_id: VertexId) -> Result<LiteralValue, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Vertex, |engine| {
             engine.observe_function_semantic_epoch()?;
             // A direct request selects exactly one vertex, regardless of its formula kind.
@@ -18615,6 +18762,7 @@ where
         &mut self,
         targets: &[crate::engine::EvaluationTarget],
     ) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Targeted, |engine| {
             engine.observe_function_semantic_epoch()?;
             engine.validate_deterministic_mode()?;
@@ -18628,6 +18776,7 @@ where
         targets: &[crate::engine::EvaluationTarget],
         options: crate::engine::TargetEvalOptions<'_>,
     ) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Targeted, |engine| {
             engine.active_cancel_flag = options.cancel.clone();
             engine.active_evaluation_deadline = options.deadline;
@@ -18649,6 +18798,7 @@ where
         &mut self,
         targets: &[crate::engine::EvaluationTarget],
     ) -> Result<(EvalResult, crate::engine::TargetEvalDelta), ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::CellsWithDelta, |engine| {
             engine.observe_function_semantic_epoch()?;
             engine.validate_deterministic_mode()?;
@@ -18663,6 +18813,7 @@ where
         &mut self,
         targets: &[(&str, u32, u32)],
     ) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Targeted, |engine| {
             engine.evaluate_until_unobserved(targets)
         })
@@ -18844,6 +18995,7 @@ where
 
     /// Evaluate using a previously constructed compatibility or target plan.
     pub fn evaluate_recalc_plan(&mut self, plan: &RecalcPlan) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::RecalcPlan, |engine| {
             engine.evaluate_recalc_plan_unobserved(plan)
         })
@@ -18855,6 +19007,7 @@ where
         cancel: Option<crate::engine::CancelToken>,
         deadline: Option<Instant>,
     ) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::RecalcPlan, |engine| {
             engine.active_cancel_flag = cancel.clone();
             engine.active_evaluation_deadline = deadline;
@@ -21386,6 +21539,7 @@ where
 
     /// Evaluate all dirty/volatile vertices
     pub fn evaluate_all(&mut self) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Full, |engine| {
             engine.evaluate_all_unobserved()
         })
@@ -21606,6 +21760,7 @@ where
     pub fn evaluate_all_with_target_delta(
         &mut self,
     ) -> Result<(EvalResult, crate::engine::TargetEvalDelta), ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::FullWithDelta, |engine| {
             engine.observe_function_semantic_epoch()?;
             let mut collector = DeltaCollector::new(DeltaMode::Cells);
@@ -21622,6 +21777,7 @@ where
         &mut self,
         policy: EvalDeltaCompatibilityPolicy,
     ) -> Result<(EvalResult, EvalDelta), ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::FullWithDelta, |engine| {
             engine.observe_function_semantic_epoch()?;
             let mut collector = DeltaCollector::new(DeltaMode::Cells);
@@ -21757,6 +21913,7 @@ where
         row: u32,
         col: u32,
     ) -> Result<Option<LiteralValue>, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Cell, |engine| {
             engine.evaluate_cell_unobserved(sheet, row, col)
         })
@@ -21795,6 +21952,7 @@ where
         &mut self,
         targets: &[(&str, u32, u32)],
     ) -> Result<Vec<Option<LiteralValue>>, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::Cells, |engine| {
             engine.evaluate_cells_unobserved(targets)
         })
@@ -21827,6 +21985,7 @@ where
         targets: &[(&str, u32, u32)],
         cancel: crate::engine::CancelToken,
     ) -> Result<Vec<Option<LiteralValue>>, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(
             EvaluationRequestKind::CellsCancellable,
             |engine| {
@@ -21864,6 +22023,7 @@ where
         &mut self,
         targets: &[(&str, u32, u32)],
     ) -> Result<(Vec<Option<LiteralValue>>, crate::engine::TargetEvalDelta), ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::CellsWithDelta, |engine| {
             engine.observe_function_semantic_epoch()?;
             engine.validate_deterministic_mode()?;
@@ -21892,6 +22052,7 @@ where
         targets: &[(&str, u32, u32)],
         policy: EvalDeltaCompatibilityPolicy,
     ) -> Result<(Vec<Option<LiteralValue>>, EvalDelta), ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::CellsWithDelta, |engine| {
             engine.evaluate_cells_with_delta_unobserved(targets, policy)
         })
@@ -22381,6 +22542,7 @@ where
         &mut self,
         cancel: crate::engine::CancelToken,
     ) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::FullCancellable, |engine| {
             engine.observe_function_semantic_epoch()?;
             engine.active_cancel_flag = Some(cancel.clone());
@@ -22549,6 +22711,7 @@ where
         targets: &[&str],
         cancel: crate::engine::CancelToken,
     ) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(
             EvaluationRequestKind::TargetedCancellable,
             |engine| {
@@ -25161,7 +25324,7 @@ where
                 member.cell.map(|cell| {
                     format!(
                         "{}!{}{}",
-                        self.graph.sheet_name(cell.sheet_id),
+                        format_a1_sheet_name(self.graph.sheet_name(cell.sheet_id)),
                         crate::reference::Coord::col_to_letters(cell.coord.col()),
                         cell.coord.row() + 1
                     )
@@ -25328,6 +25491,14 @@ where
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
         let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // Optional metadata is separately hard-bounded. The compact target
+        // graph above remains the sole unbounded structure required by normal
+        // SCC classification, including when diagnostics are disabled.
+        let mut out_edge_records = self
+            .upstream_diagnostics
+            .enabled
+            .then(|| vec![FxHashMap::<u32, RecordedEdge>::default(); n]);
+        let mut out_edge_record_count = 0usize;
         let mut diagnostic_edge_records: Vec<
             FxHashMap<(SheetId, u32, u32), DiagnosticRecordedEdge>,
         > = vec![FxHashMap::default(); n];
@@ -25463,6 +25634,11 @@ where
             for i in 0..n {
                 if pos[i] >= 0 {
                     out_edges[i].clear();
+                    if let Some(records) = out_edge_records.as_mut() {
+                        out_edge_record_count =
+                            out_edge_record_count.saturating_sub(records[i].len());
+                        records[i].clear();
+                    }
                     diagnostic_edge_records[i].clear();
                 }
             }
@@ -25474,6 +25650,18 @@ where
                     "edge from a member that did not run"
                 );
                 out_edges[from as usize].push(to);
+                if let Some(records) = out_edge_records.as_mut()
+                    && !self.upstream_diagnostics.stopped
+                {
+                    let slot = &mut records[from as usize];
+                    if let Some(existing) = slot.get_mut(&to) {
+                        existing.selected |= record.selected;
+                        existing.mechanisms |= record.mechanisms;
+                    } else if out_edge_record_count < self.upstream_diagnostics.edge_limit {
+                        slot.insert(to, record);
+                        out_edge_record_count += 1;
+                    }
+                }
             }
             for record in diagnostic_drained {
                 diagnostic_edge_records[record.from as usize]
@@ -25481,8 +25669,8 @@ where
             }
             let mut edges: Vec<(u32, u32)> = Vec::new();
             for (i, outs) in out_edges.iter().enumerate() {
-                for &t in outs {
-                    edges.push((i as u32, t));
+                for &to in outs {
+                    edges.push((i as u32, to));
                 }
             }
             edges.sort_unstable();
@@ -25519,7 +25707,12 @@ where
                     {
                         continue;
                     }
-                    let component = live_component_indices(n, &edges, member_index);
+                    let component: Vec<usize> = analysis.cyclic_components[analysis
+                        .cyclic_component_by_node[member_index]
+                        .expect("cyclic member has component")]
+                    .iter()
+                    .map(|&index| index as usize)
+                    .collect();
                     let mut live_members: Vec<String> = component
                         .iter()
                         .filter_map(|&index| member_addresses[index].clone())
@@ -25575,6 +25768,93 @@ where
                 witnessed_cycles = witnessed_cycles.max(analysis.cycle_count);
                 match policy {
                     CyclePolicy::Error => {
+                        if self.upstream_diagnostics.enabled && !self.upstream_diagnostics.stopped {
+                            let mut captures = Vec::new();
+                            for raw_component in &analysis.cyclic_components {
+                                if self.upstream_diagnostics.stopped {
+                                    break;
+                                }
+                                let component: Vec<usize> =
+                                    raw_component.iter().map(|&index| index as usize).collect();
+                                if component
+                                    .iter()
+                                    .any(|&index| member_addresses[index].is_none())
+                                {
+                                    self.upstream_diagnostics.named_formula_member_seen = true;
+                                    continue;
+                                }
+                                let component_set: FxHashSet<usize> =
+                                    component.iter().copied().collect();
+                                let members: Vec<String> = component
+                                    .iter()
+                                    .filter_map(|&index| member_addresses[index].clone())
+                                    .collect();
+                                let mut captured_edges = Vec::new();
+                                let mut complete = !self.upstream_diagnostics.stopped;
+                                let records = out_edge_records
+                                    .as_ref()
+                                    .expect("enabled diagnostics allocate bounded metadata");
+                                for &from in &component {
+                                    let from_address = member_addresses[from]
+                                        .as_ref()
+                                        .expect("cell-only component checked above")
+                                        .clone();
+                                    for &to_raw in &out_edges[from] {
+                                        let to = to_raw as usize;
+                                        if !component_set.contains(&to) {
+                                            continue;
+                                        }
+                                        let Some(record) = records[from].get(&to_raw) else {
+                                            self.upstream_diagnostics.mark_overflow();
+                                            complete = false;
+                                            continue;
+                                        };
+                                        let to_address = member_addresses[to]
+                                            .as_ref()
+                                            .expect("cell-only component checked above");
+                                        if !self
+                                            .upstream_diagnostics
+                                            .admit_edge(&from_address, to_address)
+                                        {
+                                            complete = false;
+                                            continue;
+                                        }
+                                        let mut mechanisms = Vec::new();
+                                        if record.mechanisms & EDGE_NESTED_FAIL_CLOSED != 0 {
+                                            mechanisms.push("nested-fail-closed");
+                                        }
+                                        if !record.selected
+                                            && record.mechanisms & EDGE_NESTED_FAIL_CLOSED == 0
+                                        {
+                                            mechanisms.push("lazy-inactive-branch");
+                                        }
+                                        if record.selected && record.mechanisms == 0 {
+                                            mechanisms.push("non-if-lazy");
+                                        }
+                                        if record.mechanisms & EDGE_RANGE_EXPANSION != 0 {
+                                            mechanisms.push("range-expansion");
+                                        }
+                                        if mechanisms.is_empty() {
+                                            mechanisms.push("static-fallback");
+                                        }
+                                        mechanisms.sort_unstable();
+                                        captured_edges.push(StampedSccDiagnosticEdge {
+                                            from: from_address.clone(),
+                                            to: to_address.clone(),
+                                            mechanisms,
+                                        });
+                                    }
+                                }
+                                captures.push((members, captured_edges, complete));
+                            }
+                            for (members, captured_edges, complete) in captures {
+                                self.upstream_diagnostics.record_scc(
+                                    members,
+                                    captured_edges,
+                                    complete,
+                                );
+                            }
+                        }
                         // POLICY (Error): stamp every member of a live cycle,
                         // then one settling pass over the remaining members in
                         // live-topological order so error propagation
@@ -25729,8 +26009,8 @@ where
                 if excluded[i] {
                     continue;
                 }
-                let is_stale = out_edges[i].iter().any(|&t| {
-                    let t = t as usize;
+                let is_stale = out_edges[i].iter().any(|&to| {
+                    let t = to as usize;
                     changed[t] && (pos[i] < 0 || (pos[t] >= 0 && pos[i] < pos[t]))
                 });
                 if is_stale {
@@ -27228,6 +27508,7 @@ where
     /// This is the same flow as `evaluate_all` but threads a ChangeLog through
     /// every effect application so that spill commits/clears are captured.
     pub fn evaluate_all_logged(&mut self, log: &mut ChangeLog) -> Result<EvalResult, ExcelError> {
+        self.begin_public_upstream_diagnostic_request();
         self.observe_evaluation_resource_request(EvaluationRequestKind::FullLogged, |engine| {
             engine.evaluate_all_logged_unobserved(log)
         })

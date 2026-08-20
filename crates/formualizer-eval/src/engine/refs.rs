@@ -151,6 +151,17 @@ pub(crate) fn expand_three_dimensional(
     reference: &ReferenceType,
     sheet_registry: &SheetRegistry,
 ) -> Result<Vec<ReferenceType>, ExcelError> {
+    expand_three_dimensional_bounded(reference, sheet_registry, usize::MAX).map(|(items, _)| items)
+}
+
+/// Expand at most `limit` sheets from a declared 3-D reference. The boolean
+/// reports whether additional sheets were omitted, allowing inspection APIs
+/// to honor their work budgets before allocating one reference per sheet.
+pub(crate) fn expand_three_dimensional_bounded(
+    reference: &ReferenceType,
+    sheet_registry: &SheetRegistry,
+    limit: usize,
+) -> Result<(Vec<ReferenceType>, bool), ExcelError> {
     let (first, last) = match reference {
         ReferenceType::Cell3D {
             sheet_first,
@@ -162,54 +173,57 @@ pub(crate) fn expand_three_dimensional(
             sheet_last,
             ..
         } => (sheet_first, sheet_last),
-        _ => return Ok(vec![reference.clone()]),
+        _ => return Ok((vec![reference.clone()], false)),
     };
-    let sheet_ids = sheet_registry
-        .active_span_ids(first, last)
+    let (sheet_ids, incomplete) = sheet_registry
+        .active_span_ids_bounded(first, last, limit)
         .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
-    Ok(sheet_ids
-        .into_iter()
-        .map(|sheet_id| {
-            let sheet = Some(sheet_registry.name(sheet_id).to_string());
-            match reference {
-                ReferenceType::Cell3D {
-                    row,
-                    col,
-                    row_abs,
-                    col_abs,
-                    ..
-                } => ReferenceType::Cell {
-                    sheet,
-                    row: *row,
-                    col: *col,
-                    row_abs: *row_abs,
-                    col_abs: *col_abs,
-                },
-                ReferenceType::Range3D {
-                    start_row,
-                    start_col,
-                    end_row,
-                    end_col,
-                    start_row_abs,
-                    start_col_abs,
-                    end_row_abs,
-                    end_col_abs,
-                    ..
-                } => ReferenceType::Range {
-                    sheet,
-                    start_row: *start_row,
-                    start_col: *start_col,
-                    end_row: *end_row,
-                    end_col: *end_col,
-                    start_row_abs: *start_row_abs,
-                    start_col_abs: *start_col_abs,
-                    end_row_abs: *end_row_abs,
-                    end_col_abs: *end_col_abs,
-                },
-                _ => unreachable!(),
-            }
-        })
-        .collect())
+    Ok((
+        sheet_ids
+            .into_iter()
+            .map(|sheet_id| {
+                let sheet = Some(sheet_registry.name(sheet_id).to_string());
+                match reference {
+                    ReferenceType::Cell3D {
+                        row,
+                        col,
+                        row_abs,
+                        col_abs,
+                        ..
+                    } => ReferenceType::Cell {
+                        sheet,
+                        row: *row,
+                        col: *col,
+                        row_abs: *row_abs,
+                        col_abs: *col_abs,
+                    },
+                    ReferenceType::Range3D {
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                        start_row_abs,
+                        start_col_abs,
+                        end_row_abs,
+                        end_col_abs,
+                        ..
+                    } => ReferenceType::Range {
+                        sheet,
+                        start_row: *start_row,
+                        start_col: *start_col,
+                        end_row: *end_row,
+                        end_col: *end_col,
+                        start_row_abs: *start_row_abs,
+                        start_col_abs: *start_col_abs,
+                        end_row_abs: *end_row_abs,
+                        end_col_abs: *end_col_abs,
+                    },
+                    _ => unreachable!(),
+                }
+            })
+            .collect(),
+        incomplete,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

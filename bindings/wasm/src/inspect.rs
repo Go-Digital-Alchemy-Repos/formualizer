@@ -594,6 +594,11 @@ enum WireSemanticReference {
         resolved: Option<WireRangeAddress>,
         cell_count: f64,
     },
+    ThreeDimensional {
+        declared: String,
+        ranges: Vec<WireRangeAddress>,
+        cell_count: f64,
+    },
     Name {
         name: String,
         resolution: WireNameResolution,
@@ -625,6 +630,15 @@ fn wire_reference(value: &SemanticReference) -> Result<WireSemanticReference, Js
             declared: declared.into(),
             resolved: resolved.as_ref().map(Into::into),
             // Grid-bounded to 1,048,576 * 16,384, well below 2^53.
+            cell_count: *cell_count as f64,
+        }),
+        SemanticReference::ThreeDimensional {
+            declared,
+            ranges,
+            cell_count,
+        } => Ok(WireSemanticReference::ThreeDimensional {
+            declared: declared.clone(),
+            ranges: ranges.iter().map(Into::into).collect(),
             cell_count: *cell_count as f64,
         }),
         SemanticReference::Name { name, resolution } => Ok(WireSemanticReference::Name {

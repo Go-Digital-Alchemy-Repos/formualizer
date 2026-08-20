@@ -524,6 +524,7 @@ def test_new_enum_member_sets_are_exact() -> None:
             "Name",
             "Table",
             "External",
+            "ThreeDimensional",
             "Unsupported",
             "Unknown",
         },

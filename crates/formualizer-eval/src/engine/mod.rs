@@ -61,8 +61,8 @@ pub use arena::AstNodeId;
 pub use cancel::CancelToken;
 pub use eval::{
     CycleInstrumentationEdge, CycleInstrumentationTarget, CycleTelemetry, Engine, EngineAction,
-    EngineBaselineStats, EvalResult, RecalcPlan, SourceFormulaIngress, TableMetadata,
-    VirtualDepTelemetry,
+    EngineBaselineStats, EvalResult, RecalcPlan, SourceFormulaIngress, StampedSccDiagnostic,
+    StampedSccDiagnosticEdge, TableMetadata, UpstreamDiagnosticsSnapshot, VirtualDepTelemetry,
 };
 pub use eval_delta::{
     DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy, EvalDeltaRecord, TARGET_EVAL_DELTA_VERSION,

@@ -184,6 +184,10 @@ fn trace_budgets_are_global_and_have_boundary_exactness() {
     assert_eq!(node_limited.nodes.len(), 1);
     assert!(node_limited.truncation.incomplete);
     assert_eq!(
+        node_limited.nodes[0].links[0].omitted,
+        Some(OmittedCount::Exact(3))
+    );
+    assert_eq!(
         node_limited.truncation.omitted,
         Some(OmittedCount::AtLeast(4))
     );
@@ -519,7 +523,7 @@ fn every_public_inspection_call_is_state_preserving_and_stamped() {
 }
 
 #[test]
-fn unsupported_3d_reference_is_an_explicit_semantic_leaf() {
+fn three_dimensional_reference_expands_without_formula_text() {
     let mut engine = engine();
     engine
         .set_cell_value("Model", 1, 1, LiteralValue::Number(1.0))
@@ -533,8 +537,28 @@ fn unsupported_3d_reference_is_an_explicit_semantic_leaf() {
         .unwrap();
     assert!(matches!(
         report.precedents[0].reference,
-        SemanticReference::Unsupported { .. }
+        SemanticReference::ThreeDimensional { ref ranges, cell_count: 2, .. }
+            if ranges.len() == 2
     ));
+
+    let bounded = engine
+        .precedents(
+            &address("Model", 1, 2),
+            &PrecedentOptions::default().with_max_work(2),
+        )
+        .unwrap();
+    assert!(bounded.truncation.incomplete);
+    assert!(matches!(
+        bounded.precedents[0].reference,
+        SemanticReference::ThreeDimensional { ref ranges, cell_count: 1, .. }
+            if ranges.len() == 1
+    ));
+
+    let trace = engine
+        .trace(&[address("Model", 1, 2)], &TraceOptions::default())
+        .unwrap();
+    assert!(!trace.truncation.incomplete);
+    assert_eq!(trace.nodes[0].links[0].targets.len(), 2);
 }
 
 #[test]

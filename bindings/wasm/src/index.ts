@@ -385,6 +385,13 @@ export type SemanticReference =
       /** Grid-bounded and therefore represented exactly as a JS number. */
       cellCount: number;
     }
+  | {
+      kind: 'threeDimensional';
+      declared: string;
+      ranges: FiniteRangeAddress[];
+      /** Grid-bounded and therefore represented exactly as a JS number. */
+      cellCount: number;
+    }
   | { kind: 'name'; name: string; resolution: NameResolution }
   | {
       kind: 'table';

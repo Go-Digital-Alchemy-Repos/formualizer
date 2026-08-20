@@ -152,7 +152,7 @@ if typing.TYPE_CHECKING:
         TraceDirection.Precedents, TraceDirection.Dependents,
         OmittedCountKind.Exact, OmittedCountKind.AtLeast, OmittedCountKind.Unknown,
         SpillRoleKind.Anchor, SpillRoleKind.Member, SpillRoleKind.Unknown,
-        ReferenceKind.Cell, ReferenceKind.Range, ReferenceKind.Name, ReferenceKind.Table, ReferenceKind.External, ReferenceKind.Unsupported, ReferenceKind.Unknown,
+        ReferenceKind.Cell, ReferenceKind.Range, ReferenceKind.Name, ReferenceKind.Table, ReferenceKind.External, ReferenceKind.ThreeDimensional, ReferenceKind.Unsupported, ReferenceKind.Unknown,
         NameResolutionKind.Cell, NameResolutionKind.Range, NameResolutionKind.Literal, NameResolutionKind.Formula, NameResolutionKind.Unresolved, NameResolutionKind.Unknown,
         TraceLinkKindType.Formula, TraceLinkKindType.SpillAnchor, TraceLinkKindType.SpillReader, TraceLinkKindType.Unknown,
     )

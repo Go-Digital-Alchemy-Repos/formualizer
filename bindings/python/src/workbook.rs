@@ -4,7 +4,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 use formualizer::common::LiteralValue;
-use formualizer::common::error::{ExcelError, ExcelErrorKind};
+use formualizer::common::error::{ExcelError, ExcelErrorExtra, ExcelErrorKind};
 
 use crate::engine::{
     PyEvaluationConfig, apply_binding_eval_defaults, eval_plan_to_py, merge_python_eval_config,
@@ -12,6 +12,7 @@ use crate::engine::{
 use crate::enums::PyWorkbookMode;
 use crate::errors::workbook_error_to_pyerr;
 use crate::value::{literal_to_py, py_to_literal};
+use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 
 type SheetCellMap = HashMap<(u32, u32), CellData>;
@@ -34,6 +35,80 @@ fn validate_cell_coords(row: u32, col: u32) -> PyResult<()> {
         ));
     }
     Ok(())
+}
+
+fn typed_literal_json(value: &LiteralValue) -> serde_json::Value {
+    match value {
+        LiteralValue::Int(value) => serde_json::json!({"type": "Int", "value": value}),
+        LiteralValue::Number(value) => {
+            serde_json::json!({"type": "Number", "bits": value.to_bits()})
+        }
+        LiteralValue::Boolean(value) => serde_json::json!({"type": "Boolean", "value": value}),
+        LiteralValue::Text(value) => serde_json::json!({"type": "Text", "value": value}),
+        LiteralValue::Empty => serde_json::json!({"type": "Empty"}),
+        LiteralValue::Pending => serde_json::json!({"type": "Pending"}),
+        LiteralValue::Date(value) => serde_json::json!({
+            "type": "Date", "year": value.year(), "month": value.month(), "day": value.day(),
+        }),
+        LiteralValue::Time(value) => serde_json::json!({
+            "type": "Time", "seconds": value.num_seconds_from_midnight(),
+            "nanoseconds": value.nanosecond(),
+        }),
+        LiteralValue::DateTime(value) => serde_json::json!({
+            "type": "DateTime", "year": value.year(), "month": value.month(), "day": value.day(),
+            "seconds": value.time().num_seconds_from_midnight(),
+            "nanoseconds": value.time().nanosecond(),
+        }),
+        LiteralValue::Duration(value) => {
+            let seconds = value.num_seconds();
+            let remainder = (*value - chrono::Duration::seconds(seconds))
+                .num_nanoseconds()
+                .expect("sub-second duration remainder always fits i64");
+            serde_json::json!({"type": "Duration", "seconds": seconds, "nanoseconds": remainder})
+        }
+        LiteralValue::Array(rows) => serde_json::json!({
+            "type": "Array",
+            "rows": rows.iter().map(|row| row.iter().map(typed_literal_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        }),
+        LiteralValue::Error(error) => {
+            let context = error.context.as_ref().map(|context| {
+                serde_json::json!({
+                    "row": context.row, "col": context.col,
+                    "origin_row": context.origin_row, "origin_col": context.origin_col,
+                    "origin_sheet": context.origin_sheet,
+                })
+            });
+            let extra = match &error.extra {
+                ExcelErrorExtra::None => serde_json::json!({"type": "None"}),
+                ExcelErrorExtra::Spill {
+                    expected_rows,
+                    expected_cols,
+                } => serde_json::json!({
+                    "type": "Spill", "expected_rows": expected_rows,
+                    "expected_cols": expected_cols,
+                }),
+                ExcelErrorExtra::Resource { detail } => serde_json::json!({
+                    "type": "Resource", "reason": detail.reason.as_str(),
+                    "limit": detail.limit, "observed": detail.observed,
+                    "request_id": detail.request_id,
+                }),
+                ExcelErrorExtra::PreparationStale { reason } => serde_json::json!({
+                    "type": "PreparationStale", "reason": reason.as_str(),
+                }),
+                ExcelErrorExtra::PlanStale { reason } => serde_json::json!({
+                    "type": "PlanStale", "reason": reason.as_str(),
+                }),
+                other => serde_json::json!({
+                    "type": "Unknown", "debug": format!("{other:?}"),
+                }),
+            };
+            serde_json::json!({
+                "type": "Error", "kind": format!("{:?}", error.kind),
+                "message": error.message, "context": context,
+                "extra": extra,
+            })
+        }
+    }
 }
 
 /// Map a poisoned-lock error to a workbook `IoError` so it can cross the thread
@@ -851,6 +926,20 @@ impl PyWorkbook {
         literal_to_py(py, &v)
     }
 
+    /// Return the current cell result as a closed, type-preserving JSON value.
+    /// This accessor is read-only and deliberately bypasses `literal_to_py`,
+    /// whose coercions erase Int/Number and IEEE-754 payload distinctions.
+    pub fn get_typed_value_json(&self, sheet: &str, row: u32, col: u32) -> PyResult<String> {
+        validate_cell_coords(row, col)?;
+        let value = self
+            .read_inner()?
+            .engine()
+            .get_typed_cell_value(sheet, row, col)
+            .unwrap_or(LiteralValue::Empty);
+        serde_json::to_string(&typed_literal_json(&value))
+            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))
+    }
+
     /// Pin the evaluation clock to a caller-supplied instant, so the
     /// volatile date/time builtins (TODAY, NOW) evaluate deterministically
     /// on the next recalculation. Takes effect on a live workbook; no
@@ -967,6 +1056,58 @@ impl PyWorkbook {
             .collect();
         serde_json::to_string(&serde_json::json!({"targets": targets}))
             .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))
+    }
+
+    /// Configure the observational, per-evaluation stamped-SCC logger.
+    /// The production capacity is one million distinct internal live edges;
+    /// tests may supply a smaller positive limit to exercise overflow.
+    #[pyo3(signature = (enabled, edge_limit=1_000_000))]
+    pub fn set_upstream_diagnostics(&self, enabled: bool, edge_limit: usize) -> PyResult<()> {
+        if edge_limit == 0 || edge_limit > 1_000_000 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "upstream diagnostic edge limit must be between 1 and 1000000",
+            ));
+        }
+        self.write_inner()?
+            .engine_mut()
+            .set_upstream_diagnostics(enabled, edge_limit);
+        Ok(())
+    }
+
+    /// Return the sanitized stamped-SCC logger snapshot as formula-free JSON.
+    pub fn upstream_diagnostics_json(&self) -> PyResult<String> {
+        let wb = self.read_inner()?;
+        let snapshot = wb.engine().upstream_diagnostics();
+        let mut stamped_sccs = snapshot.stamped_sccs;
+        stamped_sccs.sort_by(|left, right| left.members.first().cmp(&right.members.first()));
+        let stamped_sccs: Vec<serde_json::Value> = stamped_sccs
+            .into_iter()
+            .map(|mut scc| {
+                scc.edges
+                    .sort_by(|left, right| left.from.cmp(&right.from).then(left.to.cmp(&right.to)));
+                serde_json::json!({
+                    "members": scc.members,
+                    "complete": scc.complete,
+                    "edges": scc.edges.into_iter().map(|mut edge| {
+                        edge.mechanisms.sort_unstable();
+                        serde_json::json!({
+                            "from": edge.from,
+                            "to": edge.to,
+                            "mechanisms": edge.mechanisms,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::to_string(&serde_json::json!({
+            "diagnostics": {
+                "complete": snapshot.complete,
+                "overflow": snapshot.overflow,
+                "named_formula_member_seen": snapshot.named_formula_member_seen,
+            },
+            "stamped_sccs": stamped_sccs,
+        }))
+        .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))
     }
 
     pub fn evaluate_cells(

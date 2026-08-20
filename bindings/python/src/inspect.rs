@@ -239,7 +239,7 @@ binding_enum!(PyLinkDisposition, "LinkDisposition", core::LinkDisposition, { Exp
 binding_enum!(PyTraceDirection, "TraceDirection", core::TraceDirection, { Precedents, Dependents });
 binding_enum!(PyOmittedCountKind, "OmittedCountKind", core::OmittedCount, { Exact, AtLeast, Unknown });
 binding_enum!(PySpillRoleKind, "SpillRoleKind", core::SpillRole, { Anchor, Member, Unknown });
-binding_enum!(PyReferenceKind, "ReferenceKind", core::SemanticReference, { Cell, Range, Name, Table, External, Unsupported, Unknown });
+binding_enum!(PyReferenceKind, "ReferenceKind", core::SemanticReference, { Cell, Range, Name, Table, External, ThreeDimensional, Unsupported, Unknown });
 binding_enum!(PyNameResolutionKind, "NameResolutionKind", core::NameResolution, { Cell, Range, Literal, Formula, Unresolved, Unknown });
 binding_enum!(PyTraceLinkKindType, "TraceLinkKindType", core::TraceLinkKind, { Formula, SpillAnchor, SpillReader, Unknown });
 
@@ -728,6 +728,7 @@ impl PySemanticReference {
             core::SemanticReference::Name { .. } => PyReferenceKind::Name,
             core::SemanticReference::Table { .. } => PyReferenceKind::Table,
             core::SemanticReference::External { .. } => PyReferenceKind::External,
+            core::SemanticReference::ThreeDimensional { .. } => PyReferenceKind::ThreeDimensional,
             core::SemanticReference::Unsupported { .. } => PyReferenceKind::Unsupported,
             _ => PyReferenceKind::Unknown,
         }
@@ -743,6 +744,7 @@ impl PySemanticReference {
     fn declared(&self) -> Option<String> {
         match &self.inner {
             core::SemanticReference::Range { declared, .. } => Some(area_text(declared)),
+            core::SemanticReference::ThreeDimensional { declared, .. } => Some(declared.clone()),
             _ => None,
         }
     }
@@ -757,7 +759,17 @@ impl PySemanticReference {
     #[getter]
     fn cell_count(&self) -> Option<u64> {
         match self.inner {
-            core::SemanticReference::Range { cell_count, .. } => Some(cell_count),
+            core::SemanticReference::Range { cell_count, .. }
+            | core::SemanticReference::ThreeDimensional { cell_count, .. } => Some(cell_count),
+            _ => None,
+        }
+    }
+    #[getter]
+    fn ranges(&self) -> Option<Vec<String>> {
+        match &self.inner {
+            core::SemanticReference::ThreeDimensional { ranges, .. } => {
+                Some(ranges.iter().map(range_text).collect())
+            }
             _ => None,
         }
     }
@@ -826,6 +838,9 @@ fn reference_dict(py: Python<'_>, value: &core::SemanticReference) -> PyResult<P
     out.set_item("raw", wrapper.raw())?;
     out.set_item("text", wrapper.text())?;
     out.set_item("reason", wrapper.reason())?;
+    if matches!(value, core::SemanticReference::ThreeDimensional { .. }) {
+        out.set_item("ranges", wrapper.ranges())?;
+    }
     match wrapper.resolution() {
         Some(value) => out.set_item("resolution", value.to_dict(py)?)?,
         None => out.set_item("resolution", py.None())?,

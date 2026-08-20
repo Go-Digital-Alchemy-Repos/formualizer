@@ -1027,6 +1027,8 @@ class SemanticReference:
     @property
     def cell_count(self) -> typing.Optional[builtins.int]: ...
     @property
+    def ranges(self) -> typing.Optional[builtins.list[builtins.str]]: ...
+    @property
     def name(self) -> typing.Optional[builtins.str]: ...
     @property
     def resolution(self) -> typing.Optional[NameResolution]: ...
@@ -1780,6 +1782,12 @@ class Workbook:
             print(wb.evaluate_cell("Data", 3, 1))
         ```
         """
+    def get_typed_value_json(self, sheet: builtins.str, row: builtins.int, col: builtins.int) -> builtins.str:
+        r"""
+        Return the current cell result as a closed, type-preserving JSON value.
+        This accessor is read-only and deliberately bypasses `literal_to_py`,
+        whose coercions erase Int/Number and IEEE-754 payload distinctions.
+        """
     def set_deterministic_clock(self, deterministic_timestamp_utc: datetime.datetime, deterministic_timezone: typing.Optional[typing.Any] = None) -> None:
         r"""
         Pin the evaluation clock to a caller-supplied instant, so the
@@ -1817,6 +1825,26 @@ class Workbook:
             t = wb.last_cycle_telemetry()
             print(t.iterated_sccs, t.converged_sccs, t.capped_sccs)
         ```
+        """
+    def set_cycle_instrumentation_targets(self, targets: typing.Sequence[tuple[builtins.str, builtins.int, builtins.int]]) -> None:
+        r"""
+        Enable formula-free first-witness cycle diagnostics for a bounded set
+        of 1-based workbook addresses.
+        """
+    def cycle_instrumentation_json(self) -> builtins.str:
+        r"""
+        Return the sanitized full edge dump used by the GOD-184b exporter.
+        Formula text and cell values are intentionally absent.
+        """
+    def set_upstream_diagnostics(self, enabled: builtins.bool, edge_limit: builtins.int = 1000000) -> None:
+        r"""
+        Configure the observational, per-evaluation stamped-SCC logger.
+        The production capacity is one million distinct internal live edges;
+        tests may supply a smaller positive limit to exercise overflow.
+        """
+    def upstream_diagnostics_json(self) -> builtins.str:
+        r"""
+        Return the sanitized stamped-SCC logger snapshot as formula-free JSON.
         """
     def evaluate_cells(self, targets: list) -> typing.Any: ...
     def get_eval_plan(self, targets: list, *, build_graph_if_needed: builtins.bool = True) -> EvaluationPlan: ...
@@ -1954,6 +1982,7 @@ class ReferenceKind(enum.Enum):
     Name = ...
     Table = ...
     External = ...
+    ThreeDimensional = ...
     Unsupported = ...
     Unknown = ...
 
@@ -2189,7 +2218,7 @@ if typing.TYPE_CHECKING:
         TraceDirection.Precedents, TraceDirection.Dependents,
         OmittedCountKind.Exact, OmittedCountKind.AtLeast, OmittedCountKind.Unknown,
         SpillRoleKind.Anchor, SpillRoleKind.Member, SpillRoleKind.Unknown,
-        ReferenceKind.Cell, ReferenceKind.Range, ReferenceKind.Name, ReferenceKind.Table, ReferenceKind.External, ReferenceKind.Unsupported, ReferenceKind.Unknown,
+        ReferenceKind.Cell, ReferenceKind.Range, ReferenceKind.Name, ReferenceKind.Table, ReferenceKind.External, ReferenceKind.ThreeDimensional, ReferenceKind.Unsupported, ReferenceKind.Unknown,
         NameResolutionKind.Cell, NameResolutionKind.Range, NameResolutionKind.Literal, NameResolutionKind.Formula, NameResolutionKind.Unresolved, NameResolutionKind.Unknown,
         TraceLinkKindType.Formula, TraceLinkKindType.SpillAnchor, TraceLinkKindType.SpillReader, TraceLinkKindType.Unknown,
     )

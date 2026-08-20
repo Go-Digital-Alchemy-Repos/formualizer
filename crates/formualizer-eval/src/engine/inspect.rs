@@ -180,6 +180,14 @@ pub enum SemanticReference {
     External {
         raw: String,
     },
+    /// A declared 3-D cell/range expanded in workbook tab order without
+    /// reparsing formula text. Each range is already intersected with that
+    /// sheet's effective used rectangle.
+    ThreeDimensional {
+        declared: String,
+        ranges: Vec<RangeAddress>,
+        cell_count: u64,
+    },
     Unsupported {
         text: String,
         reason: String,
@@ -1651,9 +1659,40 @@ impl<R: EvaluationContext> Engine<R> {
                 raw: external.raw.clone(),
             },
             refs::SemanticReference::ThreeDimensional(reference) => {
-                SemanticReference::Unsupported {
-                    text: reference.to_string(),
-                    reason: "3D references are not supported by phase-1 introspection".to_string(),
+                let declared = reference.to_string();
+                let mut ranges = Vec::new();
+                let Ok(expanded) =
+                    refs::expand_three_dimensional(reference, self.graph.sheet_reg())
+                else {
+                    return SemanticReference::Unsupported {
+                        text: declared,
+                        reason: "3-D sheet span could not be resolved".to_string(),
+                    };
+                };
+                for item in &expanded {
+                    match self.own_reference(key, refs::classify(item)) {
+                        SemanticReference::Cell(cell) => ranges.push(RangeAddress {
+                            sheet: cell.sheet,
+                            start_row: cell.row,
+                            start_col: cell.column,
+                            end_row: cell.row,
+                            end_col: cell.column,
+                        }),
+                        SemanticReference::Range {
+                            resolved: Some(range),
+                            ..
+                        } => ranges.push(range),
+                        _ => {}
+                    }
+                }
+                let cell_count = ranges
+                    .iter()
+                    .map(|range| u64::from(range.width()) * u64::from(range.height()))
+                    .sum();
+                SemanticReference::ThreeDimensional {
+                    declared,
+                    ranges,
+                    cell_count,
                 }
             }
             refs::SemanticReference::Unsupported(reference) => SemanticReference::Unsupported {
@@ -1661,6 +1700,64 @@ impl<R: EvaluationContext> Engine<R> {
                 reason: "reference form is unsupported by introspection".to_string(),
             },
         }
+    }
+
+    fn own_reference_bounded(
+        &self,
+        key: CellKey,
+        reference: refs::SemanticReference<'_>,
+        work: &mut WorkBudget,
+    ) -> (SemanticReference, bool) {
+        let refs::SemanticReference::ThreeDimensional(reference) = reference else {
+            return (self.own_reference(key, reference), false);
+        };
+        let declared = reference.to_string();
+        let limit = usize::try_from(work.remaining).unwrap_or(usize::MAX);
+        let Ok((expanded, incomplete)) =
+            refs::expand_three_dimensional_bounded(reference, self.graph.sheet_reg(), limit)
+        else {
+            return (
+                SemanticReference::Unsupported {
+                    text: declared,
+                    reason: "3-D sheet span could not be resolved".to_string(),
+                },
+                false,
+            );
+        };
+        let mut ranges = Vec::with_capacity(expanded.len());
+        for item in &expanded {
+            let charged = work.charge();
+            debug_assert!(charged);
+            if !charged {
+                break;
+            }
+            match self.own_reference(key, refs::classify(item)) {
+                SemanticReference::Cell(cell) => ranges.push(RangeAddress {
+                    sheet: cell.sheet,
+                    start_row: cell.row,
+                    start_col: cell.column,
+                    end_row: cell.row,
+                    end_col: cell.column,
+                }),
+                SemanticReference::Range {
+                    resolved: Some(range),
+                    ..
+                } => ranges.push(range),
+                _ => {}
+            }
+        }
+        let cell_count = ranges
+            .iter()
+            .map(|range| u64::from(range.width()) * u64::from(range.height()))
+            .sum();
+        (
+            SemanticReference::ThreeDimensional {
+                declared,
+                ranges,
+                cell_count,
+            },
+            incomplete,
+        )
     }
 
     fn collect_precedents(
@@ -1683,7 +1780,10 @@ impl<R: EvaluationContext> Engine<R> {
                     self.truncated = true;
                     return false;
                 }
-                let reference = self.engine.own_reference(self.key, reference);
+                let (reference, expansion_incomplete) = self
+                    .engine
+                    .own_reference_bounded(self.key, reference, self.work);
+                self.truncated |= expansion_incomplete;
                 if self
                     .precedents
                     .iter()
@@ -2109,6 +2209,25 @@ impl<R: EvaluationContext> Engine<R> {
                                 &mut link,
                                 &mut truncation,
                             )?;
+                        } else if let SemanticReference::ThreeDimensional { ranges, .. } =
+                            &link.reference
+                        {
+                            for range in ranges.clone() {
+                                self.attach_range_targets(
+                                    &range,
+                                    source_id,
+                                    can_follow,
+                                    depth,
+                                    options,
+                                    &mut range_members_used,
+                                    &mut nodes,
+                                    &mut node_by_address,
+                                    &mut parents,
+                                    &mut queue,
+                                    &mut link,
+                                    &mut truncation,
+                                )?;
+                            }
                         }
                         links.push(link);
                     }
@@ -2201,9 +2320,9 @@ impl<R: EvaluationContext> Engine<R> {
             return Ok(());
         }
         if nodes.len() >= options.max_nodes as usize {
-            link.omitted = Some(OmittedCount::AtLeast(1));
             truncation.incomplete = true;
             if !defer_missing_omission {
+                merge_omitted(&mut link.omitted, OmittedCount::AtLeast(1));
                 merge_omitted(&mut truncation.omitted, OmittedCount::AtLeast(1));
             }
             return Ok(());
@@ -2324,7 +2443,7 @@ impl<R: EvaluationContext> Engine<R> {
         }
         if attached < total {
             let omitted = OmittedCount::Exact(total - attached);
-            link.omitted = Some(omitted);
+            merge_omitted(&mut link.omitted, omitted);
             truncation.incomplete = true;
             merge_omitted(&mut truncation.omitted, omitted);
         }

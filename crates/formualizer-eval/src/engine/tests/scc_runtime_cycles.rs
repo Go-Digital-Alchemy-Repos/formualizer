@@ -123,6 +123,92 @@ fn cycle_instrumentation_records_first_witness_and_inactive_edge_mechanism() {
 }
 
 #[test]
+fn upstream_diagnostics_are_neutral_and_overflow_does_not_abort_stamping() {
+    let build = || {
+        let mut engine = runtime_engine();
+        set_formula(&mut engine, "Sheet1", 1, 1, "=B1+1");
+        set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1");
+        set_formula(&mut engine, "Sheet1", 2, 1, "=B2+1");
+        set_formula(&mut engine, "Sheet1", 2, 2, "=A2+1");
+        engine
+    };
+
+    let mut disabled = build();
+    let disabled_result = disabled.evaluate_all().unwrap();
+    let disabled_values = (
+        disabled.get_cell_value("Sheet1", 1, 1),
+        disabled.get_cell_value("Sheet1", 1, 2),
+    );
+
+    let mut enabled = build();
+    enabled.set_upstream_diagnostics(true, 1);
+    let enabled_result = enabled.evaluate_all().unwrap();
+    let enabled_values = (
+        enabled.get_cell_value("Sheet1", 1, 1),
+        enabled.get_cell_value("Sheet1", 1, 2),
+    );
+
+    assert_eq!(disabled_result.cycle_errors, enabled_result.cycle_errors);
+    assert_eq!(disabled_values, enabled_values);
+    assert!(is_circ(&enabled, "Sheet1", 1, 1));
+    assert!(is_circ(&enabled, "Sheet1", 1, 2));
+    assert!(is_circ(&enabled, "Sheet1", 2, 1));
+    assert!(is_circ(&enabled, "Sheet1", 2, 2));
+    let snapshot = enabled.upstream_diagnostics();
+    assert!(snapshot.overflow);
+    assert!(!snapshot.complete);
+    assert_eq!(snapshot.stamped_sccs.len(), 1);
+    assert!(!snapshot.stamped_sccs[0].complete);
+}
+
+#[test]
+fn upstream_diagnostics_capture_complete_internal_live_scc() {
+    let mut engine = runtime_engine();
+    engine.set_upstream_diagnostics(true, 10);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1");
+    engine.evaluate_all().unwrap();
+
+    let snapshot = engine.upstream_diagnostics();
+    assert!(snapshot.complete);
+    assert!(!snapshot.overflow);
+    assert_eq!(snapshot.stamped_sccs.len(), 1);
+    let scc = &snapshot.stamped_sccs[0];
+    assert_eq!(scc.members, vec!["Sheet1!A1", "Sheet1!B1"]);
+    assert_eq!(scc.edges.len(), 2);
+    assert!(
+        scc.edges
+            .iter()
+            .all(|edge| edge.mechanisms == vec!["non-if-lazy"])
+    );
+
+    engine.build_graph_all().unwrap();
+    assert_eq!(engine.upstream_diagnostics().stamped_sccs.len(), 1);
+
+    let empty = engine.evaluate_cells(&[]).unwrap();
+    assert!(empty.is_empty());
+    let reset = engine.upstream_diagnostics();
+    assert!(reset.complete);
+    assert!(reset.stamped_sccs.is_empty());
+}
+
+#[test]
+fn upstream_diagnostics_quote_sheet_names_as_canonical_a1() {
+    let mut engine = runtime_engine();
+    engine.add_sheet("O'Brien Model").unwrap();
+    engine.set_upstream_diagnostics(true, 10);
+    set_formula(&mut engine, "O'Brien Model", 1, 1, "=B1+1");
+    set_formula(&mut engine, "O'Brien Model", 1, 2, "=A1+1");
+    engine.evaluate_all().unwrap();
+
+    let snapshot = engine.upstream_diagnostics();
+    assert_eq!(
+        snapshot.stamped_sccs[0].members,
+        vec!["'O''Brien Model'!A1", "'O''Brien Model'!B1"]
+    );
+}
+
+#[test]
 fn nested_unevaluable_if_does_not_restore_outer_inactive_arm() {
     let mut engine = runtime_engine();
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,IF(1/0,11,12),A2)");
