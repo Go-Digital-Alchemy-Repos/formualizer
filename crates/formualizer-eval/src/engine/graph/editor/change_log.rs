@@ -56,6 +56,15 @@ pub enum ChangeEvent {
         old_hidden: bool,
         new_hidden: bool,
     },
+    /// Engine-side saved formula seed changed by an edit before first recalc.
+    ///
+    /// The dependency graph does not own these one-shot iterative-calculation
+    /// seeds, so Engine undo/redo and rollback wrappers replay this event.
+    SavedFormulaValueChanged {
+        addr: CellRef,
+        old: Option<LiteralValue>,
+        new: Option<LiteralValue>,
+    },
     /// Vertex creation snapshot (for undo). Minimal for now.
     AddVertex {
         id: VertexId,

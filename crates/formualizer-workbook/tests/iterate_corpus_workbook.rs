@@ -11,8 +11,9 @@
 //! calculation). Until the spec text or the implementation moves, this file
 //! pins the implemented behavior.
 
-use formualizer_eval::engine::CycleConfig;
-use formualizer_workbook::{LiteralValue, Workbook, WorkbookConfig};
+use formualizer_eval::engine::{ChangeEvent, CycleConfig};
+use formualizer_parse::parser::parse;
+use formualizer_workbook::{IoError, LiteralValue, Workbook, WorkbookConfig};
 
 fn iterate_workbook(max_iterations: u32, max_change: f64) -> Workbook {
     let mut config = WorkbookConfig::ephemeral();
@@ -29,6 +30,55 @@ fn num(wb: &Workbook, sheet: &str, row: u32, col: u32) -> f64 {
         Some(LiteralValue::Int(i)) => i as f64,
         other => panic!("expected number at {sheet} r{row}c{col}, got {other:?}"),
     }
+}
+
+fn workbook_with_saved_formula_seed() -> Workbook {
+    let mut wb = iterate_workbook(1, 0.001);
+    wb.add_sheet("S").unwrap();
+    wb.engine_mut()
+        .set_cell_formula("S", 1, 1, parse("=A1+1").unwrap())
+        .unwrap();
+    wb.engine_mut()
+        .seed_saved_formula_value("S", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    wb
+}
+
+#[test]
+fn undo_before_first_recalc_restores_saved_formula_seed() {
+    let mut wb = workbook_with_saved_formula_seed();
+
+    wb.begin_action("replace loaded formula");
+    wb.set_formula("S", 1, 1, "=A1+2").unwrap();
+    wb.end_action();
+    assert!(wb.changelog().events().iter().any(|event| matches!(
+        event,
+        ChangeEvent::SavedFormulaValueChanged { addr, old: Some(LiteralValue::Number(10.0)), new: None }
+            if addr.coord.row() == 0 && addr.coord.col() == 0
+    )));
+    wb.undo().unwrap();
+
+    wb.evaluate_all().unwrap();
+    assert_eq!(num(&wb, "S", 1, 1), 11.0);
+}
+
+#[test]
+fn transaction_rollback_before_first_recalc_restores_saved_formula_seed() {
+    let mut wb = workbook_with_saved_formula_seed();
+
+    let error = wb
+        .action("replace loaded formula", |tx| -> Result<(), IoError> {
+            tx.set_formula("S", 1, 1, "=A1+2")?;
+            Err(IoError::Backend {
+                backend: "test".to_string(),
+                message: "abort".to_string(),
+            })
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("abort"));
+
+    wb.evaluate_all().unwrap();
+    assert_eq!(num(&wb, "S", 1, 1), 11.0);
 }
 
 #[test]

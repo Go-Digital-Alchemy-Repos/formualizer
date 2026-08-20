@@ -895,41 +895,15 @@ fn engine_to_oval(v: &Option<LiteralValue>) -> Result<OVal, String> {
     }
 }
 
-/// Numeric equality with a tiny tolerance (the generated subset is exact
-/// integer arithmetic, but `*`/chains can produce large magnitudes; compare
-/// with a relative epsilon to be safe against f64 association).
-fn approx_eq(a: f64, b: f64) -> bool {
-    if a == b {
-        return true;
-    }
-    let diff = (a - b).abs();
-    let scale = a.abs().max(b.abs()).max(1.0);
-    diff <= 1e-9 * scale
-}
-
 fn ovals_match(oracle: &OVal, engine: &OVal) -> bool {
     match (oracle, engine) {
-        // Fail-closed unevaluable IF guards can widen a static SCC's #CIRC
-        // blast radius relative to this root-relative demand oracle. This
-        // property still requires error versus value agreement; focused SCC
-        // tests bind the exact #VALUE/#CIRC classification.
         (OVal::Err(a), OVal::Err(b)) if a == b => true,
+        // Circ and CircSettled are distinct oracle states with the same exact
+        // observable Excel value (#CIRC!). No error/value cross-match remains.
         (OVal::Err(a), OVal::Err(b)) if a.is_circ() && b.is_circ() => true,
-        (OVal::Err(a), OVal::Err(b))
-            if (*a == EKind::Value && b.is_circ()) || (*b == EKind::Value && a.is_circ()) =>
-        {
-            true
-        }
-        (OVal::Num(a), OVal::Num(b)) => approx_eq(*a, *b),
-        // The engine reports booleans as Boolean; the oracle distinguishes
-        // Bool/Num but a guard cell read in numeric context can surface either
-        // — accept numeric/bool cross-equality on 0/1.
+        (OVal::Num(a), OVal::Num(b)) => a == b,
         (OVal::Bool(a), OVal::Bool(b)) => a == b,
-        (OVal::Bool(a), OVal::Num(b)) | (OVal::Num(b), OVal::Bool(a)) => {
-            approx_eq(if *a { 1.0 } else { 0.0 }, *b)
-        }
         (OVal::Empty, OVal::Empty) => true,
-        (OVal::Empty, OVal::Num(n)) | (OVal::Num(n), OVal::Empty) => *n == 0.0,
         _ => false,
     }
 }
@@ -1181,10 +1155,15 @@ fn debug_dump_seed() {
         .unwrap_or(23);
     let wb = gen_workbook(seed);
     let mut engine = build_engine(&wb);
+    engine.set_cycle_instrumentation_targets(vec![("Sheet1".to_string(), 21, 1)]);
     let res = engine.evaluate_all().unwrap();
     let mut oracle = Oracle::new(&wb);
     println!("{}", dump(&wb));
     println!("cycle_errors={}", res.cycle_errors);
+    println!(
+        "cycle_instrumentation={:#?}",
+        engine.cycle_instrumentation_targets()
+    );
     for i in 0..wb.n() {
         let row = (i + 1) as u32;
         let e = engine.get_cell_value("Sheet1", row, 1);

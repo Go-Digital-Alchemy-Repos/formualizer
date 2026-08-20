@@ -43,13 +43,15 @@
 //! recording.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ReferenceType, TableReference};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::eval::Engine;
 use crate::engine::range_view::RangeView;
+use crate::function::FnCaps;
 use crate::reference::{CellRef, SheetId};
 use crate::traits::{
     EvaluationContext, FunctionProvider, NamedRangeResolver, Range, RangeResolver, ReferenceInfo,
@@ -74,10 +76,38 @@ struct CollectorState {
     current: Option<u32>,
     /// Live edges as `(from_member_idx, to_member_idx)`. Self-edges `(i, i)`
     /// are recorded (e.g. a member whose range argument includes itself).
-    edges: FxHashSet<(u32, u32)>,
-    /// Members whose lazy condition could not select a branch. Their static
-    /// dependencies are merged by the SCC evaluator before classification.
-    fail_closed: FxHashSet<u32>,
+    edges: FxHashMap<(u32, u32), RecordedEdge>,
+    /// Full cell-edge telemetry. Unlike `edges`, targets are not restricted
+    /// to SCC members; this is required to prove the diagnostic edge universe.
+    diagnostic_edges: FxHashMap<(u32, SheetId, u32, u32), DiagnosticRecordedEdge>,
+    diagnostic_overflow: bool,
+}
+
+const MAX_DIAGNOSTIC_EDGES: usize = 1_000_000;
+
+pub(crate) const EDGE_NESTED_FAIL_CLOSED: u8 = 1 << 0;
+pub(crate) const EDGE_RANGE_EXPANSION: u8 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RecordedEdge {
+    pub from: u32,
+    pub to: u32,
+    /// True when the evaluated argument path produced this edge. An edge
+    /// observed both on the selected path and through conservative retention
+    /// remains selected.
+    pub selected: bool,
+    /// Bitset of the insertion sites that contributed this edge.
+    pub mechanisms: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DiagnosticRecordedEdge {
+    pub from: u32,
+    pub sheet_id: SheetId,
+    pub row: u32,
+    pub col: u32,
+    pub selected: bool,
+    pub mechanisms: u8,
 }
 
 /// Records which reads actually occurred targeting SCC members during a
@@ -102,16 +132,73 @@ pub struct LiveEdgeCollector {
     name_index: FxHashMap<String, u32>,
     /// Total member count (cells + names); valid `set_current` range.
     total_members: usize,
+    /// Full edge-universe capture is enabled only for an explicit diagnostic
+    /// run, so ordinary cyclic evaluation retains its bounded SCC-only cost.
+    diagnostic_enabled: bool,
+    replay_safe: AtomicBool,
     /// See module docs: uncontended Mutex forced by `Send + Sync` bounds on
     /// the resolver traits; SCC passes are single-threaded.
     state: Mutex<CollectorState>,
 }
 
 impl LiveEdgeCollector {
+    fn record_edge(&self, to: u32, selected: bool, mechanisms: u8) {
+        let mut state = self.state.lock().unwrap();
+        let Some(from) = state.current else {
+            return;
+        };
+        let edge = state.edges.entry((from, to)).or_insert(RecordedEdge {
+            from,
+            to,
+            selected: false,
+            mechanisms: 0,
+        });
+        edge.selected |= selected;
+        edge.mechanisms |= mechanisms;
+    }
+
+    fn record_diagnostic_cell(
+        &self,
+        sheet_id: SheetId,
+        row: u32,
+        col: u32,
+        selected: bool,
+        mechanisms: u8,
+    ) -> bool {
+        if !self.diagnostic_enabled {
+            return true;
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some(from) = state.current else {
+            return true;
+        };
+        let key = (from, sheet_id, row, col);
+        if !state.diagnostic_edges.contains_key(&key)
+            && state.diagnostic_edges.len() >= MAX_DIAGNOSTIC_EDGES
+        {
+            state.diagnostic_overflow = true;
+            return false;
+        }
+        let edge = state
+            .diagnostic_edges
+            .entry(key)
+            .or_insert(DiagnosticRecordedEdge {
+                from,
+                sheet_id,
+                row,
+                col,
+                selected: false,
+                mechanisms: 0,
+            });
+        edge.selected |= selected;
+        edge.mechanisms |= mechanisms;
+        true
+    }
+
     /// Build a collector for the given SCC membership. Member order defines
     /// the indices used in recorded edges.
     pub fn new(members: &[CellRef]) -> Self {
-        Self::new_with_names(members, &[])
+        Self::new_with_names_and_diagnostics(members, &[], false)
     }
 
     /// Build a collector over cell members plus name-vertex members. Cell
@@ -119,6 +206,14 @@ impl LiveEdgeCollector {
     /// `cells.len() + j`. `names` must already be folded with the engine's
     /// name-folding rule (see [`Engine::fold_name_key`]).
     pub fn new_with_names(cells: &[CellRef], names: &[String]) -> Self {
+        Self::new_with_names_and_diagnostics(cells, names, false)
+    }
+
+    pub fn new_with_names_and_diagnostics(
+        cells: &[CellRef],
+        names: &[String],
+        diagnostic_enabled: bool,
+    ) -> Self {
         let members: Vec<MemberCell> = cells
             .iter()
             .map(|c| MemberCell {
@@ -143,6 +238,8 @@ impl LiveEdgeCollector {
             index,
             name_index,
             total_members,
+            diagnostic_enabled,
+            replay_safe: AtomicBool::new(false),
             state: Mutex::new(CollectorState::default()),
         }
     }
@@ -164,28 +261,66 @@ impl LiveEdgeCollector {
         self.state.lock().unwrap().current = None;
     }
 
+    pub(crate) fn replay_safe_scope(&self) -> ReplaySafeGuard<'_> {
+        self.replay_safe.store(true, Ordering::Release);
+        ReplaySafeGuard(self)
+    }
+
     /// Record a scalar read of `(sheet_id, row, col)` (0-based).
     pub fn record_scalar(&self, sheet_id: SheetId, row: u32, col: u32) {
+        self.record_diagnostic_cell(sheet_id, row, col, true, 0);
         let Some(&to) = self.index.get(&(sheet_id, row, col)) else {
             return;
         };
-        let mut st = self.state.lock().unwrap();
-        if let Some(from) = st.current {
-            st.edges.insert((from, to));
-        }
+        self.record_edge(to, true, 0);
     }
 
     /// Record a rectangle read (0-based, inclusive corners). Intersection is
     /// O(|SCC|): each member is tested against the rect once; the rect is
     /// never enumerated per cell.
     pub fn record_rect(&self, sheet_id: SheetId, sr: u32, sc: u32, er: u32, ec: u32) {
-        let mut st = self.state.lock().unwrap();
-        let Some(from) = st.current else {
-            return;
-        };
+        'rows: for row in sr..=er {
+            for col in sc..=ec {
+                if !self.record_diagnostic_cell(sheet_id, row, col, true, EDGE_RANGE_EXPANSION) {
+                    break 'rows;
+                }
+            }
+        }
         for (i, m) in self.members.iter().enumerate() {
             if m.sheet_id == sheet_id && m.row >= sr && m.row <= er && m.col >= sc && m.col <= ec {
-                st.edges.insert((from, i as u32));
+                self.record_edge(i as u32, true, EDGE_RANGE_EXPANSION);
+            }
+        }
+    }
+
+    /// Record a declared arm reference retained by an unevaluable IF. These
+    /// edges participate in classification but are not part of the selected
+    /// argument walk.
+    pub fn record_failed_rect(
+        &self,
+        sheet_id: SheetId,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+        range_expansion: bool,
+    ) {
+        let mechanisms = EDGE_NESTED_FAIL_CLOSED
+            | if range_expansion {
+                EDGE_RANGE_EXPANSION
+            } else {
+                0
+            };
+        'rows: for row in sr..=er {
+            for col in sc..=ec {
+                if !self.record_diagnostic_cell(sheet_id, row, col, false, mechanisms) {
+                    break 'rows;
+                }
+            }
+        }
+        for (i, m) in self.members.iter().enumerate() {
+            if m.sheet_id == sheet_id && m.row >= sr && m.row <= er && m.col >= sc && m.col <= ec {
+                self.record_edge(i as u32, false, mechanisms);
             }
         }
     }
@@ -196,29 +331,46 @@ impl LiveEdgeCollector {
         let Some(&to) = self.name_index.get(folded_name) else {
             return;
         };
-        let mut st = self.state.lock().unwrap();
-        if let Some(from) = st.current {
-            st.edges.insert((from, to));
-        }
+        self.record_edge(to, true, 0);
+    }
+
+    pub fn record_failed_name(&self, folded_name: &str) {
+        let Some(&to) = self.name_index.get(folded_name) else {
+            return;
+        };
+        self.record_edge(to, false, EDGE_NESTED_FAIL_CLOSED);
     }
 
     /// Drain the collected edges, leaving the collector empty (current member
     /// attribution is preserved).
     pub fn take_edges(&self) -> FxHashSet<(u32, u32)> {
+        self.take_edge_records()
+            .into_iter()
+            .map(|edge| (edge.from, edge.to))
+            .collect()
+    }
+
+    pub(crate) fn take_edge_records(&self) -> Vec<RecordedEdge> {
         std::mem::take(&mut self.state.lock().unwrap().edges)
+            .into_values()
+            .collect()
     }
 
-    /// Mark the current member for conservative declared-edge retention.
-    pub fn mark_current_fail_closed(&self) {
+    pub(crate) fn take_diagnostic_edge_records(&self) -> (Vec<DiagnosticRecordedEdge>, bool) {
         let mut state = self.state.lock().unwrap();
-        if let Some(current) = state.current {
-            state.fail_closed.insert(current);
-        }
+        let records = std::mem::take(&mut state.diagnostic_edges)
+            .into_values()
+            .collect();
+        let overflow = std::mem::take(&mut state.diagnostic_overflow);
+        (records, overflow)
     }
+}
 
-    /// Drain members marked by unevaluable lazy conditions.
-    pub fn take_fail_closed(&self) -> FxHashSet<u32> {
-        std::mem::take(&mut self.state.lock().unwrap().fail_closed)
+pub(crate) struct ReplaySafeGuard<'a>(&'a LiveEdgeCollector);
+
+impl Drop for ReplaySafeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.replay_safe.store(false, Ordering::Release);
     }
 }
 
@@ -262,6 +414,10 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
         Self { engine, collector }
     }
 
+    fn replay_safe(&self) -> bool {
+        self.collector.replay_safe.load(Ordering::Acquire)
+    }
+
     /// Record a read of a named entity, folding the raw reference text with
     /// the engine's name-folding rule so it matches collector name keys.
     fn record_name(&self, raw_name: &str) {
@@ -293,6 +449,22 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
                 view.start_col() as u32,
                 view.end_row() as u32,
                 view.end_col() as u32,
+            );
+        }
+    }
+
+    fn record_failed_view(&self, reference: &ReferenceType, view: &RangeView<'_>) {
+        if view.is_empty() {
+            return;
+        }
+        if let Some(sid) = self.engine.sheet_id(view.sheet_name()) {
+            self.collector.record_failed_rect(
+                sid,
+                view.start_row() as u32,
+                view.start_col() as u32,
+                view.end_row() as u32,
+                view.end_col() as u32,
+                matches!(reference, ReferenceType::Range { .. }),
             );
         }
     }
@@ -369,15 +541,29 @@ impl<'a, R: EvaluationContext> TableResolver for RecordingContext<'a, R> {
 
 impl<'a, R: EvaluationContext> SourceResolver for RecordingContext<'a, R> {
     fn source_scalar_version(&self, name: &str) -> Option<u64> {
+        if self.replay_safe() {
+            return None;
+        }
         self.engine.source_scalar_version(name)
     }
     fn resolve_source_scalar(&self, name: &str) -> Result<LiteralValue, ExcelError> {
+        if self.replay_safe() {
+            return Err(ExcelError::new(ExcelErrorKind::Value)
+                .with_message("external source blocked during dependency replay".to_string()));
+        }
         self.engine.resolve_source_scalar(name)
     }
     fn source_table_version(&self, name: &str) -> Option<u64> {
+        if self.replay_safe() {
+            return None;
+        }
         self.engine.source_table_version(name)
     }
     fn resolve_source_table(&self, name: &str) -> Result<Box<dyn Table>, ExcelError> {
+        if self.replay_safe() {
+            return Err(ExcelError::new(ExcelErrorKind::Value)
+                .with_message("external source blocked during dependency replay".to_string()));
+        }
         self.engine.resolve_source_table(name)
     }
 }
@@ -394,7 +580,14 @@ impl<'a, R: EvaluationContext> FunctionProvider for RecordingContext<'a, R> {
         ns: &str,
         name: &str,
     ) -> Option<std::sync::Arc<dyn crate::traits::Function>> {
-        self.engine.get_function(ns, name)
+        let function = self.engine.get_function(ns, name)?;
+        if self.replay_safe()
+            && (!function.caps().contains(FnCaps::PURE)
+                || function.caps().contains(FnCaps::VOLATILE))
+        {
+            return None;
+        }
+        Some(function)
     }
 
     fn get_function_for_planning(
@@ -478,8 +671,14 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn chunk_hint(&self) -> Option<usize> {
         self.engine.chunk_hint()
     }
-    fn mark_lazy_condition_unevaluable(&self) {
-        self.collector.mark_current_fail_closed();
+    fn record_failed_lazy_arm_reference(&self, reference: &ReferenceType, current_sheet: &str) {
+        if let ReferenceType::NamedRange(name) = reference {
+            let key = self.engine.graph.name_lookup_key(name);
+            self.collector.record_failed_name(&key);
+        }
+        if let Ok(view) = self.engine.resolve_range_view(reference, current_sheet) {
+            self.record_failed_view(reference, &view);
+        }
     }
     fn locale(&self) -> crate::locale::Locale {
         self.engine.locale()

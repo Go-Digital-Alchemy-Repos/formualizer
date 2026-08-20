@@ -922,6 +922,53 @@ impl PyWorkbook {
         ))
     }
 
+    /// Enable formula-free first-witness cycle diagnostics for a bounded set
+    /// of 1-based workbook addresses.
+    pub fn set_cycle_instrumentation_targets(
+        &self,
+        targets: Vec<(String, u32, u32)>,
+    ) -> PyResult<()> {
+        for (sheet, row, col) in &targets {
+            if sheet.is_empty() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "cycle instrumentation sheet name cannot be empty",
+                ));
+            }
+            validate_cell_coords(*row, *col)?;
+        }
+        self.write_inner()?
+            .engine_mut()
+            .set_cycle_instrumentation_targets(targets);
+        Ok(())
+    }
+
+    /// Return the sanitized full edge dump used by the GOD-184b exporter.
+    /// Formula text and cell values are intentionally absent.
+    pub fn cycle_instrumentation_json(&self) -> PyResult<String> {
+        let wb = self.read_inner()?;
+        let targets: Vec<serde_json::Value> = wb
+            .engine()
+            .cycle_instrumentation_targets()
+            .iter()
+            .map(|target| {
+                serde_json::json!({
+                    "address": target.address,
+                    "static_members": target.static_members,
+                    "live_members": target.live_members,
+                    "witness_step": target.witness_step,
+                    "edges": target.edges.iter().map(|edge| serde_json::json!({
+                        "from": edge.from,
+                        "to": edge.to,
+                        "selected": edge.selected,
+                        "mechanisms": edge.mechanisms,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        serde_json::to_string(&serde_json::json!({"targets": targets}))
+            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))
+    }
+
     pub fn evaluate_cells(
         &self,
         py: Python<'_>,

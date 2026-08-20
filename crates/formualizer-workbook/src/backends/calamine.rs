@@ -3,12 +3,12 @@ use crate::traits::{
     AccessGranularity, AdapterLoadStats, BackendCaps, CalcSettings, CellData, DefinedName,
     DefinedNameDefinition, DefinedNameScope, MergedRange, SheetData, SpreadsheetReader,
 };
-use formualizer_common::{DateSystem, ExcelError, ExcelErrorKind, LiteralValue};
+use formualizer_common::{DateSystem, ExcelError, ExcelErrorKind, LiteralValue, parse_a1_1based};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use calamine::{
@@ -23,6 +23,7 @@ use formualizer_eval::engine::{
     FormulaIngestBatch, FormulaIngestRecord, FormulaSpoolDiskPolicy, PartitionLegacyMember,
     PartitionLegacyMemberKind, PartitionReconciliation, PartitionedSourceFormulaFamily,
     SourceCoord, SourceFamilyId, SourceFormulaFamily, SourceFormulaOrder, SourceRect,
+    WorkbookLoadLimits,
 };
 use formualizer_eval::traits::EvaluationContext;
 use formualizer_parse::parser::{ASTNode, ReferenceType};
@@ -42,7 +43,71 @@ use formula_replay::{
 
 enum CalamineWorkbook {
     File(Xlsx<BufReader<File>>),
-    Bytes(Xlsx<Cursor<Vec<u8>>>),
+    Bytes(Xlsx<Cursor<Arc<[u8]>>>),
+}
+
+enum CalamineSource {
+    File(PathBuf),
+    Bytes(Arc<[u8]>),
+}
+
+/// Prevents a single XML token (tag or text node) from growing quick-xml's
+/// event buffer without bound. XML structural delimiters reset the token
+/// budget; the worksheet may still stream to any total size allowed by the
+/// workbook's logical-cell limits.
+struct BoundedXmlTokenReader<R> {
+    inner: R,
+    token_bytes: usize,
+    max_token_bytes: usize,
+}
+
+struct RawSavedFormulaValue {
+    cell_type: Option<String>,
+    style_index: Option<u32>,
+    raw: String,
+}
+
+impl<R: BufRead> Read for BoundedXmlTokenReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let count = available.len().min(output.len());
+        output[..count].copy_from_slice(&available[..count]);
+        self.consume(count);
+        Ok(count)
+    }
+}
+
+impl<R: BufRead> BufRead for BoundedXmlTokenReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let available = self.inner.fill_buf()?;
+        if available.is_empty() {
+            return Ok(available);
+        }
+        if self.token_bytes >= self.max_token_bytes {
+            if matches!(available[0], b'<' | b'>') {
+                return Ok(&available[..1]);
+            }
+            return Err(std::io::Error::other(format!(
+                "saved formula cache XML token exceeds configured memory budget of {} bytes",
+                self.max_token_bytes
+            )));
+        }
+        let remaining = self.max_token_bytes - self.token_bytes;
+        Ok(&available[..available.len().min(remaining)])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if let Ok(available) = self.inner.fill_buf() {
+            for byte in available.iter().take(amount) {
+                if matches!(*byte, b'<' | b'>') {
+                    self.token_bytes = 0;
+                } else {
+                    self.token_bytes = self.token_bytes.saturating_add(1);
+                }
+            }
+        }
+        self.inner.consume(amount);
+    }
 }
 
 impl CalamineWorkbook {
@@ -162,36 +227,6 @@ fn data_ref_to_literal(value: &DataRef<'_>, date_system: DateSystem) -> Option<L
 }
 
 #[inline]
-fn data_to_literal(value: &Data, date_system: DateSystem) -> Option<LiteralValue> {
-    match value {
-        Data::Empty => None,
-        Data::String(s) if s.is_empty() => None,
-        Data::String(s) => Some(LiteralValue::Text(s.clone())),
-        Data::Float(f) => Some(LiteralValue::Number(*f)),
-        Data::Int(i) => Some(LiteralValue::Int(*i)),
-        Data::Bool(b) => Some(LiteralValue::Boolean(*b)),
-        Data::Error(e) => Some(LiteralValue::Error(ExcelError::new(
-            match CalamineAdapter::calamine_error_code(e) {
-                1 => ExcelErrorKind::Null,
-                2 => ExcelErrorKind::Ref,
-                3 => ExcelErrorKind::Name,
-                4 => ExcelErrorKind::Value,
-                5 => ExcelErrorKind::Div,
-                6 => ExcelErrorKind::Na,
-                7 => ExcelErrorKind::Num,
-                _ => ExcelErrorKind::Error,
-            },
-        ))),
-        Data::DateTime(dt) => Some(
-            LiteralValue::try_from_serial_number_for(date_system, dt.as_f64())
-                .unwrap_or_else(LiteralValue::Error),
-        ),
-        Data::DateTimeIso(s) => Some(LiteralValue::Text(s.clone())),
-        Data::DurationIso(s) => Some(LiteralValue::Text(s.clone())),
-    }
-}
-
-#[inline]
 fn data_ref_to_overlay(value: &DataRef<'_>) -> Option<OverlayValue> {
     match value {
         DataRef::Empty => None,
@@ -249,6 +284,8 @@ type ShadowRelocationComparator = Arc<dyn Fn(&ASTNode, &ASTNode) -> bool + Send 
 
 pub struct CalamineAdapter {
     workbook: RwLock<CalamineWorkbook>,
+    source: CalamineSource,
+    worksheet_paths: BTreeMap<String, String>,
     loaded_sheets: HashSet<String>,
     cached_names: Option<Vec<String>>,
     defined_names: Vec<DefinedName>,
@@ -359,6 +396,7 @@ impl CalamineAdapter {
         engine: &mut EvalEngine<C>,
         sheet_instance: u32,
         options: StreamWorksheetOptions,
+        mut saved_formula_fallback: BTreeMap<(u32, u32), LiteralValue>,
     ) -> Result<StreamedSheet, calamine::Error>
     where
         RS: Read + Seek,
@@ -371,18 +409,6 @@ impl CalamineAdapter {
             workbook_spool_usage,
             shadow_relocation_comparator,
         } = options;
-        // The streaming reader can omit cached formula results when an XLSX
-        // producer leaves out worksheet dimensions. Iterative workbooks need
-        // those results exactly once as SCC seeds, so use Calamine's ordinary
-        // range parser as a bounded fallback only for that opt-in mode.
-        let saved_formula_range = if matches!(
-            engine.config.cycle.policy,
-            formualizer_eval::engine::CyclePolicy::Iterate { .. }
-        ) {
-            Some(workbook.worksheet_range(sheet)?)
-        } else {
-            None
-        };
         let mut reader = workbook
             .worksheet_cells_reader(sheet)
             .map_err(calamine::Error::Xlsx)?;
@@ -471,13 +497,8 @@ impl CalamineAdapter {
 
             let has_formula = record.formula.is_some();
             if let Some(metadata) = record.formula {
-                let saved =
-                    data_ref_to_literal(&record.value, engine.config.date_system).or_else(|| {
-                        saved_formula_range
-                            .as_ref()
-                            .and_then(|range| range.get_value((row0, col0)))
-                            .and_then(|value| data_to_literal(value, engine.config.date_system))
-                    });
+                let saved = data_ref_to_literal(&record.value, engine.config.date_system)
+                    .or_else(|| saved_formula_fallback.remove(&(row0 + 1, col0 + 1)));
                 if let Some(value) = saved {
                     saved_formula_values.push((row0 + 1, col0 + 1, value));
                 }
@@ -1251,6 +1272,558 @@ impl CalamineAdapter {
         crate::calc_pr::parse_calc_pr(&xml)
     }
 
+    fn normalize_ooxml_target(target: &str) -> Option<String> {
+        let rooted = target.strip_prefix('/').unwrap_or(target);
+        let joined = if target.starts_with('/') {
+            rooted.to_string()
+        } else {
+            format!("xl/{rooted}")
+        };
+        let mut parts = Vec::new();
+        for part in joined.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                _ => parts.push(part),
+            }
+        }
+        Some(parts.join("/"))
+    }
+
+    fn scan_worksheet_paths_from_reader<R>(reader: R) -> BTreeMap<String, String>
+    where
+        R: Read + Seek,
+    {
+        let mut archive = match ZipArchive::new(reader) {
+            Ok(archive) => archive,
+            Err(_) => return BTreeMap::new(),
+        };
+        let mut sheets = Vec::new();
+        {
+            let entry = match archive.by_name("xl/workbook.xml") {
+                Ok(entry) => entry,
+                Err(_) => return BTreeMap::new(),
+            };
+            let mut xml = XmlReader::from_reader(BufReader::new(entry));
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match xml.read_event_into(&mut buf) {
+                    Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                        if event.local_name().as_ref() == b"sheet" =>
+                    {
+                        if let (Some(name), Some(rel_id)) = (
+                            Self::decode_attr(&xml, event, b"name"),
+                            Self::decode_attr(&xml, event, b"r:id"),
+                        ) {
+                            sheets.push((name, rel_id));
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(_) => return BTreeMap::new(),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut relationships = BTreeMap::new();
+        {
+            let entry = match archive.by_name("xl/_rels/workbook.xml.rels") {
+                Ok(entry) => entry,
+                Err(_) => return BTreeMap::new(),
+            };
+            let mut xml = XmlReader::from_reader(BufReader::new(entry));
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match xml.read_event_into(&mut buf) {
+                    Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                        if event.local_name().as_ref() == b"Relationship" =>
+                    {
+                        let rel_type = Self::decode_attr(&xml, event, b"Type");
+                        if rel_type
+                            .as_deref()
+                            .is_some_and(|value| value.ends_with("/worksheet"))
+                            && let (Some(id), Some(target)) = (
+                                Self::decode_attr(&xml, event, b"Id"),
+                                Self::decode_attr(&xml, event, b"Target"),
+                            )
+                            && let Some(path) = Self::normalize_ooxml_target(&target)
+                        {
+                            relationships.insert(id, path);
+                        }
+                    }
+                    Ok(Event::Eof) => break,
+                    Err(_) => return BTreeMap::new(),
+                    _ => {}
+                }
+            }
+        }
+
+        sheets
+            .into_iter()
+            .filter_map(|(name, rel_id)| {
+                relationships.get(&rel_id).cloned().map(|path| (name, path))
+            })
+            .collect()
+    }
+
+    fn saved_cache_error(message: impl Into<String>) -> calamine::Error {
+        calamine::Error::Io(std::io::Error::other(message.into()))
+    }
+
+    fn charge_saved_cache_memory(
+        retained: &mut usize,
+        additional: usize,
+        budget: usize,
+    ) -> Result<(), calamine::Error> {
+        *retained = retained.saturating_add(additional);
+        if *retained > budget {
+            return Err(Self::saved_cache_error(format!(
+                "saved formula cache retained memory exceeds configured budget of {budget} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn is_builtin_date_format(num_fmt_id: u32) -> bool {
+        matches!(num_fmt_id, 14..=22 | 27..=36 | 45..=47 | 50..=58)
+    }
+
+    fn looks_like_date_format(code: &str) -> bool {
+        let mut normalized = String::new();
+        let mut quoted = false;
+        let mut bracketed = false;
+        let mut escaped = false;
+        for ch in code.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '"' => quoted = !quoted,
+                '[' if !quoted => bracketed = true,
+                ']' if !quoted => bracketed = false,
+                '\\' if !quoted => escaped = true,
+                _ if !quoted && !bracketed => normalized.push(ch.to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+        normalized
+            .chars()
+            .any(|ch| matches!(ch, 'y' | 'd' | 'h' | 's'))
+            || normalized.contains("am/pm")
+    }
+
+    fn scan_date_styles<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        cache_memory_budget: usize,
+        retained_bytes: &mut usize,
+    ) -> Result<BTreeSet<u32>, calamine::Error> {
+        let entry = match archive.by_name("xl/styles.xml") {
+            Ok(entry) => entry,
+            Err(_) => return Ok(BTreeSet::new()),
+        };
+        let bounded = BoundedXmlTokenReader {
+            inner: BufReader::new(entry),
+            token_bytes: 0,
+            max_token_bytes: cache_memory_budget,
+        };
+        let mut xml = XmlReader::from_reader(bounded);
+        let mut buf = Vec::new();
+        let mut custom_dates = BTreeSet::new();
+        let mut date_styles = BTreeSet::new();
+        let mut in_cell_xfs = false;
+        let mut style_index = 0u32;
+        loop {
+            buf.clear();
+            match xml.read_event_into(&mut buf) {
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"cellXfs" => {
+                    in_cell_xfs = true;
+                    style_index = 0;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"cellXfs" => {
+                    in_cell_xfs = false;
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if event.local_name().as_ref() == b"numFmt" =>
+                {
+                    if let (Some(id), Some(code)) = (
+                        Self::decode_attr(&xml, event, b"numFmtId")
+                            .and_then(|value| value.parse::<u32>().ok()),
+                        Self::decode_attr(&xml, event, b"formatCode"),
+                    ) && Self::looks_like_date_format(&code)
+                    {
+                        if custom_dates.insert(id) {
+                            Self::charge_saved_cache_memory(
+                                retained_bytes,
+                                64,
+                                cache_memory_budget,
+                            )?;
+                        }
+                    }
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if in_cell_xfs && event.local_name().as_ref() == b"xf" =>
+                {
+                    let num_fmt_id = Self::decode_attr(&xml, event, b"numFmtId")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    if Self::is_builtin_date_format(num_fmt_id)
+                        || custom_dates.contains(&num_fmt_id)
+                    {
+                        if date_styles.insert(style_index) {
+                            Self::charge_saved_cache_memory(
+                                retained_bytes,
+                                64,
+                                cache_memory_budget,
+                            )?;
+                        }
+                    }
+                    style_index = style_index.saturating_add(1);
+                }
+                Ok(Event::Eof) => break,
+                Err(error) => return Err(Self::saved_cache_error(error.to_string())),
+                _ => {}
+            }
+        }
+        Ok(date_styles)
+    }
+
+    fn scan_shared_strings<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        wanted: &BTreeSet<u32>,
+        cache_memory_budget: usize,
+        retained_bytes: &mut usize,
+    ) -> Result<BTreeMap<u32, String>, calamine::Error> {
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let entry = archive
+            .by_name("xl/sharedStrings.xml")
+            .map_err(|error| Self::saved_cache_error(error.to_string()))?;
+        let bounded = BoundedXmlTokenReader {
+            inner: BufReader::new(entry),
+            token_bytes: 0,
+            max_token_bytes: cache_memory_budget,
+        };
+        let mut xml = XmlReader::from_reader(bounded);
+        let mut buf = Vec::new();
+        let mut index = 0u32;
+        let mut in_si = false;
+        let mut in_text = false;
+        let mut value = String::new();
+        let mut out = BTreeMap::new();
+        loop {
+            buf.clear();
+            match xml.read_event_into(&mut buf) {
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"si" => {
+                    in_si = true;
+                    value.clear();
+                }
+                Ok(Event::Start(ref event)) if in_si && event.local_name().as_ref() == b"t" => {
+                    in_text = true;
+                }
+                Ok(Event::Text(text)) if in_text => {
+                    value.push_str(
+                        &text
+                            .xml10_content()
+                            .map_err(|error| Self::saved_cache_error(error.to_string()))?,
+                    );
+                    if value.len() > cache_memory_budget {
+                        return Err(Self::saved_cache_error(
+                            "saved formula shared-string cache exceeds memory budget",
+                        ));
+                    }
+                }
+                Ok(Event::GeneralRef(entity)) if in_text => {
+                    Self::append_xml_entity(&entity, &mut value)
+                        .map_err(|error| Self::saved_cache_error(error.to_string()))?;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"t" => {
+                    in_text = false;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"si" => {
+                    if wanted.contains(&index) {
+                        Self::charge_saved_cache_memory(
+                            retained_bytes,
+                            value.len().saturating_add(64),
+                            cache_memory_budget,
+                        )?;
+                        out.insert(index, value.clone());
+                    }
+                    index = index.saturating_add(1);
+                    in_si = false;
+                    if out.len() == wanted.len() {
+                        break;
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(error) => return Err(Self::saved_cache_error(error.to_string())),
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_saved_formula_value(
+        cell_type: Option<&str>,
+        raw: &str,
+        date_formatted: bool,
+        date_system: DateSystem,
+        shared_strings: &BTreeMap<u32, String>,
+    ) -> Option<LiteralValue> {
+        match cell_type.unwrap_or("n") {
+            "b" => match raw {
+                "0" => Some(LiteralValue::Boolean(false)),
+                "1" => Some(LiteralValue::Boolean(true)),
+                _ => None,
+            },
+            "e" => {
+                let kind = match raw {
+                    "#NULL!" => ExcelErrorKind::Null,
+                    "#REF!" => ExcelErrorKind::Ref,
+                    "#NAME?" => ExcelErrorKind::Name,
+                    "#VALUE!" => ExcelErrorKind::Value,
+                    "#DIV/0!" => ExcelErrorKind::Div,
+                    "#N/A" => ExcelErrorKind::Na,
+                    "#NUM!" => ExcelErrorKind::Num,
+                    _ => ExcelErrorKind::Error,
+                };
+                Some(LiteralValue::Error(ExcelError::new(kind)))
+            }
+            "str" | "inlineStr" | "d" => Some(LiteralValue::Text(raw.to_string())),
+            "n" if date_formatted => raw.parse::<f64>().ok().map(|serial| {
+                LiteralValue::try_from_serial_number_for(date_system, serial)
+                    .unwrap_or_else(LiteralValue::Error)
+            }),
+            "n" => raw.parse::<f64>().ok().map(LiteralValue::Number),
+            "s" => raw
+                .parse::<u32>()
+                .ok()
+                .and_then(|index| shared_strings.get(&index))
+                .cloned()
+                .map(LiteralValue::Text),
+            _ => raw.parse::<f64>().ok().map(LiteralValue::Number),
+        }
+    }
+
+    fn scan_saved_formula_values_from_reader<R>(
+        reader: R,
+        worksheet_path: &str,
+        sheet: &str,
+        limits: &WorkbookLoadLimits,
+        date_system: DateSystem,
+    ) -> Result<BTreeMap<(u32, u32), LiteralValue>, calamine::Error>
+    where
+        R: Read + Seek,
+    {
+        let mut archive =
+            ZipArchive::new(reader).map_err(|error| Self::saved_cache_error(error.to_string()))?;
+        let cache_memory_budget =
+            usize::try_from(limits.max_formula_spool_memory_bytes).unwrap_or(usize::MAX);
+        let mut retained_bytes = 0usize;
+        let date_styles =
+            Self::scan_date_styles(&mut archive, cache_memory_budget, &mut retained_bytes)?;
+        let entry = archive
+            .by_name(worksheet_path)
+            .map_err(|error| Self::saved_cache_error(error.to_string()))?;
+        let bounded_reader = BoundedXmlTokenReader {
+            inner: BufReader::new(entry),
+            token_bytes: 0,
+            max_token_bytes: cache_memory_budget,
+        };
+        let mut xml = XmlReader::from_reader(bounded_reader);
+        let mut buf = Vec::new();
+        let mut current_coord = None;
+        let mut current_type = None;
+        let mut current_style = None;
+        let mut has_formula = false;
+        let mut in_value = false;
+        let mut value = String::new();
+        let mut formula_cells = 0u64;
+        let mut raw_values = BTreeMap::new();
+        let mut shared_indexes = BTreeSet::new();
+
+        loop {
+            buf.clear();
+            match xml.read_event_into(&mut buf) {
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"c" => {
+                    let reference = Self::decode_attr(&xml, event, b"r").ok_or_else(|| {
+                        Self::saved_cache_error(format!(
+                            "Workbook load budget check failed in calamine for sheet {sheet}: cell record has no A1 coordinate"
+                        ))
+                    })?;
+                    let (row, col, _, _) = parse_a1_1based(&reference).map_err(|error| {
+                        Self::saved_cache_error(format!(
+                            "Workbook load budget check failed in calamine for sheet {sheet}: invalid cell coordinate {reference}: {error}"
+                        ))
+                    })?;
+                    enforce_sheet_dimension_limits("calamine", sheet, row, col, limits)
+                        .map_err(|error| Self::saved_cache_error(error.to_string()))?;
+                    current_coord = Some((row, col));
+                    current_type = Self::decode_attr(&xml, event, b"t");
+                    current_style = Self::decode_attr(&xml, event, b"s")
+                        .and_then(|value| value.parse::<u32>().ok());
+                    has_formula = false;
+                    in_value = false;
+                    value.clear();
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if current_coord.is_some() && event.local_name().as_ref() == b"f" =>
+                {
+                    if !has_formula {
+                        formula_cells = formula_cells.saturating_add(1);
+                        if formula_cells > limits.max_sheet_logical_cells {
+                            return Err(Self::saved_cache_error(format!(
+                                "Workbook load budget exceeded in calamine for sheet {sheet}: saved formula cache scan exceeds configured logical-cell budget of {}",
+                                limits.max_sheet_logical_cells
+                            )));
+                        }
+                    }
+                    has_formula = true;
+                }
+                Ok(Event::Start(ref event))
+                    if current_coord.is_some() && event.local_name().as_ref() == b"v" =>
+                {
+                    in_value = true;
+                    value.clear();
+                }
+                Ok(Event::Text(text)) if in_value => {
+                    value.push_str(
+                        &text
+                            .xml10_content()
+                            .map_err(|error| Self::saved_cache_error(error.to_string()))?,
+                    );
+                    if value.len() > cache_memory_budget {
+                        return Err(Self::saved_cache_error(format!(
+                            "Workbook load budget exceeded in calamine for sheet {sheet}: saved formula value exceeds configured memory budget of {} bytes",
+                            limits.max_formula_spool_memory_bytes
+                        )));
+                    }
+                }
+                Ok(Event::GeneralRef(entity)) if in_value => {
+                    Self::append_xml_entity(&entity, &mut value)
+                        .map_err(|error| Self::saved_cache_error(error.to_string()))?;
+                    if value.len() > cache_memory_budget {
+                        return Err(Self::saved_cache_error(format!(
+                            "Workbook load budget exceeded in calamine for sheet {sheet}: saved formula value exceeds configured memory budget of {} bytes",
+                            limits.max_formula_spool_memory_bytes
+                        )));
+                    }
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"v" => {
+                    in_value = false;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"c" => {
+                    if has_formula
+                        && !value.is_empty()
+                        && let Some(coord) = current_coord
+                    {
+                        if current_type.as_deref() == Some("s")
+                            && let Ok(index) = value.parse::<u32>()
+                        {
+                            if shared_indexes.insert(index) {
+                                Self::charge_saved_cache_memory(
+                                    &mut retained_bytes,
+                                    64,
+                                    cache_memory_budget,
+                                )?;
+                            }
+                        }
+                        Self::charge_saved_cache_memory(
+                            &mut retained_bytes,
+                            value.len().saturating_add(128),
+                            cache_memory_budget,
+                        )?;
+                        raw_values.insert(
+                            coord,
+                            RawSavedFormulaValue {
+                                cell_type: current_type.clone(),
+                                style_index: current_style,
+                                raw: value.clone(),
+                            },
+                        );
+                    }
+                    current_coord = None;
+                    current_type = None;
+                    current_style = None;
+                    has_formula = false;
+                    in_value = false;
+                    value.clear();
+                }
+                Ok(Event::Eof) => break,
+                Err(error) => return Err(Self::saved_cache_error(error.to_string())),
+                _ => {}
+            }
+        }
+        drop(xml);
+        let shared_strings = Self::scan_shared_strings(
+            &mut archive,
+            &shared_indexes,
+            cache_memory_budget,
+            &mut retained_bytes,
+        )?;
+        let mut out = BTreeMap::new();
+        for (coord, value) in raw_values {
+            if let Some(parsed) = Self::parse_saved_formula_value(
+                value.cell_type.as_deref(),
+                &value.raw,
+                value
+                    .style_index
+                    .is_some_and(|style| date_styles.contains(&style)),
+                date_system,
+                &shared_strings,
+            ) {
+                let parsed_bytes = match &parsed {
+                    LiteralValue::Text(text) => text.len().saturating_add(128),
+                    _ => 128,
+                };
+                Self::charge_saved_cache_memory(
+                    &mut retained_bytes,
+                    parsed_bytes,
+                    cache_memory_budget,
+                )?;
+                out.insert(coord, parsed);
+            }
+        }
+        Ok(out)
+    }
+
+    fn scan_saved_formula_values(
+        &self,
+        sheet: &str,
+        limits: &WorkbookLoadLimits,
+        date_system: DateSystem,
+    ) -> Result<BTreeMap<(u32, u32), LiteralValue>, calamine::Error> {
+        let worksheet_path = self.worksheet_paths.get(sheet).ok_or_else(|| {
+            Self::saved_cache_error(format!(
+                "Cannot resolve OOXML worksheet path for iterative cache scan of sheet {sheet}"
+            ))
+        })?;
+        match &self.source {
+            CalamineSource::File(path) => {
+                let file = File::open(path).map_err(calamine::Error::Io)?;
+                Self::scan_saved_formula_values_from_reader(
+                    BufReader::new(file),
+                    worksheet_path,
+                    sheet,
+                    limits,
+                    date_system,
+                )
+            }
+            CalamineSource::Bytes(bytes) => Self::scan_saved_formula_values_from_reader(
+                Cursor::new(Arc::clone(bytes)),
+                worksheet_path,
+                sheet,
+                limits,
+                date_system,
+            ),
+        }
+    }
+
     fn calamine_error_code(e: &calamine::CellErrorType) -> u8 {
         let kind = match e {
             calamine::CellErrorType::Div0 => ExcelErrorKind::Div,
@@ -1408,6 +1981,7 @@ impl SpreadsheetReader for CalamineAdapter {
         Self: Sized,
     {
         let path = path.as_ref();
+        let source_path = path.to_path_buf();
         let external_link_targets = match File::open(path) {
             Ok(file) => Self::scan_external_link_targets_from_reader(BufReader::new(file)),
             Err(_) => BTreeMap::new(),
@@ -1415,6 +1989,9 @@ impl SpreadsheetReader for CalamineAdapter {
         let calc_settings = File::open(path)
             .ok()
             .and_then(|file| Self::scan_calc_settings_from_reader(BufReader::new(file)));
+        let worksheet_paths = File::open(path)
+            .map(|file| Self::scan_worksheet_paths_from_reader(BufReader::new(file)))
+            .unwrap_or_default();
         let workbook: Xlsx<BufReader<File>> = open_workbook(path)?;
         let sheet_names = workbook.sheet_names().to_vec();
         let defined_names = if workbook.defined_names().is_empty() {
@@ -1434,6 +2011,8 @@ impl SpreadsheetReader for CalamineAdapter {
         };
         Ok(Self {
             workbook: RwLock::new(CalamineWorkbook::File(workbook)),
+            source: CalamineSource::File(source_path),
+            worksheet_paths,
             loaded_sheets: HashSet::new(),
             cached_names: Some(sheet_names),
             defined_names,
@@ -1457,16 +2036,22 @@ impl SpreadsheetReader for CalamineAdapter {
     where
         Self: Sized,
     {
+        let source: Arc<[u8]> = data.into();
         let external_link_targets =
-            Self::scan_external_link_targets_from_reader(Cursor::new(data.as_slice()));
-        let calc_settings = Self::scan_calc_settings_from_reader(Cursor::new(data.as_slice()));
-        let workbook: Xlsx<Cursor<Vec<u8>>> = open_workbook_from_rs(Cursor::new(data.clone()))?;
+            Self::scan_external_link_targets_from_reader(Cursor::new(Arc::clone(&source)));
+        let calc_settings = Self::scan_calc_settings_from_reader(Cursor::new(Arc::clone(&source)));
+        let worksheet_paths =
+            Self::scan_worksheet_paths_from_reader(Cursor::new(Arc::clone(&source)));
+        let workbook: Xlsx<Cursor<Arc<[u8]>>> =
+            open_workbook_from_rs(Cursor::new(Arc::clone(&source)))?;
         let sheet_names = workbook.sheet_names().to_vec();
         let defined_names = if workbook.defined_names().is_empty() {
             Vec::new()
         } else {
-            let parsed =
-                Self::scan_defined_names_from_reader(Cursor::new(data.as_slice()), &sheet_names);
+            let parsed = Self::scan_defined_names_from_reader(
+                Cursor::new(Arc::clone(&source)),
+                &sheet_names,
+            );
             if parsed.is_empty() {
                 Self::fallback_defined_names_from_workbook(&workbook, &sheet_names)
             } else {
@@ -1476,6 +2061,8 @@ impl SpreadsheetReader for CalamineAdapter {
 
         Ok(Self {
             workbook: RwLock::new(CalamineWorkbook::Bytes(workbook)),
+            source: CalamineSource::Bytes(source),
+            worksheet_paths,
             loaded_sheets: HashSet::new(),
             cached_names: Some(sheet_names),
             defined_names,
@@ -1623,6 +2210,18 @@ where
 
                 let shadow_relocation_comparator =
                     self.shadow_relocation_comparator.as_ref().map(Arc::clone);
+                let saved_formula_fallback = if matches!(
+                    engine.config.cycle.policy,
+                    formualizer_eval::engine::CyclePolicy::Iterate { .. }
+                ) {
+                    self.scan_saved_formula_values(
+                        n,
+                        engine.workbook_load_limits(),
+                        engine.config.date_system,
+                    )?
+                } else {
+                    BTreeMap::new()
+                };
                 let streamed = {
                     let mut workbook = self.workbook.write();
                     match &mut *workbook {
@@ -1640,6 +2239,7 @@ where
                                 },
                                 shadow_relocation_comparator: shadow_relocation_comparator.clone(),
                             },
+                            saved_formula_fallback,
                         ),
                         CalamineWorkbook::Bytes(workbook) => Self::stream_worksheet(
                             workbook,
@@ -1655,6 +2255,7 @@ where
                                 },
                                 shadow_relocation_comparator,
                             },
+                            saved_formula_fallback,
                         ),
                     }?
                 };
@@ -1931,5 +2532,11 @@ mod tests {
         assert_eq!(data_ref_format(&time), Some(FormatId::TIME));
         assert_eq!(data_ref_format(&datetime), Some(FormatId::DATETIME));
         assert_eq!(data_ref_format(&duration), Some(FormatId::DURATION));
+    }
+
+    #[test]
+    fn saved_cache_date_format_detection_skips_escaped_letters() {
+        assert!(!CalamineAdapter::looks_like_date_format(r#"0 \d"#));
+        assert!(CalamineAdapter::looks_like_date_format("yyyy-mm-dd"));
     }
 }

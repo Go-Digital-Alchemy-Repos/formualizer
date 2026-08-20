@@ -199,6 +199,9 @@ impl UndoEngine {
                     ChangeEvent::SetRowVisibility { .. } => {
                         // Engine-level sidecar metadata; applied by Engine undo/redo wrappers.
                     }
+                    ChangeEvent::SavedFormulaValueChanged { .. } => {
+                        // Engine-level sidecar state; applied by Engine undo/redo wrappers.
+                    }
                     _ => {}
                 }
             }

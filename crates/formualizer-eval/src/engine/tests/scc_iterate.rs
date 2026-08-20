@@ -198,6 +198,58 @@ fn formula_edit_before_first_recalc_invalidates_saved_seed() {
     assert_eq!(num(&engine, "Sheet1", 1, 1), 100.0);
 }
 
+#[test]
+fn structural_insert_undo_before_first_recalc_restores_saved_seed() {
+    use crate::engine::graph::editor::undo_engine::UndoEngine;
+
+    let mut engine = iterate_engine(1, 0.001);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=A1+1");
+    engine
+        .seed_saved_formula_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    let mut undo = UndoEngine::new();
+    let (_, journal) = engine
+        .action_atomic_journal("insert row".to_string(), |tx| {
+            tx.insert_rows("Sheet1", 1, 1)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        engine.saved_formula_value_for_test("Sheet1", 2, 1),
+        Some(&LiteralValue::Number(10.0))
+    );
+    undo.push_action(journal);
+    engine.undo_action(&mut undo).unwrap();
+    assert_eq!(
+        engine.saved_formula_value_for_test("Sheet1", 1, 1),
+        Some(&LiteralValue::Number(10.0))
+    );
+}
+
+#[test]
+fn structural_insert_rollback_before_first_recalc_restores_saved_seed() {
+    use crate::engine::EditorError;
+
+    let mut engine = iterate_engine(1, 0.001);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=A1+1");
+    engine
+        .seed_saved_formula_value("Sheet1", 1, 1, LiteralValue::Number(10.0))
+        .unwrap();
+    let error = engine
+        .action_atomic("insert row".to_string(), |tx| -> Result<(), EditorError> {
+            tx.insert_rows("Sheet1", 1, 1)?;
+            Err(EditorError::TransactionFailed {
+                reason: "abort".to_string(),
+            })
+        })
+        .unwrap_err();
+    assert!(matches!(error, EditorError::TransactionFailed { .. }));
+    assert_eq!(
+        engine.saved_formula_value_for_test("Sheet1", 1, 1),
+        Some(&LiteralValue::Number(10.0))
+    );
+}
+
 /* ───────────────────────── §7.1 self-reference ───────────────────────── */
 
 #[test]

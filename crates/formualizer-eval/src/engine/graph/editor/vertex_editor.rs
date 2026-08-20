@@ -464,6 +464,9 @@ impl<'g> VertexEditor<'g> {
             ChangeEvent::SetRowVisibility { .. } => {
                 // Engine-level sidecar metadata; handled by Engine replay/rollback paths.
             }
+            ChangeEvent::SavedFormulaValueChanged { .. } => {
+                // Engine-level sidecar state; handled by Engine replay/rollback paths.
+            }
             ChangeEvent::AddVertex { id, .. } => {
                 // Inverse of AddVertex is removal
                 let _ = self.remove_vertex(id); // ignore errors for now

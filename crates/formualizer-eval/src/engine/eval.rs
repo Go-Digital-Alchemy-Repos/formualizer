@@ -9,7 +9,10 @@ use crate::engine::graph::prepared_legacy_graph::{
 };
 use crate::engine::graph::{FormulaDirtyEventSnapshot, FormulaDirtyLease, WholeSpanDirtyReason};
 use crate::engine::ingest_pipeline::{DependencyPlanRow, FormulaAstInput};
-use crate::engine::live_edges::{LiveEdgeCollector, RecordingContext};
+use crate::engine::live_edges::{
+    DiagnosticRecordedEdge, EDGE_NESTED_FAIL_CLOSED, EDGE_RANGE_EXPANSION, LiveEdgeCollector,
+    RecordingContext,
+};
 use crate::engine::live_graph::analyze_live_graph;
 use crate::engine::lookup_index_cache::{
     BuildOutcome, LookupAxis, LookupIndex, LookupIndexCache, LookupIndexCacheReport,
@@ -1013,6 +1016,7 @@ pub struct Engine<R> {
 
     // Runtime-cycle SCC evaluation telemetry (RFC #112, Stage 2)
     last_cycle_telemetry: CycleTelemetry,
+    cycle_instrumentation: CycleInstrumentationState,
 
     // C0 evaluation-resource observability. IDs are never reset or reused.
     next_evaluation_resource_request_id: u64,
@@ -1262,7 +1266,6 @@ where
                     old_formula.clone(),
                 );
             })?;
-            self.engine.saved_formula_values.remove(&addr);
             self.engine
                 .record_formula_plane_structural_change(StructuralScope::Cell {
                     sheet: addr.sheet_id,
@@ -1371,7 +1374,6 @@ where
                     );
                 }
             })?;
-            self.engine.saved_formula_values.remove(&addr);
             self.engine
                 .record_formula_plane_structural_change(StructuralScope::Cell {
                     sheet: addr.sheet_id,
@@ -1533,6 +1535,14 @@ where
                 })?;
                 out?
             };
+            let seed_events = self
+                .engine
+                .remap_saved_formula_values(sheet_id, |row, col| {
+                    Some((if row >= before0 { row + count } else { row }, col))
+                });
+            for event in seed_events {
+                unsafe { &mut *log_ptr }.record(event);
+            }
 
             // Arrow insert (truth) + undo op.
             self.engine.ensure_arrow_sheet(sheet);
@@ -1612,6 +1622,14 @@ where
                 })?;
                 out?
             };
+            let seed_events = self
+                .engine
+                .remap_saved_formula_values(sheet_id, |row, col| {
+                    Some((row, if col >= before0 { col + count } else { col }))
+                });
+            for event in seed_events {
+                unsafe { &mut *log_ptr }.record(event);
+            }
 
             self.engine.ensure_arrow_sheet(sheet);
             if let Some(asheet) = self.engine.arrow_sheets.sheet_mut(sheet) {
@@ -1838,6 +1856,69 @@ pub struct CycleTelemetry {
     pub nan_converged: usize,
     /// Total wall-clock time spent inside Runtime SCC tasks.
     pub elapsed_ms: u128,
+}
+
+/// One effective dependency edge captured at a target's first live-cycle
+/// witness. `selected` records whether evaluation traversed the argument path;
+/// mechanisms name conservative or expansion insertion sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleInstrumentationEdge {
+    pub from: String,
+    pub to: String,
+    pub selected: bool,
+    pub mechanisms: Vec<&'static str>,
+}
+
+/// Sanitized, formula-free target telemetry for bounded cycle diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleInstrumentationTarget {
+    pub address: String,
+    pub static_members: Vec<String>,
+    pub live_members: Option<Vec<String>>,
+    pub witness_step: Option<usize>,
+    pub edges: Vec<CycleInstrumentationEdge>,
+}
+
+#[derive(Debug, Clone)]
+struct CycleInstrumentationSpec {
+    sheet: String,
+    row: u32,
+    col: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CycleInstrumentationState {
+    specs: Vec<CycleInstrumentationSpec>,
+    targets: Vec<CycleInstrumentationTarget>,
+    next_step: usize,
+}
+
+fn live_component_indices(n: usize, edges: &[(u32, u32)], target: usize) -> Vec<usize> {
+    fn reachable(n: usize, edges: &[(u32, u32)], target: usize, reverse: bool) -> Vec<bool> {
+        let mut seen = vec![false; n];
+        let mut stack = vec![target];
+        seen[target] = true;
+        while let Some(node) = stack.pop() {
+            for &(from, to) in edges {
+                let (source, destination) = if reverse {
+                    (to as usize, from as usize)
+                } else {
+                    (from as usize, to as usize)
+                };
+                if source == node && !seen[destination] {
+                    seen[destination] = true;
+                    stack.push(destination);
+                }
+            }
+        }
+        seen
+    }
+
+    let forward = reachable(n, edges, target, false);
+    let reverse = reachable(n, edges, target, true);
+    (0..n)
+        .filter(|&index| forward[index] && reverse[index])
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2654,6 +2735,7 @@ where
             last_virtual_dep_telemetry: VirtualDepTelemetry::default(),
             virtual_dep_fallback_activations: 0,
             last_cycle_telemetry: CycleTelemetry::default(),
+            cycle_instrumentation: CycleInstrumentationState::default(),
             next_evaluation_resource_request_id: 1,
             evaluation_resource_request_depth: 0,
             active_evaluation_resource_request: None,
@@ -2798,6 +2880,7 @@ where
             last_virtual_dep_telemetry: VirtualDepTelemetry::default(),
             virtual_dep_fallback_activations: 0,
             last_cycle_telemetry: CycleTelemetry::default(),
+            cycle_instrumentation: CycleInstrumentationState::default(),
             next_evaluation_resource_request_id: 1,
             evaluation_resource_request_depth: 0,
             active_evaluation_resource_request: None,
@@ -2879,6 +2962,41 @@ where
     /// or when `enable_virtual_dep_telemetry` is off).
     pub fn last_cycle_telemetry(&self) -> &CycleTelemetry {
         &self.last_cycle_telemetry
+    }
+
+    /// Enable bounded, formula-free diagnostics for the supplied 1-based
+    /// workbook addresses. Results reset with each public evaluation request.
+    pub fn set_cycle_instrumentation_targets(&mut self, targets: Vec<(String, u32, u32)>) {
+        self.cycle_instrumentation.specs = targets
+            .into_iter()
+            .map(|(sheet, row, col)| CycleInstrumentationSpec { sheet, row, col })
+            .collect();
+        self.reset_cycle_instrumentation_results();
+    }
+
+    pub fn cycle_instrumentation_targets(&self) -> &[CycleInstrumentationTarget] {
+        &self.cycle_instrumentation.targets
+    }
+
+    fn reset_cycle_instrumentation_results(&mut self) {
+        self.cycle_instrumentation.targets = self
+            .cycle_instrumentation
+            .specs
+            .iter()
+            .map(|spec| CycleInstrumentationTarget {
+                address: format!(
+                    "{}!{}{}",
+                    spec.sheet,
+                    crate::reference::Coord::col_to_letters(spec.col.saturating_sub(1)),
+                    spec.row
+                ),
+                static_members: Vec::new(),
+                live_members: None,
+                witness_step: None,
+                edges: Vec::new(),
+            })
+            .collect();
+        self.cycle_instrumentation.next_step = 0;
     }
 
     /// Resource observations for the most recently completed public evaluation request.
@@ -3536,6 +3654,7 @@ where
                 .saturating_add(1);
         }
         self.last_cycle_telemetry = CycleTelemetry::default();
+        self.reset_cycle_instrumentation_results();
         // Defensive: consumed at the end of the previous request; a request
         // that errored out mid-walk must not leak its members into this one.
         self.pending_iterative_redirty.clear();
@@ -4499,6 +4618,18 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn saved_formula_value_for_test(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+    ) -> Option<&LiteralValue> {
+        let sheet_id = self.graph.sheet_id(sheet)?;
+        let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        self.saved_formula_values.get(&cell)
+    }
+
     pub fn evaluation_vertices(&self) -> Vec<VertexId> {
         self.graph.get_evaluation_vertices()
     }
@@ -4768,7 +4899,9 @@ where
         journal.graph.undo(&mut self.graph)?;
         // 2) Roll back engine row-visibility sidecar events.
         self.apply_inverse_row_visibility_events(&journal.graph.events);
-        // 3) Roll back Arrow-truth overlays.
+        // 3) Roll back saved iterative-calculation seed invalidations.
+        self.apply_inverse_saved_formula_value_events(&journal.graph.events);
+        // 4) Roll back Arrow-truth overlays.
         self.apply_arrow_undo_batch(&journal.arrow, /*undo=*/ true);
         Ok(())
     }
@@ -4794,6 +4927,9 @@ where
                     ChangeEvent::SetRowVisibility { .. } => {
                         // Engine-side metadata handled after dropping graph editor borrow.
                     }
+                    ChangeEvent::SavedFormulaValueChanged { .. } => {
+                        // Engine-side state handled after dropping graph editor borrow.
+                    }
                     _ => {
                         editor.apply_inverse(ev.clone())?;
                     }
@@ -4804,6 +4940,7 @@ where
         // 2) Roll back engine row-visibility metadata.
         for ev in events.iter().rev() {
             self.apply_inverse_row_visibility_event(ev);
+            self.apply_inverse_saved_formula_value_event(ev);
         }
 
         // 3) Roll back Arrow-truth overlays mirrored from those ChangeEvents.
@@ -4961,6 +5098,23 @@ where
             });
         }
 
+        // Any cell edit invalidates a saved workbook formula result before
+        // first recalc. Keep that sidecar mutation in the same journal group
+        // as the graph edit so interactive undo and atomic rollback restore it.
+        for event in &new_events {
+            let addr = match event {
+                ChangeEvent::SetValue { addr, .. } | ChangeEvent::SetFormula { addr, .. } => addr,
+                _ => continue,
+            };
+            if let Some(old) = self.saved_formula_values.remove(addr) {
+                log.record(ChangeEvent::SavedFormulaValueChanged {
+                    addr: *addr,
+                    old: Some(old),
+                    new: None,
+                });
+            }
+        }
+
         // Mirror value-impacting graph events to Arrow for forward edits.
         // This keeps Arrow overlays (delta + computed) consistent when edits clear/commit spills.
         self.clear_logged_cell_format_states(&new_events);
@@ -5094,6 +5248,7 @@ where
         let batch = undo.undo(&mut self.graph, log)?;
         for item in batch.iter().rev() {
             self.apply_inverse_row_visibility_event(&item.event);
+            self.apply_inverse_saved_formula_value_event(&item.event);
             self.apply_inverse_staged_formula_event(&item.event);
         }
         if !batch.is_empty() {
@@ -5129,6 +5284,7 @@ where
         let batch = undo.redo(&mut self.graph, log)?;
         for item in &batch {
             self.apply_forward_row_visibility_event(&item.event);
+            self.apply_forward_saved_formula_value_event(&item.event);
             self.apply_forward_staged_formula_event(&item.event);
         }
         if !batch.is_empty() {
@@ -5183,6 +5339,7 @@ where
 
         journal.graph.undo(&mut self.graph)?;
         self.apply_inverse_row_visibility_events(&journal.graph.events);
+        self.apply_inverse_saved_formula_value_events(&journal.graph.events);
         self.apply_arrow_undo_batch(&journal.arrow, /*undo=*/ true);
         if !journal.graph.is_empty() || !journal.arrow.is_empty() {
             for event in &journal.graph.events {
@@ -5232,6 +5389,7 @@ where
 
         journal.graph.redo(&mut self.graph)?;
         self.apply_forward_row_visibility_events(&journal.graph.events);
+        self.apply_forward_saved_formula_value_events(&journal.graph.events);
         self.apply_arrow_undo_batch(&journal.arrow, /*undo=*/ false);
         if !journal.graph.is_empty() || !journal.arrow.is_empty() {
             for event in &journal.graph.events {
@@ -12171,6 +12329,81 @@ where
         }
     }
 
+    fn apply_inverse_saved_formula_value_event(&mut self, event: &crate::engine::ChangeEvent) {
+        if let crate::engine::ChangeEvent::SavedFormulaValueChanged { addr, old, .. } = event {
+            self.apply_saved_formula_value(*addr, old.clone());
+        }
+    }
+
+    fn apply_forward_saved_formula_value_event(&mut self, event: &crate::engine::ChangeEvent) {
+        if let crate::engine::ChangeEvent::SavedFormulaValueChanged { addr, new, .. } = event {
+            self.apply_saved_formula_value(*addr, new.clone());
+        }
+    }
+
+    fn apply_inverse_saved_formula_value_events(&mut self, events: &[crate::engine::ChangeEvent]) {
+        for event in events.iter().rev() {
+            self.apply_inverse_saved_formula_value_event(event);
+        }
+    }
+
+    fn apply_forward_saved_formula_value_events(&mut self, events: &[crate::engine::ChangeEvent]) {
+        for event in events {
+            self.apply_forward_saved_formula_value_event(event);
+        }
+    }
+
+    fn apply_saved_formula_value(&mut self, addr: CellRef, value: Option<LiteralValue>) {
+        match value {
+            Some(value) => {
+                self.saved_formula_values.insert(addr, value);
+            }
+            None => {
+                self.saved_formula_values.remove(&addr);
+            }
+        }
+    }
+
+    fn remap_saved_formula_values(
+        &mut self,
+        sheet_id: SheetId,
+        mut remap: impl FnMut(u32, u32) -> Option<(u32, u32)>,
+    ) -> Vec<crate::engine::ChangeEvent> {
+        let before: BTreeMap<CellRef, LiteralValue> = self
+            .saved_formula_values
+            .iter()
+            .filter(|(addr, _)| addr.sheet_id == sheet_id)
+            .map(|(addr, value)| (*addr, value.clone()))
+            .collect();
+        self.saved_formula_values
+            .retain(|addr, _| addr.sheet_id != sheet_id);
+        let mut after = BTreeMap::new();
+        for (addr, value) in &before {
+            if let Some((row, col)) = remap(addr.coord.row(), addr.coord.col()) {
+                let coord = Coord::new(row, col, true, true);
+                let shifted = CellRef::new(sheet_id, coord);
+                self.saved_formula_values.insert(shifted, value.clone());
+                after.insert(shifted, value.clone());
+            }
+        }
+        before
+            .keys()
+            .chain(after.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|addr| {
+                let old = before.get(&addr).cloned();
+                let new = after.get(&addr).cloned();
+                (old != new).then_some(crate::engine::ChangeEvent::SavedFormulaValueChanged {
+                    addr,
+                    old,
+                    new,
+                })
+            })
+            .collect()
+    }
+
     fn apply_inverse_staged_formula_event(&mut self, event: &crate::engine::ChangeEvent) {
         if let crate::engine::ChangeEvent::StagedFormulaCellChanged {
             sheet,
@@ -14792,7 +15025,6 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
-        self.saved_formula_values.clear();
         let sheet_id = self.ensure_known_sheet_id(sheet)?;
         let before0 = before.saturating_sub(1);
         let affected_region = Self::structural_row_region(sheet_id, before0);
@@ -14808,6 +15040,9 @@ where
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.insert_rows(sheet_id, before0, count)?
         };
+        self.remap_saved_formula_values(sheet_id, |row, col| {
+            Some((if row >= before0 { row + count } else { row }, col))
+        });
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let before0 = before0 as usize;
             asheet.insert_rows(before0, count as usize);
@@ -14836,7 +15071,6 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
-        self.saved_formula_values.clear();
         let sheet_id = self.ensure_known_sheet_id(sheet)?;
         let start0 = start.saturating_sub(1);
         let affected_region = Self::structural_row_region(sheet_id, start0);
@@ -14852,6 +15086,16 @@ where
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.delete_rows(sheet_id, start0, count)?
         };
+        let end0 = start0.saturating_add(count);
+        self.remap_saved_formula_values(sheet_id, |row, col| {
+            if row < start0 {
+                Some((row, col))
+            } else if row < end0 {
+                None
+            } else {
+                Some((row - count, col))
+            }
+        });
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let start0 = start0 as usize;
             asheet.delete_rows(start0, count as usize);
@@ -14880,7 +15124,6 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
-        self.saved_formula_values.clear();
         let sheet_id = self.graph.sheet_id(sheet).ok_or(
             crate::engine::graph::editor::vertex_editor::EditorError::InvalidName {
                 name: sheet.to_string(),
@@ -14901,6 +15144,9 @@ where
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.insert_columns(sheet_id, before0, count)?
         };
+        self.remap_saved_formula_values(sheet_id, |row, col| {
+            Some((row, if col >= before0 { col + count } else { col }))
+        });
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let before0 = before0 as usize;
             asheet.insert_columns(before0, count as usize);
@@ -14928,7 +15174,6 @@ where
             .map_err(crate::engine::EditorError::Excel)?;
         use crate::engine::graph::editor::vertex_editor::VertexEditor;
         self.materialize_deferred_sheet_before_structural_edit(sheet)?;
-        self.saved_formula_values.clear();
         let sheet_id = self.graph.sheet_id(sheet).ok_or(
             crate::engine::graph::editor::vertex_editor::EditorError::InvalidName {
                 name: sheet.to_string(),
@@ -14949,6 +15194,16 @@ where
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
             editor.delete_columns(sheet_id, start0, count)?
         };
+        let end0 = start0.saturating_add(count);
+        self.remap_saved_formula_values(sheet_id, |row, col| {
+            if col < start0 {
+                Some((row, col))
+            } else if col < end0 {
+                None
+            } else {
+                Some((row, col - count))
+            }
+        });
         if let Some(asheet) = self.arrow_sheets.sheet_mut(sheet) {
             let start0 = start0 as usize;
             asheet.delete_columns(start0, count as usize);
@@ -16888,7 +17143,8 @@ where
             | ChangeEvent::EdgeRemoved { .. }
             | ChangeEvent::CompoundStart { .. }
             | ChangeEvent::CompoundEnd { .. }
-            | ChangeEvent::StagedFormulaCellChanged { .. } => {}
+            | ChangeEvent::StagedFormulaCellChanged { .. }
+            | ChangeEvent::SavedFormulaValueChanged { .. } => {}
         }
     }
 
@@ -24896,14 +25152,57 @@ where
             });
         }
         let n = members.len();
-        let member_index: FxHashMap<VertexId, u32> = members
-            .iter()
-            .enumerate()
-            .map(|(index, member)| (member.vertex, index as u32))
-            .collect();
         // Indices addressable by the collector (cells + names); `other`
         // members can be neither edge sources nor targets.
         let recordable = cell_refs.len() + name_keys.len();
+        let member_addresses: Vec<Option<String>> = members
+            .iter()
+            .map(|member| {
+                member.cell.map(|cell| {
+                    format!(
+                        "{}!{}{}",
+                        self.graph.sheet_name(cell.sheet_id),
+                        crate::reference::Coord::col_to_letters(cell.coord.col()),
+                        cell.coord.row() + 1
+                    )
+                })
+            })
+            .collect();
+        let instrumentation_matches: Vec<Option<usize>> = self
+            .cycle_instrumentation
+            .specs
+            .iter()
+            .map(|spec| {
+                members.iter().position(|member| {
+                    member.cell.is_some_and(|cell| {
+                        self.graph.sheet_name(cell.sheet_id) == spec.sheet
+                            && cell.coord.row() + 1 == spec.row
+                            && cell.coord.col() + 1 == spec.col
+                    })
+                })
+            })
+            .collect();
+        let diagnostic_enabled = instrumentation_matches.iter().any(Option::is_some);
+        if diagnostic_enabled && !name_members.is_empty() {
+            return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
+                "cycle instrumentation schema cannot represent named-formula SCC members"
+                    .to_string(),
+            ));
+        }
+        if diagnostic_enabled {
+            let static_members: Vec<String> = member_addresses.iter().flatten().cloned().collect();
+            for (target_index, member_index) in instrumentation_matches.iter().copied().enumerate()
+            {
+                if member_index.is_some()
+                    && self.cycle_instrumentation.targets[target_index]
+                        .static_members
+                        .is_empty()
+                {
+                    self.cycle_instrumentation.targets[target_index].static_members =
+                        static_members.clone();
+                }
+            }
+        }
 
         let circ_error = LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Circ)
@@ -24953,7 +25252,11 @@ where
                 .iter()
                 .filter_map(|m| {
                     let cell = m.cell?;
-                    let saved = self.saved_formula_values.get(&cell)?;
+                    let saved_key = CellRef::new(
+                        cell.sheet_id,
+                        Coord::new(cell.coord.row(), cell.coord.col(), true, true),
+                    );
+                    let saved = self.saved_formula_values.get(&saved_key)?;
                     let sheet_name = self.graph.sheet_name(cell.sheet_id);
                     let overlay = self
                         .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
@@ -24968,7 +25271,11 @@ where
             // committed iterative state and must not resurrect file caches.
             for member in &members {
                 if let Some(cell) = member.cell {
-                    self.saved_formula_values.remove(&cell);
+                    let saved_key = CellRef::new(
+                        cell.sheet_id,
+                        Coord::new(cell.coord.row(), cell.coord.col(), true, true),
+                    );
+                    self.saved_formula_values.remove(&saved_key);
                 }
             }
         }
@@ -25013,10 +25320,17 @@ where
             }
         }
 
-        let collector = LiveEdgeCollector::new_with_names(&cell_refs, &name_keys);
+        let collector = LiveEdgeCollector::new_with_names_and_diagnostics(
+            &cell_refs,
+            &name_keys,
+            diagnostic_enabled,
+        );
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
         let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut diagnostic_edge_records: Vec<
+            FxHashMap<(SheetId, u32, u32), DiagnosticRecordedEdge>,
+        > = vec![FxHashMap::default(); n];
         // Position of each member in the most recent pass (-1 = did not run).
         let mut pos: Vec<i64> = vec![-1; n];
         // Whether each member's committed value changed in the most recent pass.
@@ -25138,34 +25452,35 @@ where
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
-            let mut drained = collector.take_edges();
-            // An unevaluable lazy condition cannot choose a value-producing
-            // branch. Retain all declared member edges for that formula so
-            // runtime cycle classification fails closed.
-            for from in collector.take_fail_closed() {
-                for dependency in self.graph.get_dependencies(members[from as usize].vertex) {
-                    if let Some(&to) = member_index.get(&dependency) {
-                        drained.insert((from, to));
-                    }
-                }
+            let drained = collector.take_edge_records();
+            let (diagnostic_drained, diagnostic_overflow) =
+                collector.take_diagnostic_edge_records();
+            if diagnostic_overflow {
+                return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
+                    "cycle instrumentation exceeded its 1000000-edge bound".to_string(),
+                ));
             }
             for i in 0..n {
                 if pos[i] >= 0 {
                     out_edges[i].clear();
+                    diagnostic_edge_records[i].clear();
                 }
             }
-            for (from, to) in drained {
+            for record in drained {
+                let from = record.from;
+                let to = record.to;
                 debug_assert!(
                     pos[from as usize] >= 0,
                     "edge from a member that did not run"
                 );
                 out_edges[from as usize].push(to);
             }
+            for record in diagnostic_drained {
+                diagnostic_edge_records[record.from as usize]
+                    .insert((record.sheet_id, record.row, record.col), record);
+            }
             let mut edges: Vec<(u32, u32)> = Vec::new();
             for (i, outs) in out_edges.iter().enumerate() {
-                if excluded[i] {
-                    continue;
-                }
                 for &t in outs {
                     edges.push((i as u32, t));
                 }
@@ -25174,6 +25489,84 @@ where
             edges.dedup();
 
             let analysis = analyze_live_graph(n, &edges);
+
+            if !self.cycle_instrumentation.specs.is_empty() {
+                let step = self.cycle_instrumentation.next_step;
+                self.cycle_instrumentation.next_step = step.saturating_add(1);
+                let matches: Vec<Option<usize>> = self
+                    .cycle_instrumentation
+                    .specs
+                    .iter()
+                    .map(|spec| {
+                        members.iter().position(|member| {
+                            member.cell.is_some_and(|cell| {
+                                self.graph.sheet_name(cell.sheet_id) == spec.sheet
+                                    && cell.coord.row() + 1 == spec.row
+                                    && cell.coord.col() + 1 == spec.col
+                            })
+                        })
+                    })
+                    .collect();
+                let mut updates = Vec::new();
+                for (target_index, member_index) in matches.into_iter().enumerate() {
+                    let Some(member_index) = member_index else {
+                        continue;
+                    };
+                    if self.cycle_instrumentation.targets[target_index]
+                        .witness_step
+                        .is_some()
+                        || !analysis.in_cycle[member_index]
+                    {
+                        continue;
+                    }
+                    let component = live_component_indices(n, &edges, member_index);
+                    let mut live_members: Vec<String> = component
+                        .iter()
+                        .filter_map(|&index| member_addresses[index].clone())
+                        .collect();
+                    live_members.sort();
+                    let mut diagnostic_edges = Vec::new();
+                    for &from in &component {
+                        let Some(from_address) = member_addresses[from].as_ref() else {
+                            continue;
+                        };
+                        for record in diagnostic_edge_records[from].values() {
+                            let to_address = format!(
+                                "{}!{}{}",
+                                self.graph.sheet_name(record.sheet_id),
+                                crate::reference::Coord::col_to_letters(record.col),
+                                record.row + 1
+                            );
+                            let mut mechanisms = Vec::new();
+                            if record.mechanisms & EDGE_NESTED_FAIL_CLOSED != 0 {
+                                mechanisms.push("nested-fail-closed");
+                            }
+                            if record.mechanisms & EDGE_RANGE_EXPANSION != 0 {
+                                mechanisms.push("range-expansion");
+                            }
+                            diagnostic_edges.push(CycleInstrumentationEdge {
+                                from: from_address.clone(),
+                                to: to_address,
+                                selected: record.selected,
+                                mechanisms,
+                            });
+                        }
+                    }
+                    diagnostic_edges.sort_by(|left, right| {
+                        left.from
+                            .cmp(&right.from)
+                            .then(left.to.cmp(&right.to))
+                            .then(left.selected.cmp(&right.selected))
+                    });
+                    updates.push((target_index, live_members, diagnostic_edges));
+                }
+                for (target_index, live_members, diagnostic_edges) in updates {
+                    let target = &mut self.cycle_instrumentation.targets[target_index];
+                    target.live_members = Some(live_members);
+                    target.witness_step = Some(step);
+                    target.edges = diagnostic_edges;
+                }
+            }
 
             if analysis.cycle_count > 0 {
                 // Classification repeats every iteration pass under
@@ -25187,13 +25580,17 @@ where
                         // live-topological order so error propagation
                         // downstream is consistent (spec §3.4). Blast radius =
                         // live cycles only.
-                        for i in 0..n {
-                            if analysis.in_cycle[i] && !excluded[i] {
-                                self.stamp_cycle_error(members[i].vertex, &circ_error, None);
-                                excluded[i] = true;
-                                last_value[i] = circ_error.clone();
-                                stamped += 1;
-                            }
+                        let newly_stamped: Vec<usize> = (0..n)
+                            .filter(|&i| analysis.in_cycle[i] && !excluded[i])
+                            .collect();
+                        if newly_stamped.is_empty() {
+                            break;
+                        }
+                        for &i in &newly_stamped {
+                            self.stamp_cycle_error(members[i].vertex, &circ_error, None);
+                            excluded[i] = true;
+                            last_value[i] = circ_error.clone();
+                            stamped += 1;
                         }
                         check_cancel(cancel_flag)?;
                         let order: Vec<usize> = analysis
@@ -25202,13 +25599,35 @@ where
                             .map(|&i| i as usize)
                             .filter(|&i| !excluded[i])
                             .collect();
+                        for position in pos.iter_mut() {
+                            *position = -1;
+                        }
+                        changed.fill(false);
+                        let mut position = 0i64;
+                        for &i in &newly_stamped {
+                            if i < recordable {
+                                collector.set_current(i as u32);
+                            }
+                            let _replay_guard = collector.replay_safe_scope();
+                            let ctx = RecordingContext::new(&*self, &collector);
+                            let _ =
+                                self.evaluate_vertex_recorded(members[i].vertex, &ctx, &collector);
+                            pos[i] = position;
+                            position += 1;
+                        }
                         if !order.is_empty() {
                             passes += 1;
                             for i in order {
                                 run_member!(i);
+                                pos[i] = position;
+                                position += 1;
                             }
                         }
-                        break;
+                        // Stamping can make a downstream IF condition
+                        // unevaluable. Reclassify the remaining members so
+                        // locally retained arms can reveal a second live
+                        // cycle instead of escaping as a propagated #VALUE!.
+                        continue;
                     }
                     CyclePolicy::Iterate {
                         max_iterations,

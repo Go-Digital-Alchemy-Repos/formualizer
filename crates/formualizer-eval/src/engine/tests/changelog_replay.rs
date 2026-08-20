@@ -73,6 +73,9 @@ fn replay_events(graph: &mut DependencyGraph, events: &[ChangeEvent]) {
             ChangeEvent::SetRowVisibility { .. } => {
                 // Engine-level sidecar metadata; graph-only replay intentionally ignores it.
             }
+            ChangeEvent::SavedFormulaValueChanged { .. } => {
+                // Engine-level sidecar state; graph-only replay intentionally ignores it.
+            }
 
             ChangeEvent::AddVertex {
                 coord,

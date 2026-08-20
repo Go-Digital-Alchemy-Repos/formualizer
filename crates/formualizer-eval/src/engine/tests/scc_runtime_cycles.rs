@@ -14,7 +14,7 @@ use crate::test_workbook::TestWorkbook;
 use formualizer_common::{ExcelErrorKind, LiteralValue, PackedSheetCell};
 use formualizer_parse::parser::parse;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn runtime_cycle() -> CycleConfig {
     CycleConfig {
@@ -84,6 +84,114 @@ fn unevaluable_if_condition_fails_closed_over_both_branches() {
     assert!(is_circ(&engine, "Sheet1", 1, 1));
     assert!(is_circ(&engine, "Sheet1", 2, 1));
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+}
+
+#[test]
+fn cycle_instrumentation_records_first_witness_and_inactive_edge_mechanism() {
+    let mut engine = runtime_engine();
+    engine.set_cycle_instrumentation_targets(vec![("Sheet1".to_string(), 1, 1)]);
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(1/0,A2,A3)");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
+
+    engine.evaluate_all().unwrap();
+
+    let targets = engine.cycle_instrumentation_targets();
+    assert_eq!(targets.len(), 1);
+    let target = &targets[0];
+    assert_eq!(target.address, "Sheet1!A1");
+    assert_eq!(target.static_members.len(), 2);
+    assert_eq!(target.live_members.as_ref().map(Vec::len), Some(2));
+    assert_eq!(target.witness_step, Some(0));
+    assert!(
+        target.edges.iter().any(|edge| {
+            edge.from == "Sheet1!A1"
+                && edge.to == "Sheet1!A2"
+                && !edge.selected
+                && edge.mechanisms == vec!["nested-fail-closed"]
+        }),
+        "unexpected target telemetry: {target:?}"
+    );
+    assert!(
+        target.edges.iter().any(|edge| {
+            edge.from == "Sheet1!A1"
+                && edge.to == "Sheet1!A3"
+                && !edge.selected
+                && edge.mechanisms == vec!["nested-fail-closed"]
+        }),
+        "telemetry omitted an edge from an SCC member to an outside cell: {target:?}"
+    );
+}
+
+#[test]
+fn nested_unevaluable_if_does_not_restore_outer_inactive_arm() {
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,IF(1/0,11,12),A2)");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
+
+    engine.evaluate_all().unwrap();
+
+    assert!(matches!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+    ));
+    assert!(!is_circ(&engine, "Sheet1", 2, 1));
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+}
+
+#[test]
+fn failed_if_does_not_restore_sibling_if_inactive_arm() {
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,1,A2)+IF(1/0,11,12)");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
+
+    engine.evaluate_all().unwrap();
+
+    assert!(matches!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+    ));
+    assert!(!is_circ(&engine, "Sheet1", 2, 1));
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+}
+
+#[test]
+fn failed_if_does_not_restore_choose_inactive_arm() {
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=CHOOSE(1,IF(1/0,11,12),A2)");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
+
+    engine.evaluate_all().unwrap();
+
+    assert!(matches!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+    ));
+    assert!(!is_circ(&engine, "Sheet1", 2, 1));
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+}
+
+#[test]
+fn nested_failed_if_keeps_two_sheet_outer_inactive_arms_narrowed() {
+    let mut engine = runtime_engine();
+    engine.add_sheet("Probe").unwrap();
+    engine.add_sheet("Sheet2").unwrap();
+    set_formula(
+        &mut engine,
+        "Probe",
+        1,
+        1,
+        "=IF(TRUE,IF(TRUE,IF(1/0,41,42),Sheet2!A1),Sheet2!A1)",
+    );
+    set_formula(&mut engine, "Sheet2", 1, 1, "=IF(TRUE,77,Probe!A1)");
+
+    engine.evaluate_all().unwrap();
+
+    assert!(matches!(
+        engine.get_cell_value("Probe", 1, 1),
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+    ));
+    assert_eq!(num(&engine, "Sheet2", 1, 1), 77.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
 }
 
 /// Engine rule that PRE-EMPTS spec §7.1's eval-time `#CIRC!`: a direct
@@ -898,6 +1006,45 @@ fn cancellation_is_honored_at_settle_pass_boundaries() {
         err.message.as_deref().unwrap_or("").contains("SCC"),
         "cancellation must come from the SCC pass boundary, got {err:?}"
     );
+}
+
+#[test]
+fn dependency_replay_does_not_reinvoke_impure_functions() {
+    use crate::args::ArgSchema;
+    use crate::function::{FnCaps, Function};
+    use crate::traits::{ArgumentHandle, FunctionContext};
+
+    #[derive(Debug)]
+    struct CountFn(Arc<AtomicUsize>);
+    impl Function for CountFn {
+        fn caps(&self) -> FnCaps {
+            FnCaps::empty()
+        }
+        fn name(&self) -> &'static str {
+            "COUNTREPLAY"
+        }
+        fn arg_schema(&self) -> &'static [ArgSchema] {
+            &[]
+        }
+        fn eval<'a, 'b, 'c>(
+            &self,
+            _args: &'c [ArgumentHandle<'a, 'b>],
+            _ctx: &dyn FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, formualizer_common::ExcelError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(0)))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let wb = TestWorkbook::new().with_function(Arc::new(CountFn(calls.clone())));
+    let mut engine = Engine::new(wb, runtime_cfg());
+    set_formula(&mut engine, "Sheet1", 1, 1, "=COUNTREPLAY()+A2");
+    set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
+
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
 /* ───────────────────── G12: INDIRECT inside an SCC ───────────────────── */

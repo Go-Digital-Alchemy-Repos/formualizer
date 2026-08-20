@@ -7,10 +7,11 @@
 //! path. The round-trip test then exercises `Workbook::to_xlsx_bytes`
 //! (the umya write path) explicitly.
 
+use formualizer_common::col_letters_from_1based;
 use formualizer_eval::engine::{CycleConfig, CycleDetection, CyclePolicy};
 use formualizer_workbook::{
     CalamineAdapter, CalcSettings, LiteralValue, LoadStrategy, SpreadsheetReader, Workbook,
-    WorkbookConfig,
+    WorkbookConfig, WorkbookLoadLimits,
 };
 use std::io::{Read, Write};
 
@@ -139,6 +140,31 @@ fn strip_worksheet_dimensions(xlsx: &[u8]) -> Vec<u8> {
         }
         writer.finish().unwrap();
     }
+    out
+}
+
+fn replace_first_worksheet_xml(xlsx: &[u8], replacement: &str) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(xlsx)).unwrap();
+    let mut out = Vec::new();
+    let mut replaced = false;
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(&name, opts).unwrap();
+            if !replaced && name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+                writer.write_all(replacement.as_bytes()).unwrap();
+                replaced = true;
+            } else {
+                std::io::copy(&mut entry, &mut writer).unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    assert!(replaced, "fixture has no worksheet XML");
     out
 }
 
@@ -376,6 +402,142 @@ fn from_reader_iterate_starts_cross_sheet_3d_cycle_from_saved_formula_caches() {
         assert!((num(&wb, "Acct2", 1, 1) - 6.0).abs() < 0.001);
         assert!((num(&wb, "Calc", 1, 1) - 10.0).abs() < 0.001);
     }
+}
+
+#[test]
+fn iterate_cache_scan_rejects_oversized_sparse_coordinate_before_materialization() {
+    let worksheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1001"><c r="A1001"><f>A1001</f><v>1</v></c></row></sheetData>
+</worksheet>"#;
+    let fixture = replace_first_worksheet_xml(&simple_fixture(), worksheet);
+    let bytes = inject_calc_pr(
+        &fixture,
+        r#"<calcPr calcId="122211" iterate="1" iterateCount="10" iterateDelta="0.001"/>"#,
+    );
+    let adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let limits = WorkbookLoadLimits {
+        max_sheet_rows: 1_000,
+        ..WorkbookLoadLimits::default()
+    };
+    let error = Workbook::from_reader(
+        adapter,
+        LoadStrategy::EagerAll,
+        WorkbookConfig::ephemeral().with_ingest_limits(limits),
+    )
+    .err()
+    .expect("sparse coordinate above the row budget must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("1001 rows"), "unexpected error: {message}");
+    assert!(
+        message.contains("row budget of 1000"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn iterate_cache_scan_rejects_oversized_xml_token_before_retention() {
+    let cached = "7".repeat(512);
+    let worksheet = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><f>A1</f><v>{cached}</v></c></row></sheetData>
+</worksheet>"#
+    );
+    let fixture = replace_first_worksheet_xml(&simple_fixture(), &worksheet);
+    let bytes = inject_calc_pr(
+        &fixture,
+        r#"<calcPr calcId="122211" iterate="1" iterateCount="10" iterateDelta="0.001"/>"#,
+    );
+    let adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let limits = WorkbookLoadLimits {
+        max_formula_spool_memory_bytes: 128,
+        formula_spool_memory_prefix_bytes: 64,
+        ..WorkbookLoadLimits::default()
+    };
+    let error = Workbook::from_reader(
+        adapter,
+        LoadStrategy::EagerAll,
+        WorkbookConfig::ephemeral().with_ingest_limits(limits),
+    )
+    .err()
+    .expect("oversized cached XML value must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("saved formula cache XML token")
+            || message.contains("saved formula value")
+            || message.contains("saved formula cache retained memory"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn iterate_cache_scan_charges_aggregate_retained_values() {
+    let cells = (1..=100)
+        .map(|column| {
+            let address = format!("{}1", col_letters_from_1based(column).unwrap());
+            format!(r#"<c r="{address}"><f>{address}</f><v>1</v></c>"#)
+        })
+        .collect::<String>();
+    let worksheet = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1">{cells}</row></sheetData>
+</worksheet>"#
+    );
+    let fixture = replace_first_worksheet_xml(&simple_fixture(), &worksheet);
+    let bytes = inject_calc_pr(
+        &fixture,
+        r#"<calcPr calcId="122211" iterate="1" iterateCount="10" iterateDelta="0.001"/>"#,
+    );
+    let adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let limits = WorkbookLoadLimits {
+        max_formula_spool_memory_bytes: 4_096,
+        formula_spool_memory_prefix_bytes: 1_024,
+        ..WorkbookLoadLimits::default()
+    };
+    let error = Workbook::from_reader(
+        adapter,
+        LoadStrategy::EagerAll,
+        WorkbookConfig::ephemeral().with_ingest_limits(limits),
+    )
+    .err()
+    .expect("aggregate cache retention must be budgeted");
+    assert!(
+        error
+            .to_string()
+            .contains("saved formula cache retained memory"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn iterate_cache_scan_charges_formula_records_to_logical_cell_budget() {
+    let worksheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><f>B1</f><v>1</v></c><c r="B1"><f>A1</f><v>1</v></c></row></sheetData>
+</worksheet>"#;
+    let fixture = replace_first_worksheet_xml(&simple_fixture(), worksheet);
+    let bytes = inject_calc_pr(
+        &fixture,
+        r#"<calcPr calcId="122211" iterate="1" iterateCount="10" iterateDelta="0.001"/>"#,
+    );
+    let adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let limits = WorkbookLoadLimits {
+        max_sheet_logical_cells: 1,
+        ..WorkbookLoadLimits::default()
+    };
+    let error = Workbook::from_reader(
+        adapter,
+        LoadStrategy::EagerAll,
+        WorkbookConfig::ephemeral().with_ingest_limits(limits),
+    )
+    .err()
+    .expect("cache scan above the logical-cell budget must be rejected");
+    assert!(
+        error.to_string().contains("saved formula cache scan"),
+        "unexpected error: {error}"
+    );
 }
 
 fn num(wb: &Workbook, sheet: &str, row: u32, col: u32) -> f64 {

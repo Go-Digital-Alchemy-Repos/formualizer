@@ -205,6 +205,9 @@ fn apply_forward_change_event(
         ChangeEvent::SetRowVisibility { .. } => {
             // Engine-level sidecar metadata; applied by Engine undo/redo orchestration.
         }
+        ChangeEvent::SavedFormulaValueChanged { .. } => {
+            // Engine-level sidecar state; applied by Engine undo/redo orchestration.
+        }
         ChangeEvent::AddVertex {
             coord,
             sheet_id,

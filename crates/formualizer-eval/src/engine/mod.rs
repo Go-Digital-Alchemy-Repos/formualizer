@@ -60,8 +60,9 @@ mod tests;
 pub use arena::AstNodeId;
 pub use cancel::CancelToken;
 pub use eval::{
-    CycleTelemetry, Engine, EngineAction, EngineBaselineStats, EvalResult, RecalcPlan,
-    SourceFormulaIngress, TableMetadata, VirtualDepTelemetry,
+    CycleInstrumentationEdge, CycleInstrumentationTarget, CycleTelemetry, Engine, EngineAction,
+    EngineBaselineStats, EvalResult, RecalcPlan, SourceFormulaIngress, TableMetadata,
+    VirtualDepTelemetry,
 };
 pub use eval_delta::{
     DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy, EvalDeltaRecord, TARGET_EVAL_DELTA_VERSION,

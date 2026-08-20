@@ -1217,6 +1217,16 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// Return syntactic references below this argument, relocated for a
+    /// shared-arena formula's current placement.
+    pub fn declared_references(&self) -> Vec<ReferenceType> {
+        self.ast()
+            .get_dependencies()
+            .into_iter()
+            .filter_map(|reference| self.interp.reference_for_current_offset(reference).ok())
+            .collect()
+    }
+
     /// Returns the raw reference from the AST when this argument is a reference.
     /// This does not evaluate the reference or materialize values.
     pub fn as_reference(&self) -> Result<&ReferenceType, ExcelError> {
@@ -1690,10 +1700,10 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
-    /// Notify cycle-edge recording that a lazy condition could not select a
-    /// branch. Ordinary contexts ignore this; recording contexts retain the
-    /// formula's declared dependencies so cycle classification fails closed.
-    fn mark_lazy_condition_unevaluable(&self) {}
+    /// Record one declared reference from the arms of a lazy conditional whose
+    /// condition could not select a branch. Ordinary contexts ignore this;
+    /// recording contexts retain only the failed conditional's arm edges.
+    fn record_failed_lazy_arm_reference(&self, _reference: &ReferenceType, _current_sheet: &str) {}
 
     /// Resolve a reference into a `RangeView` with clear bounds.
     /// Implementations should resolve un/partially bounded references using used-region.
@@ -1963,8 +1973,8 @@ pub trait FunctionContext<'ctx> {
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken>;
     fn chunk_hint(&self) -> Option<usize>;
 
-    /// See [`EvaluationContext::mark_lazy_condition_unevaluable`].
-    fn mark_lazy_condition_unevaluable(&self) {}
+    /// See [`EvaluationContext::record_failed_lazy_arm_reference`].
+    fn record_failed_lazy_arm_reference(&self, _reference: &ReferenceType) {}
 
     /// Current formula sheet name.
     fn current_sheet(&self) -> &str;
@@ -2135,8 +2145,9 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     fn chunk_hint(&self) -> Option<usize> {
         self.base.chunk_hint()
     }
-    fn mark_lazy_condition_unevaluable(&self) {
-        self.base.mark_lazy_condition_unevaluable();
+    fn record_failed_lazy_arm_reference(&self, reference: &ReferenceType) {
+        self.base
+            .record_failed_lazy_arm_reference(reference, self.current_sheet);
     }
 
     fn volatile_level(&self) -> VolatileLevel {
