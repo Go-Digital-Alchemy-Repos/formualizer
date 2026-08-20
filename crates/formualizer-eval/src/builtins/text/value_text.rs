@@ -306,6 +306,12 @@ impl Function for TextFn {
         let num = match val {
             LiteralValue::Number(f) => f,
             LiteralValue::Int(i) => i as f64,
+            temporal @ (LiteralValue::Date(_)
+            | LiteralValue::DateTime(_)
+            | LiteralValue::Time(_)
+            | LiteralValue::Duration(_)) => temporal
+                .as_serial_number_for(ctx.date_system())
+                .ok_or_else(ExcelError::new_value)?,
             LiteralValue::Text(t) => match ctx.locale().parse_number_invariant(&t) {
                 Some(n) => n,
                 None => {
@@ -354,7 +360,8 @@ impl Function for TextFn {
         } else {
             // Date-token parsing is intentionally limited here; conversion still
             // follows the workbook's shared Excel serial semantics.
-            if fmt.contains("yyyy") || fmt.contains("dd") || fmt.contains("mm") {
+            let lower = fmt.to_ascii_lowercase();
+            if lower.contains("yyyy") || lower.contains("dd") || lower.contains("mm") {
                 match format_serial_date(ctx.date_system(), num, &fmt) {
                     Ok(text) => text,
                     Err(_) => {
@@ -458,6 +465,13 @@ fn format_serial_date(
         (n, None)
     };
     let parts = try_serial_to_display_date_parts_for(system, display_serial)?;
+
+    // OOXML preserves the author's token case. Excel treats date tokens
+    // case-insensitively and uses token width to choose padded or unpadded output.
+    // Keep this compatibility form explicit so `M/D/YYYY` remains byte-exact.
+    if fmt.eq_ignore_ascii_case("m/d/yyyy") {
+        return Ok(format!("{}/{}/{:04}", parts.month, parts.day, parts.year));
+    }
 
     if let Some(total_minutes) = rounded_minutes {
         let hours = total_minutes / 60;

@@ -94,6 +94,55 @@ fn dynamic_array_builtins_accept_computed_array_arguments() {
     }
 }
 
+#[test]
+fn filter_applies_a_computed_horizontal_column_mask() {
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = Engine::new(
+            TestWorkbook::default(),
+            EvalConfig::default().with_formula_plane_mode(mode),
+        );
+        for col in 1..=18 {
+            engine
+                .set_cell_value("Sheet1", 2, col, LiteralValue::Number(col as f64))
+                .unwrap();
+            engine
+                .set_cell_value(
+                    "Sheet1",
+                    3,
+                    col,
+                    LiteralValue::Number(((col - 1) % 3 + 1) as f64),
+                )
+                .unwrap();
+        }
+        for col in 1..=6 {
+            engine
+                .set_cell_value("Sheet1", 1, col, LiteralValue::Number(col as f64))
+                .unwrap();
+        }
+        engine
+            .set_cell_value("Sheet1", 4, 1, LiteralValue::Number(2.0))
+            .unwrap();
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                1,
+                20,
+                parse("=SUMPRODUCT(A1:F1,FILTER(A2:R2,A3:R3=A4))").unwrap(),
+            )
+            .unwrap();
+        engine.evaluate_all().unwrap();
+
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 1, 20),
+            Some(LiteralValue::Number(252.0)),
+            "horizontal FILTER evaluated unexpectedly in {mode:?} mode"
+        );
+    }
+}
+
 /// Flipping these arguments off `by_ref` must not swallow a genuine reference
 /// failure: `OFFSET` still owns reference semantics and its errors surface as
 /// formula values rather than being re-evaluated into something else.

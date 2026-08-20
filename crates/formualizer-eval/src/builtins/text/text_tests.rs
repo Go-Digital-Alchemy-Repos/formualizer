@@ -459,6 +459,34 @@ mod tests {
     }
 
     #[test]
+    fn text_formats_typed_date_with_uppercase_unpadded_tokens() {
+        use chrono::NaiveDate;
+
+        let wb = TestWorkbook::new().with_function(Arc::new(TextFn));
+        let ctx = wb.interpreter();
+        let function = ctx.context.get_function("", "TEXT").unwrap();
+        let date = lit(LiteralValue::Date(
+            NaiveDate::from_ymd_opt(2031, 7, 4).unwrap(),
+        ));
+        let format = lit(LiteralValue::Text("M/D/YYYY".into()));
+        let result = function
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&date, &ctx),
+                    ArgumentHandle::new(&format, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+
+        match result {
+            LiteralValue::Text(text) => assert_eq!(text.as_bytes(), b"7/4/2031"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_text_date_serial_boundaries_1900_formula_level() {
         use crate::engine::DateSystem;
 

@@ -76,6 +76,67 @@ pub fn super_wildcard_match(pattern: &str, text: &str) -> bool {
 #[derive(Debug)]
 pub struct XLookupFn;
 
+/// Compatibility wrapper emitted by older Excel OOXML writers for explicit
+/// implicit intersection. Modern formulas spell the same operation with `@`.
+#[derive(Debug)]
+pub struct SingleFn;
+
+impl Function for SingleFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "SINGLE"
+    }
+    fn min_args(&self) -> usize {
+        1
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        use once_cell::sync::Lazy;
+        static SCHEMA: Lazy<Vec<ArgSchema>> = Lazy::new(|| vec![ArgSchema::any()]);
+        &SCHEMA
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let value = match args[0].value()? {
+            crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or_else(|| LiteralValue::Error(ExcelError::new_value())),
+            crate::traits::CalcValue::Scalar(value) => value,
+            crate::traits::CalcValue::Range(view) => {
+                if view.is_empty() {
+                    LiteralValue::Error(ExcelError::new_value())
+                } else if view.sheet_name() == "__tmp" {
+                    view.get_cell(0, 0)
+                } else if let Some(value) = view.as_1x1() {
+                    value
+                } else {
+                    let current = ctx.current_cell();
+                    let row = current.map(|cell| cell.coord.row() as usize).unwrap_or(0);
+                    let col = current.map(|cell| cell.coord.col() as usize).unwrap_or(0);
+                    let (rows, cols) = view.dims();
+                    if cols == 1 && (view.start_row()..=view.end_row()).contains(&row) {
+                        view.get_cell(row - view.start_row(), 0)
+                    } else if rows == 1 && (view.start_col()..=view.end_col()).contains(&col) {
+                        view.get_cell(0, col - view.start_col())
+                    } else if (view.start_row()..=view.end_row()).contains(&row)
+                        && (view.start_col()..=view.end_col()).contains(&col)
+                    {
+                        view.get_cell(row - view.start_row(), col - view.start_col())
+                    } else {
+                        LiteralValue::Error(ExcelError::new_value())
+                    }
+                }
+            }
+            crate::traits::CalcValue::Callable(_) => LiteralValue::Error(ExcelError::new_value()),
+        };
+        Ok(crate::traits::CalcValue::Scalar(value))
+    }
+}
+
 /// Looks up a value in one array and returns the aligned value from another array.
 ///
 /// `XLOOKUP` supports exact, approximate, and wildcard matching with forward or reverse search.
@@ -2493,13 +2554,12 @@ impl Function for PivotByFn {
 
 #[derive(Debug)]
 pub struct FilterFn;
-/// Filters rows from an array using a Boolean include mask.
+/// Filters rows or columns from an array using a Boolean include mask.
 ///
-/// `FILTER` returns only rows where the include condition evaluates to true.
+/// `FILTER` returns rows for a vertical mask and columns for a horizontal mask.
 ///
 /// # Remarks
-/// - `include` must have the same row count as `array`, or a single row used as broadcast.
-/// - A row is kept if any include cell for that row is truthy.
+/// - `include` must be an Nx1 row mask or a 1xM column mask for an NxM array.
 /// - If no rows match, `if_empty` is returned when supplied; otherwise `#CALC!`.
 /// - Dimension mismatches return `#VALUE!`.
 /// - Results spill as dynamic arrays.
@@ -2628,29 +2688,38 @@ impl Function for FilterFn {
         }
 
         let (include_rows, include_cols) = include_view.dims();
-        if include_rows != array_rows && include_rows != 1 {
+        let vertical = include_rows == array_rows && include_cols == 1;
+        let horizontal = include_rows == 1 && include_cols == array_cols;
+        if !vertical && !horizontal {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
 
         let mut result: Vec<Vec<LiteralValue>> = Vec::new();
-        for r in 0..array_rows {
-            let include_r = if include_rows == array_rows { r } else { 0 };
-            let mut include = false;
-            for c in 0..include_cols {
-                if include_view.get_cell(include_r, c).is_truthy() {
-                    include = true;
-                    break;
+        if vertical {
+            for r in 0..array_rows {
+                if include_view.get_cell(r, 0).is_truthy() {
+                    let mut row_out: Vec<LiteralValue> = Vec::with_capacity(array_cols);
+                    for c in 0..array_cols {
+                        row_out.push(array_view.get_cell(r, c));
+                    }
+                    result.push(row_out);
                 }
             }
-
-            if include {
-                let mut row_out: Vec<LiteralValue> = Vec::with_capacity(array_cols);
-                for c in 0..array_cols {
-                    row_out.push(array_view.get_cell(r, c));
+        } else {
+            let selected = (0..array_cols)
+                .filter(|&c| include_view.get_cell(0, c).is_truthy())
+                .collect::<Vec<_>>();
+            if !selected.is_empty() {
+                for r in 0..array_rows {
+                    result.push(
+                        selected
+                            .iter()
+                            .map(|&c| array_view.get_cell(r, c))
+                            .collect(),
+                    );
                 }
-                result.push(row_out);
             }
         }
 
@@ -3495,6 +3564,7 @@ pub fn register_builtins() {
     use crate::function_registry::register_builtin;
     use std::sync::Arc;
     register_builtin(Arc::new(XLookupFn));
+    register_builtin(Arc::new(SingleFn));
     register_builtin(Arc::new(FilterFn));
     register_builtin(Arc::new(UniqueFn));
     register_builtin(Arc::new(SequenceFn));
@@ -3526,6 +3596,7 @@ mod tests {
 
         let functions = [
             "XLOOKUP",
+            "SINGLE",
             "FILTER",
             "UNIQUE",
             "SEQUENCE",

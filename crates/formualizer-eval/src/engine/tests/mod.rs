@@ -96,6 +96,7 @@ mod arrow_canonical_611;
 mod effects_603;
 
 mod implicit_intersection_103;
+mod single_legacy_intersection;
 
 mod arrow_bulk_update;
 mod arrow_chunk_growth;
