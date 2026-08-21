@@ -280,6 +280,7 @@ pub enum EvaluatedArg<'a> {
     Range(Box<dyn Range>),
 }
 
+#[derive(Clone)]
 enum ArgumentExpr<'a> {
     Ast(&'a ASTNode),
     Arena {
@@ -292,6 +293,7 @@ enum ArgumentExpr<'a> {
 pub struct ArgumentHandle<'a, 'b> {
     expr: ArgumentExpr<'a>,
     interp: &'a Interpreter<'b>,
+    value_override: Option<crate::traits::CalcValue<'b>>,
     cached_ast: std::cell::OnceCell<ASTNode>,
     cached_ref: std::cell::OnceCell<ReferenceType>,
     cached_reference_or_value:
@@ -313,6 +315,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         Self {
             expr: ArgumentExpr::Ast(node),
             interp,
+            value_override: None,
             cached_ast: std::cell::OnceCell::new(),
             cached_ref: std::cell::OnceCell::new(),
             cached_reference_or_value: std::cell::OnceCell::new(),
@@ -334,11 +337,90 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 sheet_registry,
             },
             interp,
+            value_override: None,
             cached_ast: std::cell::OnceCell::new(),
             cached_ref: std::cell::OnceCell::new(),
             cached_reference_or_value: std::cell::OnceCell::new(),
             cached_resolved: std::cell::OnceCell::new(),
             cached_value: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            expr: self.expr.clone(),
+            interp: self.interp,
+            value_override: self.value_override.clone(),
+            cached_ast: self.cached_ast.clone(),
+            cached_ref: self.cached_ref.clone(),
+            cached_resolved: self.cached_resolved.clone(),
+            cached_value: self.cached_value.clone(),
+        }
+    }
+
+    pub(crate) fn with_scalar_value(&self, value: LiteralValue) -> Self {
+        let mut handle = self.duplicate();
+        handle.value_override = Some(crate::traits::CalcValue::Scalar(value));
+        handle.cached_resolved = std::cell::OnceCell::new();
+        handle.cached_value = std::cell::OnceCell::new();
+        handle
+    }
+
+    pub(crate) fn shape_hint(&self) -> Option<(usize, usize)> {
+        if let Some(value) = &self.value_override {
+            return Some(match value {
+                crate::traits::CalcValue::Range(view) => view.dims(),
+                crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => {
+                    (rows.len(), rows.first().map_or(0, Vec::len))
+                }
+                _ => (1, 1),
+            });
+        }
+        match &self.expr {
+            ArgumentExpr::Ast(node) => self.interp.ast_shape_hint(node),
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => self
+                .interp
+                .arena_shape_hint(*id, data_store, sheet_registry),
+        }
+    }
+
+    pub(crate) fn value_at(&self, row: usize, col: usize) -> Result<LiteralValue, ExcelError> {
+        if let Some(value) = &self.value_override {
+            return Ok(value.clone().into_literal());
+        }
+        match &self.expr {
+            ArgumentExpr::Ast(node) => self.interp.evaluate_ast_at(node, row, col),
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => self
+                .interp
+                .evaluate_arena_ast_at(*id, row, col, data_store, sheet_registry),
+        }
+    }
+
+    pub(crate) fn value_block_at(
+        &self,
+        row: usize,
+        col: usize,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        if let Some(value) = &self.value_override {
+            return Ok(value.clone());
+        }
+        match &self.expr {
+            ArgumentExpr::Ast(node) => self.interp.evaluate_ast_block_at(node, row, col),
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => self
+                .interp
+                .evaluate_arena_ast_block_at(*id, row, col, data_store, sheet_registry),
         }
     }
 
@@ -355,6 +437,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     ///
     /// This is false for absent arguments, explicit empty text, and blank references.
     pub fn is_omitted(&self) -> bool {
+        if self.value_override.is_some() {
+            return false;
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => matches!(node.node_type, ASTNodeType::Omitted),
             ArgumentExpr::Arena { id, data_store, .. } => matches!(
@@ -445,6 +530,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     }
 
     fn compute_value(&self) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        if let Some(value) = &self.value_override {
+            return Ok(value.clone());
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Literal(v) => Ok(crate::traits::CalcValue::Scalar(v.clone())),
@@ -477,6 +565,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         &self,
         env: crate::interpreter::LocalEnv,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        if let Some(value) = &self.value_override {
+            return Ok(value.clone());
+        }
         let scoped = self.interp.with_local_env(env);
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
@@ -667,6 +758,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     }
 
     fn reference_attempt(&self) -> Option<Result<ReferenceType, ExcelError>> {
+        if self.value_override.is_some() {
+            return None;
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {

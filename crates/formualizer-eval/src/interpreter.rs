@@ -61,6 +61,18 @@ pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
     }
 }
 
+fn array_lifted_argument_positions(name: &str) -> Option<&'static [usize]> {
+    match name.to_ascii_uppercase().as_str() {
+        "XLOOKUP" | "XMATCH" | "MATCH" | "LOOKUP" => Some(&[0]),
+        "INDEX" => Some(&[1, 2]),
+        "VLOOKUP" | "HLOOKUP" => Some(&[0, 2]),
+        "ABS" | "LEN" | "ISNUMBER" | "SQRT" => Some(&[0]),
+        "ROUND" | "MOD" | "EDATE" => Some(&[0, 1]),
+        "IF" => Some(&[0, 1, 2]),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub enum LocalBinding {
     Value(LiteralValue),
@@ -443,6 +455,156 @@ impl<'a> Interpreter<'a> {
         self.evaluate_ast_uncached(node)
     }
 
+    fn project_calc_value(
+        &self,
+        value: crate::traits::CalcValue<'a>,
+        row: usize,
+        col: usize,
+    ) -> LiteralValue {
+        match value {
+            crate::traits::CalcValue::Range(view) => {
+                let shape = view.dims();
+                let (row, col) = project_index((row, col), shape);
+                if row >= shape.0 || col >= shape.1 {
+                    LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))
+                } else {
+                    view.get_cell(row, col)
+                }
+            }
+            crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => {
+                let shape = (rows.len(), rows.first().map_or(0, Vec::len));
+                let (row, col) = project_index((row, col), shape);
+                rows.get(row)
+                    .and_then(|values| values.get(col))
+                    .cloned()
+                    .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+            }
+            crate::traits::CalcValue::Scalar(value) => value,
+            crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
+            ),
+        }
+    }
+
+    pub(crate) fn ast_shape_hint(&self, node: &ASTNode) -> Option<(usize, usize)> {
+        match &node.node_type {
+            ASTNodeType::Literal(LiteralValue::Array(rows)) => {
+                Some((rows.len(), rows.first().map_or(0, Vec::len)))
+            }
+            ASTNodeType::Array(rows) => Some((rows.len(), rows.first().map_or(0, Vec::len))),
+            ASTNodeType::Reference { reference, .. } => {
+                let reference = self.effective_reference(reference).ok()?;
+                probe_range_dimensions(self.context, self.current_sheet, &reference)
+                    .map(|(rows, cols)| (rows as usize, cols as usize))
+            }
+            ASTNodeType::UnaryOp { expr, .. } => self.ast_shape_hint(expr),
+            ASTNodeType::BinaryOp { left, right, .. } => broadcast_shape(&[
+                self.ast_shape_hint(left).unwrap_or((1, 1)),
+                self.ast_shape_hint(right).unwrap_or((1, 1)),
+            ])
+            .ok(),
+            ASTNodeType::Function { name, args } => {
+                let canonical = self.context.get_function("", name)?.name();
+                let positions = array_lifted_argument_positions(canonical)?;
+                let shapes: Vec<_> = positions
+                    .iter()
+                    .filter_map(|position| args.get(*position))
+                    .map(|arg| self.ast_shape_hint(arg).unwrap_or((1, 1)))
+                    .collect();
+                broadcast_shape(&shapes).ok()
+            }
+            _ => Some((1, 1)),
+        }
+    }
+
+    pub(crate) fn evaluate_ast_at(
+        &self,
+        node: &ASTNode,
+        row: usize,
+        col: usize,
+    ) -> Result<LiteralValue, ExcelError> {
+        match &node.node_type {
+            ASTNodeType::Literal(LiteralValue::Array(rows)) => {
+                let shape = (rows.len(), rows.first().map_or(0, Vec::len));
+                let (row, col) = project_index((row, col), shape);
+                Ok(rows
+                    .get(row)
+                    .and_then(|values| values.get(col))
+                    .cloned()
+                    .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))))
+            }
+            ASTNodeType::Array(rows) => {
+                let shape = (rows.len(), rows.first().map_or(0, Vec::len));
+                let (row, col) = project_index((row, col), shape);
+                let cell = rows
+                    .get(row)
+                    .and_then(|values| values.get(col))
+                    .ok_or_else(|| ExcelError::new(ExcelErrorKind::Value))?;
+                self.evaluate_ast_at(cell, 0, 0)
+            }
+            ASTNodeType::BinaryOp { op, left, right } => {
+                let left_shape = self.ast_shape_hint(left).unwrap_or((1, 1));
+                let right_shape = self.ast_shape_hint(right).unwrap_or((1, 1));
+                broadcast_shape(&[left_shape, right_shape])?;
+                let left_index = project_index((row, col), left_shape);
+                let right_index = project_index((row, col), right_shape);
+                let left_value = self.evaluate_ast_at(left, left_index.0, left_index.1)?;
+                let right_value = self.evaluate_ast_at(right, right_index.0, right_index.1)?;
+                let left = ASTNode::new(ASTNodeType::Literal(left_value), None);
+                let right = ASTNode::new(ASTNodeType::Literal(right_value), None);
+                self.eval_binary(op, &left, &right)
+            }
+            ASTNodeType::UnaryOp { op, expr } => {
+                let value = self.evaluate_ast_at(expr, row, col)?;
+                self.eval_unary_scalar(op, value)
+            }
+            ASTNodeType::Function { name, args } => {
+                let Some(fun) = self.context.get_function("", name) else {
+                    return self
+                        .evaluate_ast(node)
+                        .map(|value| self.project_calc_value(value, row, col));
+                };
+                let handles: Vec<_> = args
+                    .iter()
+                    .map(|arg| ArgumentHandle::new(arg, self))
+                    .collect();
+                let fctx = DefaultFunctionContext::new_with_sheet(
+                    self.context,
+                    self.current_cell,
+                    self.current_sheet,
+                );
+                self.dispatch_function_at(fun.as_ref(), &handles, &fctx, row, col)
+            }
+            _ => self
+                .evaluate_ast(node)
+                .map(|value| self.project_calc_value(value, row, col)),
+        }
+    }
+
+    pub(crate) fn evaluate_ast_block_at(
+        &self,
+        node: &ASTNode,
+        row: usize,
+        col: usize,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if let ASTNodeType::Function { name, args } = &node.node_type
+            && let Some(fun) = self.context.get_function("", name)
+        {
+            let handles: Vec<_> = args
+                .iter()
+                .map(|arg| ArgumentHandle::new(arg, self))
+                .collect();
+            let fctx = DefaultFunctionContext::new_with_sheet(
+                self.context,
+                self.current_cell,
+                self.current_sheet,
+            );
+            return self.dispatch_function_block_at(fun.as_ref(), &handles, &fctx, row, col);
+        }
+        self.evaluate_ast_at(node, row, col)
+            .map(crate::traits::CalcValue::Scalar)
+    }
+
     pub(crate) fn evaluate_ast_with_offset(
         &self,
         node: &ASTNode,
@@ -576,6 +738,192 @@ impl<'a> Interpreter<'a> {
             }
             (value, _) => crate::traits::CalcValue::Scalar(value),
         }
+    }
+
+    pub(crate) fn arena_shape_hint(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Option<(usize, usize)> {
+        match data_store.get_node(node_id)? {
+            AstNodeData::Literal(value) => match data_store.retrieve_value(*value) {
+                LiteralValue::Array(rows) => Some((rows.len(), rows.first().map_or(0, Vec::len))),
+                _ => Some((1, 1)),
+            },
+            AstNodeData::Array { .. } => data_store
+                .get_array_elems(node_id)
+                .map(|(rows, cols, _)| (rows as usize, cols as usize)),
+            AstNodeData::Reference { ref_type, .. } => {
+                let reference =
+                    data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+                let reference = self.effective_reference(&reference).ok()?;
+                probe_range_dimensions(self.context, self.current_sheet, &reference)
+                    .map(|(rows, cols)| (rows as usize, cols as usize))
+            }
+            AstNodeData::UnaryOp { expr_id, .. } => {
+                self.arena_shape_hint(*expr_id, data_store, sheet_registry)
+            }
+            AstNodeData::BinaryOp {
+                left_id, right_id, ..
+            } => broadcast_shape(&[
+                self.arena_shape_hint(*left_id, data_store, sheet_registry)
+                    .unwrap_or((1, 1)),
+                self.arena_shape_hint(*right_id, data_store, sheet_registry)
+                    .unwrap_or((1, 1)),
+            ])
+            .ok(),
+            AstNodeData::Function { name_id, .. } => {
+                let raw_name = data_store.resolve_ast_string(*name_id);
+                let canonical = self.context.get_function("", raw_name)?.name();
+                let positions = array_lifted_argument_positions(canonical)?;
+                let args = data_store.get_args(node_id)?;
+                let shapes: Vec<_> = positions
+                    .iter()
+                    .filter_map(|position| args.get(*position))
+                    .map(|arg| {
+                        self.arena_shape_hint(*arg, data_store, sheet_registry)
+                            .unwrap_or((1, 1))
+                    })
+                    .collect();
+                broadcast_shape(&shapes).ok()
+            }
+            _ => Some((1, 1)),
+        }
+    }
+
+    pub(crate) fn evaluate_arena_ast_at(
+        &self,
+        node_id: AstNodeId,
+        row: usize,
+        col: usize,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<LiteralValue, ExcelError> {
+        let node = data_store.get_node(node_id).ok_or_else(|| {
+            ExcelError::new(ExcelErrorKind::Value).with_message("Missing AST node")
+        })?;
+        match node {
+            AstNodeData::Literal(value) => match data_store.retrieve_value(*value) {
+                LiteralValue::Array(rows) => {
+                    let shape = (rows.len(), rows.first().map_or(0, Vec::len));
+                    let (row, col) = project_index((row, col), shape);
+                    Ok(rows
+                        .get(row)
+                        .and_then(|values| values.get(col))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))
+                        }))
+                }
+                value => Ok(value),
+            },
+            AstNodeData::Array { .. } => {
+                let (rows, cols, elements) =
+                    data_store.get_array_elems(node_id).ok_or_else(|| {
+                        ExcelError::new(ExcelErrorKind::Value).with_message("Invalid array")
+                    })?;
+                let shape = (rows as usize, cols as usize);
+                let (row, col) = project_index((row, col), shape);
+                let element = elements
+                    .get(row * shape.1 + col)
+                    .ok_or_else(|| ExcelError::new(ExcelErrorKind::Value))?;
+                self.evaluate_arena_ast_at(*element, 0, 0, data_store, sheet_registry)
+            }
+            AstNodeData::BinaryOp {
+                op_id,
+                left_id,
+                right_id,
+            } => {
+                let left_shape = self
+                    .arena_shape_hint(*left_id, data_store, sheet_registry)
+                    .unwrap_or((1, 1));
+                let right_shape = self
+                    .arena_shape_hint(*right_id, data_store, sheet_registry)
+                    .unwrap_or((1, 1));
+                broadcast_shape(&[left_shape, right_shape])?;
+                let left_index = project_index((row, col), left_shape);
+                let right_index = project_index((row, col), right_shape);
+                let left = self.evaluate_arena_ast_at(
+                    *left_id,
+                    left_index.0,
+                    left_index.1,
+                    data_store,
+                    sheet_registry,
+                )?;
+                let right = self.evaluate_arena_ast_at(
+                    *right_id,
+                    right_index.0,
+                    right_index.1,
+                    data_store,
+                    sheet_registry,
+                )?;
+                let left = ASTNode::new(ASTNodeType::Literal(left), None);
+                let right = ASTNode::new(ASTNodeType::Literal(right), None);
+                self.eval_binary(data_store.resolve_ast_string(*op_id), &left, &right)
+            }
+            AstNodeData::UnaryOp { op_id, expr_id } => {
+                let value =
+                    self.evaluate_arena_ast_at(*expr_id, row, col, data_store, sheet_registry)?;
+                self.eval_unary_scalar(data_store.resolve_ast_string(*op_id), value)
+            }
+            AstNodeData::Function { name_id, .. } => {
+                let name = data_store.resolve_ast_string(*name_id);
+                let Some(fun) = self.context.get_function("", name) else {
+                    return self
+                        .evaluate_arena_ast(node_id, data_store, sheet_registry)
+                        .map(|value| self.project_calc_value(value, row, col));
+                };
+                let args = data_store.get_args(node_id).ok_or_else(|| {
+                    ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
+                })?;
+                let handles: Vec<_> = args
+                    .iter()
+                    .copied()
+                    .map(|arg| ArgumentHandle::new_arena(arg, self, data_store, sheet_registry))
+                    .collect();
+                let fctx = DefaultFunctionContext::new_with_sheet(
+                    self.context,
+                    self.current_cell,
+                    self.current_sheet,
+                );
+                self.dispatch_function_at(fun.as_ref(), &handles, &fctx, row, col)
+            }
+            _ => self
+                .evaluate_arena_ast(node_id, data_store, sheet_registry)
+                .map(|value| self.project_calc_value(value, row, col)),
+        }
+    }
+
+    pub(crate) fn evaluate_arena_ast_block_at(
+        &self,
+        node_id: AstNodeId,
+        row: usize,
+        col: usize,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if let Some(AstNodeData::Function { name_id, .. }) = data_store.get_node(node_id) {
+            let name = data_store.resolve_ast_string(*name_id);
+            if let Some(fun) = self.context.get_function("", name) {
+                let args = data_store.get_args(node_id).ok_or_else(|| {
+                    ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
+                })?;
+                let handles: Vec<_> = args
+                    .iter()
+                    .copied()
+                    .map(|arg| ArgumentHandle::new_arena(arg, self, data_store, sheet_registry))
+                    .collect();
+                let fctx = DefaultFunctionContext::new_with_sheet(
+                    self.context,
+                    self.current_cell,
+                    self.current_sheet,
+                );
+                return self.dispatch_function_block_at(fun.as_ref(), &handles, &fctx, row, col);
+            }
+        }
+        self.evaluate_arena_ast_at(node_id, row, col, data_store, sheet_registry)
+            .map(crate::traits::CalcValue::Scalar)
     }
 
     pub(crate) fn evaluate_arena_ast(
@@ -797,7 +1145,7 @@ impl<'a> Interpreter<'a> {
                         self.current_sheet,
                     );
 
-                    return fun.dispatch(&handles, &fctx);
+                    return self.dispatch_with_array_lifting(name, fun.as_ref(), &handles, &fctx);
                 }
 
                 if let Some(callable) = self.resolve_local_callable(name) {
@@ -1278,6 +1626,384 @@ impl<'a> Interpreter<'a> {
     }
 
     /* ===================  function calls  =================== */
+    fn dispatch_if_block_at<'h>(
+        &'h self,
+        fun: &dyn crate::function::Function,
+        handles: &[ArgumentHandle<'h, 'a>],
+        fctx: &dyn crate::traits::FunctionContext<'a>,
+        row: usize,
+        col: usize,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if !(2..=3).contains(&handles.len()) {
+            return fun.dispatch(handles, fctx);
+        }
+        let condition_shape = handles[0].shape_hint().unwrap_or((1, 1));
+        let condition_index = project_index((row, col), condition_shape);
+        let condition = handles[0].value_at(condition_index.0, condition_index.1)?;
+        if let LiteralValue::Error(error) = condition {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+        }
+        let selected = match condition {
+            LiteralValue::Boolean(value) => value,
+            LiteralValue::Number(value) => value != 0.0,
+            LiteralValue::Int(value) => value != 0,
+            LiteralValue::Empty => false,
+            value => {
+                let projected = handles[0].with_scalar_value(value);
+                let mut cell_handles = vec![projected];
+                cell_handles.extend(handles[1..].iter().map(ArgumentHandle::duplicate));
+                return fun.dispatch(&cell_handles, fctx);
+            }
+        };
+        let Some(selected_handle) = (if selected {
+            handles.get(1)
+        } else {
+            handles.get(2)
+        }) else {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
+                false,
+            )));
+        };
+        let selected_shape = selected_handle.shape_hint().unwrap_or((1, 1));
+        let selected_index = project_index((row, col), selected_shape);
+        selected_handle.value_block_at(selected_index.0, selected_index.1)
+    }
+
+    fn dispatch_function_block_at<'h>(
+        &'h self,
+        fun: &dyn crate::function::Function,
+        handles: &[ArgumentHandle<'h, 'a>],
+        fctx: &dyn crate::traits::FunctionContext<'a>,
+        row: usize,
+        col: usize,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun.name()) else {
+            return fun.dispatch(handles, fctx);
+        };
+        if fun.name().eq_ignore_ascii_case("IF") {
+            return self.dispatch_if_block_at(fun, handles, fctx, row, col);
+        }
+        let shapes: Vec<_> = lifted_positions
+            .iter()
+            .filter_map(|position| handles.get(*position))
+            .map(|handle| handle.shape_hint().unwrap_or((1, 1)))
+            .collect();
+        broadcast_shape(&shapes)?;
+        let cell_handles: Vec<_> = handles
+            .iter()
+            .enumerate()
+            .map(|(position, handle)| {
+                if lifted_positions.contains(&position) {
+                    let shape = handle.shape_hint().unwrap_or((1, 1));
+                    let index = project_index((row, col), shape);
+                    handle
+                        .value_at(index.0, index.1)
+                        .map(|value| handle.with_scalar_value(value))
+                } else {
+                    Ok(handle.duplicate())
+                }
+            })
+            .collect::<Result<_, ExcelError>>()?;
+        fun.dispatch(&cell_handles, fctx)
+    }
+
+    fn dispatch_function_at<'h>(
+        &'h self,
+        fun: &dyn crate::function::Function,
+        handles: &[ArgumentHandle<'h, 'a>],
+        fctx: &dyn crate::traits::FunctionContext<'a>,
+        row: usize,
+        col: usize,
+    ) -> Result<LiteralValue, ExcelError> {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun.name()) else {
+            return fun
+                .dispatch(handles, fctx)
+                .map(|value| self.project_calc_value(value, row, col));
+        };
+
+        if fun.name().eq_ignore_ascii_case("IF") {
+            return self
+                .dispatch_if_block_at(fun, handles, fctx, row, col)
+                .map(|value| self.project_calc_value(value, row, col));
+        }
+
+        let shapes: Vec<_> = lifted_positions
+            .iter()
+            .filter_map(|position| handles.get(*position))
+            .map(|handle| handle.shape_hint().unwrap_or((1, 1)))
+            .collect();
+        broadcast_shape(&shapes)?;
+        let cell_handles: Vec<_> = handles
+            .iter()
+            .enumerate()
+            .map(|(position, handle)| {
+                if lifted_positions.contains(&position) {
+                    let shape = handle.shape_hint().unwrap_or((1, 1));
+                    let index = project_index((row, col), shape);
+                    handle
+                        .value_at(index.0, index.1)
+                        .map(|value| handle.with_scalar_value(value))
+                } else {
+                    Ok(handle.duplicate())
+                }
+            })
+            .collect::<Result<_, ExcelError>>()?;
+        fun.dispatch(&cell_handles, fctx)
+            .map(|value| self.project_calc_value(value, row, col))
+    }
+
+    fn dispatch_with_array_lifting<'h>(
+        &'h self,
+        _name: &str,
+        fun: &dyn crate::function::Function,
+        handles: &[ArgumentHandle<'h, 'a>],
+        fctx: &dyn crate::traits::FunctionContext<'a>,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        enum LiftGrid<'b> {
+            Range(crate::engine::range_view::RangeView<'b>),
+            Array(Vec<Vec<LiteralValue>>),
+            Scalar(LiteralValue),
+        }
+
+        impl LiftGrid<'_> {
+            fn shape(&self) -> (usize, usize) {
+                match self {
+                    Self::Range(view) => view.dims(),
+                    Self::Array(rows) => (rows.len(), rows.first().map_or(0, |row| row.len())),
+                    Self::Scalar(_) => (1, 1),
+                }
+            }
+
+            fn get(&self, row: usize, col: usize) -> LiteralValue {
+                match self {
+                    Self::Range(view) => view.get_cell(row, col),
+                    Self::Array(rows) => rows
+                        .get(row)
+                        .and_then(|values| values.get(col))
+                        .cloned()
+                        .unwrap_or(LiteralValue::Empty),
+                    Self::Scalar(value) => value.clone(),
+                }
+            }
+        }
+
+        fn grid_from_handle<'x, 'b>(
+            handle: &ArgumentHandle<'x, 'b>,
+        ) -> Result<LiftGrid<'b>, ExcelError> {
+            match handle.value() {
+                Ok(crate::traits::CalcValue::Range(view)) => Ok(LiftGrid::Range(view)),
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(rows))) => {
+                    Ok(LiftGrid::Array(rows))
+                }
+                Ok(crate::traits::CalcValue::Scalar(value)) => Ok(LiftGrid::Scalar(value)),
+                Ok(crate::traits::CalcValue::Callable(_)) => {
+                    Ok(LiftGrid::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Calc)
+                            .with_message("LAMBDA value must be invoked"),
+                    )))
+                }
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+                Err(error) => Ok(LiftGrid::Scalar(LiteralValue::Error(error))),
+            }
+        }
+
+        fn grid_from_calc<'b>(value: crate::traits::CalcValue<'b>) -> LiftGrid<'b> {
+            match value {
+                crate::traits::CalcValue::Range(view) => LiftGrid::Range(view),
+                crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => {
+                    LiftGrid::Array(rows)
+                }
+                crate::traits::CalcValue::Scalar(value) => LiftGrid::Scalar(value),
+                crate::traits::CalcValue::Callable(_) => LiftGrid::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Calc)
+                        .with_message("LAMBDA value must be invoked"),
+                )),
+            }
+        }
+
+        fn rows_to_calc<'b>(
+            rows: Vec<Vec<LiteralValue>>,
+            fctx: &dyn crate::traits::FunctionContext<'b>,
+        ) -> crate::traits::CalcValue<'b> {
+            if rows.len() == 1 && rows.first().is_some_and(|row| row.len() == 1) {
+                crate::traits::CalcValue::Scalar(rows[0][0].clone())
+            } else {
+                crate::traits::CalcValue::Range(
+                    crate::engine::range_view::RangeView::from_owned_rows(rows, fctx.date_system()),
+                )
+            }
+        }
+
+        fn blocks_to_calc<'b>(
+            blocks: Vec<Vec<LiftGrid<'b>>>,
+            fctx: &dyn crate::traits::FunctionContext<'b>,
+        ) -> crate::traits::CalcValue<'b> {
+            let outer_rows = blocks.len();
+            let outer_cols = blocks.first().map_or(0, Vec::len);
+            let shapes: Vec<_> = blocks
+                .iter()
+                .flat_map(|row| row.iter().map(LiftGrid::shape))
+                .collect();
+            let block_shape = match broadcast_shape(&shapes) {
+                Ok(shape) => shape,
+                Err(error) => {
+                    return crate::traits::CalcValue::Scalar(LiteralValue::Error(error));
+                }
+            };
+            let mut rows = vec![
+                vec![LiteralValue::Empty; outer_cols * block_shape.1];
+                outer_rows * block_shape.0
+            ];
+            for (outer_row, block_row) in blocks.iter().enumerate() {
+                for (outer_col, block) in block_row.iter().enumerate() {
+                    for block_row in 0..block_shape.0 {
+                        for block_col in 0..block_shape.1 {
+                            let source = project_index((block_row, block_col), block.shape());
+                            rows[outer_row * block_shape.0 + block_row]
+                                [outer_col * block_shape.1 + block_col] =
+                                block.get(source.0, source.1);
+                        }
+                    }
+                }
+            }
+            rows_to_calc(rows, fctx)
+        }
+
+        let canonical_name = fun.name();
+        let Some(lifted_positions) = array_lifted_argument_positions(canonical_name) else {
+            return fun.dispatch(handles, fctx);
+        };
+
+        if canonical_name == "IF" {
+            if !(2..=3).contains(&handles.len()) {
+                return fun.dispatch(handles, fctx);
+            }
+
+            let condition = grid_from_handle(&handles[0])?;
+            let condition_shape = condition.shape();
+            if condition_shape == (1, 1) {
+                return fun.dispatch(handles, fctx);
+            }
+
+            let condition_bool = |value: &LiteralValue| match value {
+                LiteralValue::Boolean(value) => Some(*value),
+                LiteralValue::Number(value) => Some(*value != 0.0),
+                LiteralValue::Int(value) => Some(*value != 0),
+                LiteralValue::Empty => Some(false),
+                _ => None,
+            };
+            let true_shape = handles[1].shape_hint().unwrap_or(condition_shape);
+            let false_shape = handles
+                .get(2)
+                .and_then(ArgumentHandle::shape_hint)
+                .unwrap_or((1, 1));
+            let shapes = [condition_shape, true_shape, false_shape];
+            let target = match broadcast_shape(&shapes) {
+                Ok(target) => target,
+                Err(error) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                }
+            };
+            let mut blocks = Vec::with_capacity(target.0);
+            for row in 0..target.0 {
+                let mut block_row = Vec::with_capacity(target.1);
+                for col in 0..target.1 {
+                    let condition_index = project_index((row, col), condition_shape);
+                    let condition_value = condition.get(condition_index.0, condition_index.1);
+                    if let LiteralValue::Error(error) = condition_value {
+                        block_row.push(LiftGrid::Scalar(LiteralValue::Error(error)));
+                        continue;
+                    }
+                    let Some(select_true) = condition_bool(&condition_value) else {
+                        let projected = handles[0].with_scalar_value(condition_value);
+                        let mut cell_handles = vec![projected];
+                        cell_handles.extend(handles[1..].iter().map(ArgumentHandle::duplicate));
+                        let result = fun.dispatch(&cell_handles, fctx);
+                        block_row.push(match result {
+                            Ok(value) => grid_from_calc(value),
+                            Err(error) => LiftGrid::Scalar(LiteralValue::Error(error)),
+                        });
+                        continue;
+                    };
+
+                    let (selected, selected_shape) = if select_true {
+                        (&handles[1], true_shape)
+                    } else if let Some(handle) = handles.get(2) {
+                        (handle, false_shape)
+                    } else {
+                        block_row.push(LiftGrid::Scalar(LiteralValue::Boolean(false)));
+                        continue;
+                    };
+                    let selected_index = project_index((row, col), selected_shape);
+                    block_row.push(
+                        match selected.value_block_at(selected_index.0, selected_index.1) {
+                            Ok(value) => grid_from_calc(value),
+                            Err(error) if error.kind == ExcelErrorKind::Cancelled => {
+                                return Err(error);
+                            }
+                            Err(error) => LiftGrid::Scalar(LiteralValue::Error(error)),
+                        },
+                    );
+                }
+                blocks.push(block_row);
+            }
+            return Ok(blocks_to_calc(blocks, fctx));
+        }
+
+        let mut grids = Vec::with_capacity(lifted_positions.len());
+        let mut shapes = Vec::with_capacity(lifted_positions.len());
+        for &position in lifted_positions {
+            if let Some(handle) = handles.get(position) {
+                let grid = grid_from_handle(handle)?;
+                shapes.push(grid.shape());
+                grids.push((position, grid));
+            }
+        }
+        let target = match broadcast_shape(&shapes) {
+            Ok(target) => target,
+            Err(error) => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+            }
+        };
+        if target == (1, 1) {
+            return fun.dispatch(handles, fctx);
+        }
+        for (position, handle) in handles.iter().enumerate() {
+            if !lifted_positions.contains(&position) {
+                handle.resolve_once()?;
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(target.0);
+        for row in 0..target.0 {
+            let mut block_row = Vec::with_capacity(target.1);
+            for col in 0..target.1 {
+                let cell_handles: Vec<_> = handles
+                    .iter()
+                    .enumerate()
+                    .map(|(position, handle)| {
+                        if let Some((_, grid)) =
+                            grids.iter().find(|(lifted, _)| *lifted == position)
+                        {
+                            let index = project_index((row, col), grid.shape());
+                            handle.with_scalar_value(grid.get(index.0, index.1))
+                        } else {
+                            handle.duplicate()
+                        }
+                    })
+                    .collect();
+                let value = match fun.dispatch(&cell_handles, fctx) {
+                    Ok(value) => grid_from_calc(value),
+                    Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+                    Err(error) => LiftGrid::Scalar(LiteralValue::Error(error)),
+                };
+                block_row.push(value);
+            }
+            blocks.push(block_row);
+        }
+        Ok(blocks_to_calc(blocks, fctx))
+    }
+
     fn eval_function_to_calc(
         &self,
         name: &str,
@@ -1292,7 +2018,7 @@ impl<'a> Interpreter<'a> {
                 self.current_cell,
                 self.current_sheet,
             );
-            return fun.dispatch(&handles, &fctx);
+            return self.dispatch_with_array_lifting(name, fun.as_ref(), &handles, &fctx);
         }
 
         if let Some(callable) = self.resolve_local_callable(name) {

@@ -1,8 +1,508 @@
 use crate::builtins::math::{Atan2Fn, CosFn, SinFn, TanFn};
 use crate::test_workbook::TestWorkbook;
 use crate::traits::ArgumentHandle;
-use formualizer_common::LiteralValue;
+use formualizer_common::{ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
+
+fn ensure_lifting_builtins() {
+    static BUILTINS: std::sync::Once = std::sync::Once::new();
+    BUILTINS.call_once(crate::builtins::load_builtins);
+}
+
+fn evaluate_lifting_formula(wb: &TestWorkbook, formula: &str) -> LiteralValue {
+    use formualizer_parse::parser::Parser;
+
+    ensure_lifting_builtins();
+    let mut parser = Parser::new(formula).expect("formula parser");
+    let ast = parser.parse().expect("valid formula");
+    match wb.interpreter().evaluate_ast(&ast) {
+        Ok(value) => value.into_literal(),
+        Err(error) => LiteralValue::Error(error),
+    }
+}
+
+fn array_lifting_engine() -> crate::engine::Engine<TestWorkbook> {
+    ensure_lifting_builtins();
+    let mut engine =
+        crate::engine::Engine::new(TestWorkbook::new(), crate::engine::EvalConfig::default());
+    for (row, a, b) in [(1, 1, 10), (2, 2, 20), (3, 3, 30)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(a))
+            .expect("set lookup key");
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(b))
+            .expect("set lookup result");
+    }
+    for (col, value) in [(1, 3), (2, 1), (3, 2)] {
+        engine
+            .set_cell_value("Sheet1", 5, col, LiteralValue::Int(value))
+            .expect("set lookup needle");
+    }
+    engine
+}
+
+fn evaluate_lifting_engine_formula(
+    engine: &mut crate::engine::Engine<TestWorkbook>,
+    formula: &str,
+) {
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            20,
+            1,
+            formualizer_parse::parser::parse(formula).expect("valid arena formula"),
+        )
+        .expect("set arena formula");
+    engine.evaluate_all().expect("arena formula evaluation");
+}
+
+fn array_lifting_workbook() -> TestWorkbook {
+    TestWorkbook::new()
+        .with_range(
+            "Sheet1",
+            1,
+            1,
+            vec![
+                vec![
+                    LiteralValue::Int(1),
+                    LiteralValue::Int(10),
+                    LiteralValue::Text("ab".into()),
+                    LiteralValue::Int(1),
+                ],
+                vec![
+                    LiteralValue::Int(2),
+                    LiteralValue::Int(20),
+                    LiteralValue::Text("abab".into()),
+                    LiteralValue::Int(4),
+                ],
+                vec![
+                    LiteralValue::Int(3),
+                    LiteralValue::Int(30),
+                    LiteralValue::Text("ababab".into()),
+                    LiteralValue::Int(9),
+                ],
+            ],
+        )
+        .with_range(
+            "Sheet1",
+            5,
+            1,
+            vec![
+                vec![
+                    LiteralValue::Int(3),
+                    LiteralValue::Int(1),
+                    LiteralValue::Int(2),
+                    LiteralValue::Int(2),
+                    LiteralValue::Int(2),
+                    LiteralValue::Int(2),
+                ],
+                vec![
+                    LiteralValue::Int(7),
+                    LiteralValue::Int(8),
+                    LiteralValue::Int(9),
+                ],
+            ],
+        )
+        .with_range(
+            "Sheet1",
+            10,
+            1,
+            vec![
+                vec![
+                    LiteralValue::Int(1),
+                    LiteralValue::Int(2),
+                    LiteralValue::Int(3),
+                ],
+                vec![
+                    LiteralValue::Int(10),
+                    LiteralValue::Int(20),
+                    LiteralValue::Int(30),
+                ],
+            ],
+        )
+}
+
+#[test]
+fn array_lifting_lookup_family() {
+    let wb = array_lifting_workbook();
+    let number = |formula| evaluate_lifting_formula(&wb, formula);
+
+    assert_eq!(
+        number("=SUMPRODUCT(A6:C6,1*(XLOOKUP(A5:C5,A1:A3,B1:B3)<>0))"),
+        LiteralValue::Number(24.0)
+    );
+    assert_eq!(
+        number("=SUM(XLOOKUP(A5:C5,A1:A3,B1:B3))"),
+        LiteralValue::Number(60.0)
+    );
+    assert_eq!(
+        number("=XLOOKUP(A5:C5,A1:A3,B1:B3)"),
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Number(30.0),
+            LiteralValue::Number(10.0),
+            LiteralValue::Number(20.0),
+        ]])
+    );
+    assert_eq!(
+        number("=XLOOKUP({1;2},A1:A3,B1:C3)"),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0), LiteralValue::Text("ab".into())],
+            vec![
+                LiteralValue::Number(20.0),
+                LiteralValue::Text("abab".into()),
+            ],
+        ])
+    );
+    assert_eq!(
+        number("=_xlfn.XLOOKUP({1;2},A1:A3,B1:C3)"),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0), LiteralValue::Text("ab".into())],
+            vec![
+                LiteralValue::Number(20.0),
+                LiteralValue::Text("abab".into()),
+            ],
+        ])
+    );
+    assert_eq!(
+        number("=_xlfn._xlws.XLOOKUP({1;2},A1:A3,B1:C3)"),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0), LiteralValue::Text("ab".into())],
+            vec![
+                LiteralValue::Number(20.0),
+                LiteralValue::Text("abab".into()),
+            ],
+        ])
+    );
+    assert_eq!(
+        number("=SUM(XMATCH(A5:C5,A1:A3,0))"),
+        LiteralValue::Number(6.0)
+    );
+    assert_eq!(
+        number("=SUMPRODUCT(A6:C6,1*(INDEX(B1:B3,MATCH(A5:C5,A1:A3,0))<>0))"),
+        LiteralValue::Number(24.0)
+    );
+    assert_eq!(
+        number("=SUM(MATCH(A5:C5,A1:A3,0))"),
+        LiteralValue::Number(6.0)
+    );
+    assert_eq!(
+        number("=SUM(INDEX(B1:B3,A5:C5))"),
+        LiteralValue::Number(60.0)
+    );
+    assert_eq!(
+        number("=SUM(INDEX(A11:C11,1,A5:C5))"),
+        LiteralValue::Number(60.0)
+    );
+    assert_eq!(
+        number("=SUM(VLOOKUP(A5:C5,A1:B3,D5:F5,FALSE))"),
+        LiteralValue::Number(60.0)
+    );
+    assert_eq!(
+        number("=SUM(HLOOKUP(A5:C5,A10:C11,D5:F5,FALSE))"),
+        LiteralValue::Number(60.0)
+    );
+    assert_eq!(
+        number("=SUM(LOOKUP(A5:C5,A1:A3,B1:B3))"),
+        LiteralValue::Number(60.0)
+    );
+    let mut engine = array_lifting_engine();
+    evaluate_lifting_engine_formula(&mut engine, "=SUM(XLOOKUP(A5:C5,A1:A3,B1:B3))");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 20, 1),
+        Some(LiteralValue::Number(60.0))
+    );
+}
+
+#[test]
+fn array_lifting_scalar_family() {
+    let wb = array_lifting_workbook()
+        .with_cell_a1("Sheet1", "G1", LiteralValue::Int(43831))
+        .with_range(
+            "Sheet1",
+            1,
+            8,
+            vec![vec![
+                LiteralValue::Int(0),
+                LiteralValue::Int(1),
+                LiteralValue::Int(2),
+            ]],
+        );
+    let number = |formula| evaluate_lifting_formula(&wb, formula);
+
+    assert_eq!(number("=SUM(ABS(A1:A3))"), LiteralValue::Number(6.0));
+    assert_eq!(number("=SUM(ROUND(A1:A3,0))"), LiteralValue::Number(6.0));
+    assert_eq!(number("=SUM(IF(A1:A3>1,1,0))"), LiteralValue::Number(2.0));
+    assert_eq!(number("=SUM(LEN(C1:C3))"), LiteralValue::Number(12.0));
+    assert_eq!(number("=SUM(ISNUMBER(A1:A3)*1)"), LiteralValue::Number(3.0));
+    assert_eq!(number("=SUM(MOD(A1:A3,2))"), LiteralValue::Number(2.0));
+    assert_eq!(number("=SUM(SQRT(D1:D3))"), LiteralValue::Number(6.0));
+    assert_eq!(
+        number("=SUM(EDATE(G1,H1:J1))"),
+        LiteralValue::Number(131584.0)
+    );
+
+    match number("=ROUND(A1:B2,A1:A3)") {
+        LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Value),
+        other => panic!("expected incompatible broadcast error, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_lifting_if_is_lazy() {
+    use crate::function::Function;
+    use crate::traits::FunctionContext;
+    use formualizer_common::ExcelError;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct CircularReadFn(Arc<AtomicUsize>);
+
+    impl Function for CircularReadFn {
+        fn name(&self) -> &'static str {
+            "CIRCULAR_READ"
+        }
+
+        fn eval<'x, 'b, 'c>(
+            &self,
+            _args: &'c [ArgumentHandle<'x, 'b>],
+            _ctx: &dyn FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Circ),
+            )))
+        }
+    }
+
+    let circular_reads = Arc::new(AtomicUsize::new(0));
+    let wb = array_lifting_workbook()
+        .with_range(
+            "Sheet1",
+            1,
+            11,
+            vec![
+                vec![LiteralValue::Int(10), LiteralValue::Int(100)],
+                vec![LiteralValue::Int(20), LiteralValue::Int(200)],
+                vec![LiteralValue::Int(30), LiteralValue::Int(300)],
+            ],
+        )
+        .with_function(Arc::new(CircularReadFn(Arc::clone(&circular_reads))));
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=IF({TRUE,FALSE},{1,1}/{1,0},9)"),
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Number(1.0),
+            LiteralValue::Number(9.0),
+        ]])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=IF({TRUE,TRUE},1,{1,1}/{0,0})"),
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Number(1.0),
+            LiteralValue::Number(1.0),
+        ]])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(
+            &wb,
+            "=IF({TRUE,FALSE},{11,CIRCULAR_READ()},{CIRCULAR_READ(),22})",
+        ),
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Number(11.0),
+            LiteralValue::Number(22.0),
+        ]])
+    );
+    assert_eq!(circular_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=IF({TRUE;TRUE},XLOOKUP({1;2},A1:A3,K1:L3),0)",),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0), LiteralValue::Number(100.0)],
+            vec![LiteralValue::Number(20.0), LiteralValue::Number(200.0)],
+        ])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(
+            &wb,
+            "=IF(TRUE,IF({TRUE;TRUE},XLOOKUP({1;2},A1:A3,K1:L3),0),0)",
+        ),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0), LiteralValue::Number(100.0)],
+            vec![LiteralValue::Number(20.0), LiteralValue::Number(200.0)],
+        ])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(
+            &wb,
+            "=IF({TRUE;TRUE},IF({TRUE;TRUE},XLOOKUP({1;2},A1:A3,K1:L3),0),0)",
+        ),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0), LiteralValue::Number(100.0)],
+            vec![LiteralValue::Number(20.0), LiteralValue::Number(200.0)],
+        ])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=IF({TRUE,NA()},1,2)"),
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Number(1.0),
+            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
+        ]])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=IF({TRUE,FALSE},ABS({11,CIRCULAR_READ()}),9)"),
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Number(11.0),
+            LiteralValue::Number(9.0),
+        ]])
+    );
+    assert_eq!(circular_reads.load(Ordering::SeqCst), 0);
+    let mut engine = array_lifting_engine();
+    evaluate_lifting_engine_formula(&mut engine, "=IF({TRUE,FALSE},{1,1}/{1,0},9)");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 20, 1),
+        Some(LiteralValue::Number(1.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 20, 2),
+        Some(LiteralValue::Number(9.0))
+    );
+
+    let arena_reads = Arc::new(AtomicUsize::new(0));
+    let mut engine = crate::engine::Engine::new(
+        TestWorkbook::new().with_function(Arc::new(CircularReadFn(Arc::clone(&arena_reads)))),
+        crate::engine::EvalConfig::default(),
+    );
+    evaluate_lifting_engine_formula(&mut engine, "=IF({TRUE,FALSE},ABS({11,CIRCULAR_READ()}),9)");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 20, 1),
+        Some(LiteralValue::Number(11.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 20, 2),
+        Some(LiteralValue::Number(9.0))
+    );
+    assert_eq!(arena_reads.load(Ordering::SeqCst), 0);
+    for (row, key, first, second) in [(1, 1, 10, 100), (2, 2, 20, 200), (3, 3, 30, 300)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(key))
+            .expect("set IF lookup key");
+        engine
+            .set_cell_value("Sheet1", row, 11, LiteralValue::Int(first))
+            .expect("set IF first return");
+        engine
+            .set_cell_value("Sheet1", row, 12, LiteralValue::Int(second))
+            .expect("set IF second return");
+    }
+    evaluate_lifting_engine_formula(&mut engine, "=IF({TRUE;TRUE},XLOOKUP({1;2},A1:A3,K1:L3),0)");
+    for (row, expected) in [(20, [10.0, 100.0]), (21, [20.0, 200.0])] {
+        for (offset, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                engine.get_cell_value("Sheet1", row, offset as u32 + 1),
+                Some(LiteralValue::Number(value))
+            );
+        }
+    }
+    evaluate_lifting_engine_formula(
+        &mut engine,
+        "=IF(TRUE,IF({TRUE;TRUE},XLOOKUP({1;2},A1:A3,K1:L3),0),0)",
+    );
+    for (row, expected) in [(20, [10.0, 100.0]), (21, [20.0, 200.0])] {
+        for (offset, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                engine.get_cell_value("Sheet1", row, offset as u32 + 1),
+                Some(LiteralValue::Number(value))
+            );
+        }
+    }
+    evaluate_lifting_engine_formula(
+        &mut engine,
+        "=IF({TRUE;TRUE},IF({TRUE;TRUE},XLOOKUP({1;2},A1:A3,K1:L3),0),0)",
+    );
+    for (row, expected) in [(20, [10.0, 100.0]), (21, [20.0, 200.0])] {
+        for (offset, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                engine.get_cell_value("Sheet1", row, offset as u32 + 1),
+                Some(LiteralValue::Number(value))
+            );
+        }
+    }
+}
+
+#[test]
+fn array_lifting_preserves_single_intersection() {
+    let wb = array_lifting_workbook();
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=_xlfn.SINGLE(A1:A3)"),
+        LiteralValue::Number(1.0)
+    );
+}
+
+#[test]
+fn array_lifting_preserves_range_reducers() {
+    let wb = array_lifting_workbook();
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=SUM(A1:A3)"),
+        LiteralValue::Number(6.0)
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=SUMIF(A1:A3,\">1\",B1:B3)"),
+        LiteralValue::Number(50.0)
+    );
+}
+
+#[test]
+fn array_lifting_preserves_by_ref() {
+    use crate::args::{ArgSchema, ShapeKind};
+    use crate::function::Function;
+    use crate::traits::FunctionContext;
+    use formualizer_common::{ArgKind, CoercionPolicy, ExcelError};
+    use smallvec::smallvec;
+
+    #[derive(Debug)]
+    struct ByRefFn;
+
+    impl Function for ByRefFn {
+        fn name(&self) -> &'static str {
+            "BYREF"
+        }
+
+        fn min_args(&self) -> usize {
+            1
+        }
+
+        fn arg_schema(&self) -> &'static [ArgSchema] {
+            static SCHEMA: std::sync::LazyLock<Vec<ArgSchema>> = std::sync::LazyLock::new(|| {
+                vec![ArgSchema {
+                    kinds: smallvec![ArgKind::Any],
+                    required: true,
+                    by_ref: true,
+                    shape: ShapeKind::Range,
+                    coercion: CoercionPolicy::None,
+                    max: None,
+                    repeating: None,
+                    default: None,
+                }]
+            });
+            &SCHEMA
+        }
+
+        fn eval<'x, 'b, 'c>(
+            &self,
+            args: &'c [ArgumentHandle<'x, 'b>],
+            _ctx: &dyn FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+            args[0].as_reference_or_eval()?;
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(1)))
+        }
+    }
+
+    let wb = array_lifting_workbook().with_function(std::sync::Arc::new(ByRefFn));
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=BYREF(A1:A3)"),
+        LiteralValue::Int(1)
+    );
+}
 
 fn interp(wb: &TestWorkbook) -> crate::interpreter::Interpreter<'_> {
     wb.interpreter()
