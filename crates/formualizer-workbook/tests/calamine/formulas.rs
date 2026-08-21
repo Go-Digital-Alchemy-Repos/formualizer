@@ -7,6 +7,51 @@ use std::io::{Cursor, Read, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+fn replace_zip_entry(bytes: Vec<u8>, entry_name: &str, replacement: &[u8]) -> Vec<u8> {
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).unwrap();
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let name = entry.name().to_string();
+        if entry.is_dir() {
+            writer.add_directory(name, options).unwrap();
+            continue;
+        }
+        writer.start_file(&name, options).unwrap();
+        if name == entry_name {
+            writer.write_all(replacement).unwrap();
+        } else {
+            std::io::copy(&mut entry, &mut writer).unwrap();
+        }
+    }
+
+    writer.finish().unwrap().into_inner()
+}
+
+fn workbook_with_raw_sheet(sheet_xml: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let path = build_workbook(|_| {});
+    let bytes = std::fs::read(&path).unwrap();
+    let bytes = replace_zip_entry(bytes, "xl/worksheets/sheet1.xml", sheet_xml.as_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    (path, bytes)
+}
+
+fn assert_number(
+    engine: &Engine<formualizer_eval::test_workbook::TestWorkbook>,
+    row: u32,
+    col: u32,
+    expected: f64,
+) {
+    assert_eq!(
+        engine.get_cell_value("Sheet1", row, col),
+        Some(LiteralValue::Number(expected)),
+        "unexpected value at row {row}, column {col}"
+    );
+}
+
 fn inject_external_link_rels(bytes: Vec<u8>, idx: u32, target: &str) -> Vec<u8> {
     let reader = Cursor::new(bytes);
     let mut archive = ZipArchive::new(reader).unwrap();
@@ -124,4 +169,126 @@ fn calamine_loads_external_link_index_formulas_from_bytes() {
     let mut engine: Engine<_> = Engine::new(ctx, EvalConfig::default());
     backend.stream_into_engine(&mut engine).unwrap();
     engine.build_graph_all().unwrap();
+}
+
+#[test]
+fn array_formula_ref_cached_values_do_not_block() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:G3"/>
+  <sheetData>
+    <row r="1">
+      <c r="A1"><v>5</v></c><c r="B1"><v>6</v></c><c r="C1"><v>7</v></c>
+      <c r="E1"><f t="array" ref="E1:E3">TRANSPOSE(A1:C1)</f><v>5</v></c>
+      <c r="G1"><f>SUM(E1:E3)</f><v>18</v></c>
+    </row>
+    <row r="2"><c r="E2"><v>6</v></c></row>
+    <row r="3"><c r="E3"><v>7</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (path, _) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_path(path).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 1, 5, 5.0);
+    assert_number(&engine, 2, 5, 6.0);
+    assert_number(&engine, 3, 5, 7.0);
+    assert_number(&engine, 1, 7, 18.0);
+    let stats = adapter.load_stats().unwrap();
+    assert_eq!(stats.formula_cells_observed, Some(2));
+    assert_eq!(stats.value_cells_observed, Some(3));
+}
+
+#[test]
+fn array_formula_ref_empty_members_do_not_parse() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:E3"/>
+  <sheetData>
+    <row r="1">
+      <c r="A1"><v>5</v></c><c r="B1"><v>6</v></c><c r="C1"><v>7</v></c>
+      <c r="E1"><f t="array" ref="E1:E3">TRANSPOSE(A1:C1)</f><v>5</v></c>
+    </row>
+    <row r="2"><c r="E2"><f ca="1"/><v>6</v></c></row>
+    <row r="3"><c r="E3"><f ca="1"/><v>7</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    let load = adapter.stream_into_engine(&mut engine);
+    assert!(
+        load.is_ok(),
+        "empty array members must not be parsed as formulas: {load:?}"
+    );
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 1, 5, 5.0);
+    assert_number(&engine, 2, 5, 6.0);
+    assert_number(&engine, 3, 5, 7.0);
+    let stats = adapter.load_stats().unwrap();
+    assert_eq!(stats.formula_cells_observed, Some(1));
+    assert_eq!(stats.value_cells_observed, Some(3));
+}
+
+#[test]
+fn array_formula_ref_single_cell_unchanged() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:B1"/>
+  <sheetData>
+    <row r="1">
+      <c r="A1"><v>-5</v></c>
+      <c r="B1"><f t="array" ref="B1">ABS(A1)</f><v>99</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 1, 2, 5.0);
+    let stats = adapter.load_stats().unwrap();
+    assert_eq!(stats.formula_cells_observed, Some(1));
+    assert_eq!(stats.value_cells_observed, Some(1));
+}
+
+#[test]
+fn array_formula_ref_shared_unchanged() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:B3"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>10</v></c><c><f t="shared" ref="B1:B3" si="0">A1+1</f><v>11</v></c></row>
+    <row r="2"><c><v>20</v></c><c><f t="shared" si="0"/><v>21</v></c></row>
+    <row><c><v>30</v></c><c><f t="shared" si="0"/><v>31</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 1, 2, 11.0);
+    assert_number(&engine, 2, 2, 21.0);
+    assert_number(&engine, 3, 2, 31.0);
+    let stats = adapter.load_stats().unwrap();
+    assert_eq!(stats.shared_formula_tags_observed, Some(3));
 }

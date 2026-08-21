@@ -67,6 +67,14 @@ struct RawSavedFormulaValue {
     raw: String,
 }
 
+#[derive(Default)]
+struct ArrayFormulaMetadata {
+    anchors: BTreeSet<(u32, u32)>,
+    non_anchor_members: BTreeSet<(u32, u32)>,
+}
+
+const ARRAY_FORMULA_XML_TOKEN_BYTES: usize = 1024 * 1024;
+
 impl<R: BufRead> Read for BoundedXmlTokenReader<R> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         let available = self.fill_buf()?;
@@ -397,6 +405,7 @@ impl CalamineAdapter {
         sheet_instance: u32,
         options: StreamWorksheetOptions,
         mut saved_formula_fallback: BTreeMap<(u32, u32), LiteralValue>,
+        array_formula_members: &BTreeSet<(u32, u32)>,
     ) -> Result<StreamedSheet, calamine::Error>
     where
         RS: Read + Seek,
@@ -494,6 +503,11 @@ impl CalamineAdapter {
             }
             max_row_seen = max_row_seen.max(row);
             max_col_seen = max_col_seen.max(col);
+
+            if array_formula_members.contains(&(row0 + 1, col0 + 1)) {
+                saved_formula_fallback.remove(&(row0 + 1, col0 + 1));
+                continue;
+            }
 
             let has_formula = record.formula.is_some();
             if let Some(metadata) = record.formula {
@@ -1374,6 +1388,23 @@ impl CalamineAdapter {
         calamine::Error::Io(std::io::Error::other(message.into()))
     }
 
+    fn array_formula_metadata_error(message: impl Into<String>) -> calamine::Error {
+        calamine::Error::Io(std::io::Error::other(message.into()))
+    }
+
+    fn charge_array_formula_metadata_memory(
+        retained: &mut usize,
+        budget: usize,
+    ) -> Result<(), calamine::Error> {
+        *retained = retained.saturating_add(64);
+        if *retained > budget {
+            return Err(Self::array_formula_metadata_error(format!(
+                "array formula metadata exceeds configured memory budget of {budget} bytes"
+            )));
+        }
+        Ok(())
+    }
+
     fn charge_saved_cache_memory(
         retained: &mut usize,
         additional: usize,
@@ -1607,6 +1638,182 @@ impl CalamineAdapter {
                 .cloned()
                 .map(LiteralValue::Text),
             _ => raw.parse::<f64>().ok().map(LiteralValue::Number),
+        }
+    }
+
+    fn scan_array_formula_metadata_from_reader<R>(
+        reader: R,
+        worksheet_path: &str,
+        sheet: &str,
+        limits: &WorkbookLoadLimits,
+    ) -> Result<ArrayFormulaMetadata, calamine::Error>
+    where
+        R: Read + Seek,
+    {
+        let mut archive = ZipArchive::new(reader)
+            .map_err(|error| Self::array_formula_metadata_error(error.to_string()))?;
+        let entry = archive
+            .by_name(worksheet_path)
+            .map_err(|error| Self::array_formula_metadata_error(error.to_string()))?;
+        let memory_budget =
+            usize::try_from(limits.max_formula_spool_memory_bytes).unwrap_or(usize::MAX);
+        let bounded_reader = BoundedXmlTokenReader {
+            inner: BufReader::new(entry),
+            token_bytes: 0,
+            max_token_bytes: ARRAY_FORMULA_XML_TOKEN_BYTES,
+        };
+        let mut xml = XmlReader::from_reader(bounded_reader);
+        let mut buf = Vec::new();
+        let mut current_coord = None;
+        let mut row_index = 1u32;
+        let mut col_index = 1u32;
+        let mut retained_bytes = 0usize;
+        let mut metadata = ArrayFormulaMetadata::default();
+
+        loop {
+            buf.clear();
+            match xml.read_event_into(&mut buf) {
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"row" => {
+                    if let Some(reference) = Self::decode_attr(&xml, event, b"r") {
+                        row_index = reference.parse::<u32>().map_err(|error| {
+                            Self::array_formula_metadata_error(format!(
+                                "array formula metadata scan failed for sheet {sheet}: invalid row coordinate {reference}: {error}"
+                            ))
+                        })?;
+                        if row_index == 0 {
+                            return Err(Self::array_formula_metadata_error(format!(
+                                "array formula metadata scan failed for sheet {sheet}: invalid row coordinate {reference}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"row" => {
+                    row_index = row_index.saturating_add(1);
+                    col_index = 1;
+                    current_coord = None;
+                }
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"c" => {
+                    let (row, col) = if let Some(reference) = Self::decode_attr(&xml, event, b"r") {
+                        let (row, col, _, _) =
+                            parse_a1_1based(&reference).map_err(|error| {
+                                Self::array_formula_metadata_error(format!(
+                                    "array formula metadata scan failed for sheet {sheet}: invalid cell coordinate {reference}: {error}"
+                                ))
+                            })?;
+                        (row, col)
+                    } else {
+                        (row_index, col_index)
+                    };
+                    enforce_sheet_dimension_limits("calamine", sheet, row, col, limits)
+                        .map_err(|error| Self::array_formula_metadata_error(error.to_string()))?;
+                    current_coord = Some((row, col));
+                    col_index = col.saturating_add(1);
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if current_coord.is_some()
+                        && event.local_name().as_ref() == b"f"
+                        && Self::decode_attr(&xml, event, b"t").as_deref() == Some("array") =>
+                {
+                    let anchor = current_coord.expect("guarded above");
+                    let reference = Self::decode_attr(&xml, event, b"ref").ok_or_else(|| {
+                        Self::array_formula_metadata_error(format!(
+                            "array formula metadata scan failed for sheet {sheet}: array formula at row {}, column {} has no ref",
+                            anchor.0, anchor.1
+                        ))
+                    })?;
+                    let (start, end) = reference
+                        .split_once(':')
+                        .map_or((reference.as_str(), reference.as_str()), |(start, end)| {
+                            (start, end)
+                        });
+                    let (start_row, start_col, _, _) =
+                        parse_a1_1based(start).map_err(|error| {
+                            Self::array_formula_metadata_error(format!(
+                                "array formula metadata scan failed for sheet {sheet}: invalid array ref {reference}: {error}"
+                            ))
+                        })?;
+                    let (end_row, end_col, _, _) = parse_a1_1based(end).map_err(|error| {
+                        Self::array_formula_metadata_error(format!(
+                            "array formula metadata scan failed for sheet {sheet}: invalid array ref {reference}: {error}"
+                        ))
+                    })?;
+                    let first_row = start_row.min(end_row);
+                    let last_row = start_row.max(end_row);
+                    let first_col = start_col.min(end_col);
+                    let last_col = start_col.max(end_col);
+                    enforce_sheet_dimension_limits("calamine", sheet, last_row, last_col, limits)
+                        .map_err(|error| Self::array_formula_metadata_error(error.to_string()))?;
+                    let area = u64::from(last_row - first_row + 1)
+                        .saturating_mul(u64::from(last_col - first_col + 1));
+                    if area > limits.max_sheet_logical_cells {
+                        return Err(Self::array_formula_metadata_error(format!(
+                            "Workbook load budget exceeded in calamine for sheet {sheet}: array formula ref {reference} contains {area} cells, limit is {}",
+                            limits.max_sheet_logical_cells
+                        )));
+                    }
+                    if metadata.anchors.insert(anchor) {
+                        Self::charge_array_formula_metadata_memory(
+                            &mut retained_bytes,
+                            memory_budget,
+                        )?;
+                    }
+                    if area > 1 {
+                        for row in first_row..=last_row {
+                            for col in first_col..=last_col {
+                                if (row, col) != anchor
+                                    && metadata.non_anchor_members.insert((row, col))
+                                {
+                                    Self::charge_array_formula_metadata_memory(
+                                        &mut retained_bytes,
+                                        memory_budget,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"c" => {
+                    current_coord = None;
+                }
+                Ok(Event::Eof) => break,
+                Err(error) => {
+                    return Err(Self::array_formula_metadata_error(error.to_string()));
+                }
+                _ => {}
+            }
+        }
+        for anchor in &metadata.anchors {
+            metadata.non_anchor_members.remove(anchor);
+        }
+        Ok(metadata)
+    }
+
+    fn scan_array_formula_metadata(
+        &self,
+        sheet: &str,
+        limits: &WorkbookLoadLimits,
+    ) -> Result<ArrayFormulaMetadata, calamine::Error> {
+        let worksheet_path = self.worksheet_paths.get(sheet).ok_or_else(|| {
+            Self::array_formula_metadata_error(format!(
+                "Cannot resolve OOXML worksheet path for array formula metadata scan of sheet {sheet}"
+            ))
+        })?;
+        match &self.source {
+            CalamineSource::File(path) => {
+                let file = File::open(path).map_err(calamine::Error::Io)?;
+                Self::scan_array_formula_metadata_from_reader(
+                    BufReader::new(file),
+                    worksheet_path,
+                    sheet,
+                    limits,
+                )
+            }
+            CalamineSource::Bytes(bytes) => Self::scan_array_formula_metadata_from_reader(
+                Cursor::new(Arc::clone(bytes)),
+                worksheet_path,
+                sheet,
+                limits,
+            ),
         }
     }
 
@@ -2210,6 +2417,8 @@ where
 
                 let shadow_relocation_comparator =
                     self.shadow_relocation_comparator.as_ref().map(Arc::clone);
+                let array_formula_metadata =
+                    self.scan_array_formula_metadata(n, engine.workbook_load_limits())?;
                 let saved_formula_fallback = if matches!(
                     engine.config.cycle.policy,
                     formualizer_eval::engine::CyclePolicy::Iterate { .. }
@@ -2240,6 +2449,7 @@ where
                                 shadow_relocation_comparator: shadow_relocation_comparator.clone(),
                             },
                             saved_formula_fallback,
+                            &array_formula_metadata.non_anchor_members,
                         ),
                         CalamineWorkbook::Bytes(workbook) => Self::stream_worksheet(
                             workbook,
@@ -2256,6 +2466,7 @@ where
                                 shadow_relocation_comparator,
                             },
                             saved_formula_fallback,
+                            &array_formula_metadata.non_anchor_members,
                         ),
                     }?
                 };
