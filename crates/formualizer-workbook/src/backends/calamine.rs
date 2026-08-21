@@ -1147,7 +1147,7 @@ impl CalamineAdapter {
         // defined-name metadata we need here with a targeted streaming pass over
         // workbook.xml, avoiding a full file String allocation or any sheet XML reparse.
         let mut xml = XmlReader::from_reader(BufReader::new(entry));
-        xml.config_mut().trim_text(true);
+        xml.config_mut().trim_text(false);
 
         let mut out = Vec::new();
         let mut seen: HashSet<(DefinedNameScope, Option<String>, String)> = HashSet::new();
