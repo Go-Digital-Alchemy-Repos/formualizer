@@ -3,7 +3,8 @@
 //! Notes / Simplifications (documented for future refinement):
 //! - XLOOKUP supports: lookup_value, lookup_array, return_array, [if_not_found], [match_mode], [search_mode]
 //!   * match_mode: 0 exact (default), -1 exact-or-next-smaller, 1 exact-or-next-larger, 2 wildcard (basic * ?)
-//!   * search_mode: 1 forward (default), -1 reverse; (2 / -2 binary not yet implemented -> treated as 1 / -1)
+//!   * search_mode: 1 forward (default), -1 reverse, 2 ascending binary semantics,
+//!     -2 descending binary semantics. Binary modes validate ordering, then scan linearly.
 //!   * Wildcard mode (2) is case-insensitive and supports Excel-style escapes (~).
 //! - FILTER supports: array, include, [if_empty]; Shapes must be broadcast-compatible by rows (include is 1-D).
 //!   * include may be vertical column vector OR same sized 2D; we reduce any non-zero truthy cell to include row.
@@ -14,13 +15,15 @@
 //! - All functions return Array literal values (spills) – engine handles spill placement later.
 //!
 //! TODO(backlog):
-//! - Binary search for XLOOKUP approximate modes; currently linear scan.
+//! - Replace the validated linear scan for XLOOKUP binary modes with binary search.
 //! - Better type coercion parity with Excel (booleans/text vs numbers nuances).
 //! - Match unsorted detection for approximate modes (#N/A) and wildcard escaping.
 //! - PERFORMANCE: streaming FILTER without full materialization; UNIQUE using smallvec for tiny sets.
 
 use super::super::utils::collapse_if_scalar;
-use super::lookup_utils::{PreparedLookupMatcher, cmp_for_lookup, value_to_f64_lenient};
+use super::lookup_utils::{
+    PreparedLookupMatcher, SearchedVector, cmp_for_lookup, value_to_f64_lenient,
+};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::lookup_index_cache::LookupAxis;
 use crate::function::Function; // FnCaps imported via macro
@@ -145,7 +148,8 @@ impl Function for SingleFn {
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
-/// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
+/// - `search_mode`: `1` forward, `-1` reverse, `2` ascending binary semantics,
+///   `-2` descending binary semantics. Binary modes currently use a validated linear scan.
 /// - `lookup_array` must be 1D. Invalid shape returns `#VALUE!`.
 /// - If `return_array` is multi-column or multi-row, the matched row/column is returned as a spill.
 ///
@@ -435,41 +439,60 @@ impl Function for XLookupFn {
                 f64::INFINITY
             };
 
-            let mut prev: Option<LiteralValue> = None;
-            for i in 0..lookup_len {
-                let cand = if vertical {
-                    lookup_view.get_cell(i, 0)
-                } else {
-                    lookup_view.get_cell(0, i)
-                };
-
-                if let Some(p) = prev.as_ref() {
-                    let sorted_ok =
-                        cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o <= 0);
-                    if !sorted_ok {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Na),
-                        )));
+            // Approximate XLOOKUP searches only values comparable with the needle.
+            // In particular, Empty is skipped while numeric zero remains searchable.
+            // Keep original positions so return-array alignment survives projection.
+            let lookup_values: Vec<LiteralValue> = (0..lookup_len)
+                .map(|i| {
+                    if vertical {
+                        lookup_view.get_cell(i, 0)
+                    } else {
+                        lookup_view.get_cell(0, i)
                     }
-                }
-                prev = Some(cand.clone());
+                })
+                .collect();
+            let searched = SearchedVector::new(&lookup_values, &needle, _ctx.date_system())?;
 
-                if cmp_for_lookup(&cand, &needle, _ctx.date_system()).is_some_and(|o| o == 0) {
-                    found = Some(i);
+            let ordering_valid = match search_mode {
+                // Linear modes deliberately accept unsorted lookup arrays.
+                1 | -1 => true,
+                2 => searched.is_sorted_ascending(),
+                -2 => searched.is_sorted_descending(),
+                // Preserve the prior fallback for unsupported modes.
+                _ => searched.is_sorted_ascending(),
+            };
+            if !ordering_valid {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Na),
+                )));
+            }
+
+            let reverse = search_mode == -1 || search_mode == -2;
+            for visit in 0..searched.len() {
+                let projected_idx = if reverse {
+                    searched.len() - visit - 1
+                } else {
+                    visit
+                };
+                let cand = searched.get(projected_idx);
+                let original_idx = searched.original_position(projected_idx);
+
+                if cmp_for_lookup(cand, &needle, _ctx.date_system()).is_some_and(|o| o == 0) {
+                    found = Some(original_idx);
                     break;
                 }
 
                 if let (Some(nn), Some(vv)) =
-                    (needle_num, value_to_f64_lenient(&cand, _ctx.date_system()))
+                    (needle_num, value_to_f64_lenient(cand, _ctx.date_system()))
                 {
                     if match_mode == -1 {
                         if vv <= nn && vv > best_val {
                             best_val = vv;
-                            best_idx = Some(i);
+                            best_idx = Some(original_idx);
                         }
                     } else if vv >= nn && vv < best_val {
                         best_val = vv;
-                        best_idx = Some(i);
+                        best_idx = Some(original_idx);
                     }
                 }
             }

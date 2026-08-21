@@ -563,3 +563,180 @@ fn searchable_count_not_range_extent_controls_descending_tie_break() {
         "MATCH threshold uses projected length, not range extent",
     );
 }
+
+#[test]
+fn xlookup_linear_approximate_unsorted_forward() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, key, result) in [
+        (1, 46_247, 265),
+        (2, 46_400, 300),
+        (3, 46_300, 280),
+        (4, 46_200, 200),
+    ] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(result))
+            .unwrap();
+    }
+
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(46278,A1:A4,B1:B4,\"nf\",-1,1)"),
+        265.0,
+        "XLOOKUP forward next-smaller over unsorted keys",
+    );
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(46278,A1:A4,B1:B4,,1,1)"),
+        280.0,
+        "XLOOKUP forward next-larger over unsorted keys",
+    );
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(46400,A1:A4,B1:B4,,-1,1)"),
+        300.0,
+        "XLOOKUP forward exact match wins in approximate mode",
+    );
+
+    // With duplicate best candidates, a forward scan keeps the first one.
+    for (row, key, result) in [(1, 3, 10), (2, 5, 20), (3, 3, 30), (4, 5, 40)] {
+        engine
+            .set_cell_value("Sheet1", row, 3, LiteralValue::Int(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 4, LiteralValue::Int(result))
+            .unwrap();
+    }
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(4,C1:C4,D1:D4,,-1,1)"),
+        10.0,
+        "XLOOKUP forward next-smaller duplicate tie",
+    );
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(4,C1:C4,D1:D4,,1,1)"),
+        20.0,
+        "XLOOKUP forward next-larger duplicate tie",
+    );
+}
+
+#[test]
+fn xlookup_linear_approximate_unsorted_reverse() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, key, result) in [(1, 3, 10), (2, 5, 20), (3, 3, 30), (4, 5, 40)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(result))
+            .unwrap();
+    }
+
+    // Reverse search visits the same unsorted keys last-to-first, including
+    // duplicate ties for both approximate directions and exact matches.
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(4,A1:A4,B1:B4,,-1,-1)"),
+        30.0,
+        "XLOOKUP reverse next-smaller duplicate tie",
+    );
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(4,A1:A4,B1:B4,,1,-1)"),
+        40.0,
+        "XLOOKUP reverse next-larger duplicate tie",
+    );
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(3,A1:A4,B1:B4,,-1,-1)"),
+        30.0,
+        "XLOOKUP reverse exact duplicate tie",
+    );
+}
+
+#[test]
+fn xlookup_linear_approximate_blanks_zero_text() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, key) in [(1, 46_247), (4, 0), (5, 46_400)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(key))
+            .unwrap();
+    }
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Empty)
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 3, 1, LiteralValue::Text("header".into()))
+        .unwrap();
+
+    // The production-shaped computed return array selects C when B is zero.
+    for (row, primary, alternate) in [
+        (1, 0, 265),
+        (2, 900, 901),
+        (3, 800, 801),
+        (4, 0, 7),
+        (5, 300, 301),
+    ] {
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(primary))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 3, LiteralValue::Int(alternate))
+            .unwrap();
+    }
+
+    assert_number(
+        eval(
+            &mut engine,
+            "=XLOOKUP(46278,A1:A5,IF(B1:B5=0,C1:C5,B1:B5),,-1,1)",
+        ),
+        265.0,
+        "XLOOKUP skips blanks and incomparable text",
+    );
+    assert_number(
+        eval(
+            &mut engine,
+            "=XLOOKUP(1,A1:A5,IF(B1:B5=0,C1:C5,B1:B5),,-1,1)",
+        ),
+        7.0,
+        "XLOOKUP retains numeric zero while skipping Empty",
+    );
+}
+
+#[test]
+fn xlookup_binary_approximate_sort_direction() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    // Dense ascending input remains accepted by ascending binary mode.
+    for (row, key, result) in [(1, 1, 10), (2, 3, 30), (3, 5, 50)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(result))
+            .unwrap();
+    }
+
+    for (row, key, result) in [(1, 3, 30), (2, 1, 10), (3, 5, 50)] {
+        engine
+            .set_cell_value("Sheet1", row, 3, LiteralValue::Int(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 4, LiteralValue::Int(result))
+            .unwrap();
+    }
+
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(4,A1:A3,B1:B3,,-1,2)"),
+        30.0,
+        "XLOOKUP ascending binary next-smaller",
+    );
+    assert_number(
+        eval(&mut engine, "=XLOOKUP(4,A1:A3,B1:B3,,1,2)"),
+        50.0,
+        "XLOOKUP ascending binary next-larger",
+    );
+    assert_na(
+        eval(&mut engine, "=XLOOKUP(4,C1:C3,D1:D3,,-1,2)"),
+        "XLOOKUP ascending binary rejects unsorted keys",
+    );
+    assert_na(
+        eval(&mut engine, "=XLOOKUP(4,C1:C3,D1:D3,,-1,-2)"),
+        "XLOOKUP descending binary rejects unsorted keys",
+    );
+}
