@@ -64,6 +64,19 @@ fn is_circ(engine: &Engine<TestWorkbook>, sheet: &str, row: u32, col: u32) -> bo
     )
 }
 
+fn is_error_kind(
+    engine: &Engine<TestWorkbook>,
+    sheet: &str,
+    row: u32,
+    col: u32,
+    kind: ExcelErrorKind,
+) -> bool {
+    matches!(
+        engine.get_cell_value(sheet, row, col),
+        Some(LiteralValue::Error(error)) if error.kind == kind
+    )
+}
+
 /// Build the discussion-#99 guarded pair: A1 guard, A2/A3 the static SCC.
 fn build_99_pair(engine: &mut Engine<TestWorkbook>, guard: bool) {
     set_value(engine, "Sheet1", 1, 1, LiteralValue::Boolean(guard));
@@ -74,20 +87,20 @@ fn build_99_pair(engine: &mut Engine<TestWorkbook>, guard: bool) {
 /* ───────────────────────── 7.1 self-reference ───────────────────────── */
 
 #[test]
-fn unevaluable_if_condition_fails_closed_over_both_branches() {
+fn errored_if_condition_propagates_without_arm_cycle() {
     let mut engine = runtime_engine();
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(1/0,A2,7)");
     set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
 
     engine.evaluate_all().unwrap();
 
-    assert!(is_circ(&engine, "Sheet1", 1, 1));
-    assert!(is_circ(&engine, "Sheet1", 2, 1));
-    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert!(is_error_kind(&engine, "Sheet1", 1, 1, ExcelErrorKind::Div));
+    assert!(is_error_kind(&engine, "Sheet1", 2, 1, ExcelErrorKind::Div));
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
 }
 
 #[test]
-fn cycle_instrumentation_records_first_witness_and_inactive_edge_mechanism() {
+fn cycle_instrumentation_omits_errored_if_arm_edges() {
     let mut engine = runtime_engine();
     engine.set_cycle_instrumentation_targets(vec![("Sheet1".to_string(), 1, 1)]);
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(1/0,A2,A3)");
@@ -100,31 +113,10 @@ fn cycle_instrumentation_records_first_witness_and_inactive_edge_mechanism() {
     let target = &targets[0];
     assert_eq!(target.address, "Sheet1!A1");
     assert_eq!(target.static_members.len(), 2);
-    assert_eq!(target.live_members.as_ref().map(Vec::len), Some(2));
-    assert_eq!(target.witness_step, Some(0));
-    assert!(
-        target.edges.iter().any(|edge| {
-            edge.from == "Sheet1!A1"
-                && edge.to == "Sheet1!A2"
-                && !edge.selected
-                && edge.mechanisms == vec!["nested-fail-closed"]
-        }),
-        "unexpected target telemetry: {target:?}"
-    );
-    assert!(
-        target.edges.iter().any(|edge| {
-            edge.from == "Sheet1!A1"
-                && edge.to == "Sheet1!A3"
-                && !edge.selected
-                && edge.mechanisms == vec!["nested-fail-closed"]
-        }),
-        "telemetry omitted an edge from an SCC member to an outside cell: {target:?}"
-    );
-    assert!(target.edges.iter().all(|edge| {
-        edge.mechanisms
-            .iter()
-            .all(|mechanism| matches!(*mechanism, "nested-fail-closed" | "range-expansion"))
-    }));
+    assert!(target.live_members.is_none());
+    assert_eq!(target.witness_step, None);
+    assert!(target.edges.is_empty());
+    assert!(is_error_kind(&engine, "Sheet1", 1, 1, ExcelErrorKind::Div));
 }
 
 #[test]
@@ -275,8 +267,26 @@ fn upstream_diagnostics_literal_mechanism_emission_sites() {
     let range = run("=SUM(B1:B1)", "=A1+1");
     assert!(range.contains("range-expansion"));
 
-    let nested = run("=IF(1/0,B1,0)", "=A1+1");
-    assert!(nested.contains("nested-fail-closed"));
+    let mut errored_if = runtime_engine();
+    errored_if.set_upstream_diagnostics(true, 20);
+    set_formula(&mut errored_if, "Sheet1", 1, 1, "=IF(1/0,B1,0)");
+    set_formula(&mut errored_if, "Sheet1", 1, 2, "=A1+1");
+    errored_if.evaluate_all().unwrap();
+    assert!(is_error_kind(
+        &errored_if,
+        "Sheet1",
+        1,
+        1,
+        ExcelErrorKind::Div
+    ));
+    assert!(is_error_kind(
+        &errored_if,
+        "Sheet1",
+        1,
+        2,
+        ExcelErrorKind::Div
+    ));
+    assert!(errored_if.upstream_diagnostics().stamped_sccs.is_empty());
 
     let non_if = run("=CHOOSE(1,B1)", "=A1+1");
     assert!(non_if.contains("non-if-lazy"));
@@ -291,7 +301,7 @@ fn upstream_diagnostics_literal_mechanism_emission_sites() {
     let nested_and_scalar = run("=B1+IF(1/0,B1,0)", "=A1+1");
     assert_eq!(
         nested_and_scalar,
-        std::collections::BTreeSet::from(["evaluated-scalar", "nested-fail-closed"])
+        std::collections::BTreeSet::from(["evaluated-scalar"])
     );
 
     let range_and_scalar = run("=B1+SUM(B1:B1)", "=A1+1");
@@ -318,7 +328,7 @@ fn upstream_diagnostics_quote_sheet_names_as_canonical_a1() {
 }
 
 #[test]
-fn nested_unevaluable_if_does_not_restore_outer_inactive_arm() {
+fn nested_errored_if_propagates_without_outer_inactive_arm() {
     let mut engine = runtime_engine();
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,IF(1/0,11,12),A2)");
     set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
@@ -327,14 +337,14 @@ fn nested_unevaluable_if_does_not_restore_outer_inactive_arm() {
 
     assert!(matches!(
         engine.get_cell_value("Sheet1", 1, 1),
-        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Div
     ));
     assert!(!is_circ(&engine, "Sheet1", 2, 1));
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
 }
 
 #[test]
-fn failed_if_does_not_restore_sibling_if_inactive_arm() {
+fn errored_if_propagates_without_sibling_if_inactive_arm() {
     let mut engine = runtime_engine();
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,1,A2)+IF(1/0,11,12)");
     set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
@@ -343,14 +353,14 @@ fn failed_if_does_not_restore_sibling_if_inactive_arm() {
 
     assert!(matches!(
         engine.get_cell_value("Sheet1", 1, 1),
-        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Div
     ));
     assert!(!is_circ(&engine, "Sheet1", 2, 1));
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
 }
 
 #[test]
-fn failed_if_does_not_restore_choose_inactive_arm() {
+fn errored_if_propagates_without_choose_inactive_arm() {
     let mut engine = runtime_engine();
     set_formula(&mut engine, "Sheet1", 1, 1, "=CHOOSE(1,IF(1/0,11,12),A2)");
     set_formula(&mut engine, "Sheet1", 2, 1, "=A1");
@@ -359,14 +369,14 @@ fn failed_if_does_not_restore_choose_inactive_arm() {
 
     assert!(matches!(
         engine.get_cell_value("Sheet1", 1, 1),
-        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Div
     ));
     assert!(!is_circ(&engine, "Sheet1", 2, 1));
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
 }
 
 #[test]
-fn nested_failed_if_keeps_two_sheet_outer_inactive_arms_narrowed() {
+fn nested_errored_if_propagates_without_two_sheet_inactive_arms() {
     let mut engine = runtime_engine();
     engine.add_sheet("Probe").unwrap();
     engine.add_sheet("Sheet2").unwrap();
@@ -383,7 +393,7 @@ fn nested_failed_if_keeps_two_sheet_outer_inactive_arms_narrowed() {
 
     assert!(matches!(
         engine.get_cell_value("Probe", 1, 1),
-        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Value
+        Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Div
     ));
     assert_eq!(num(&engine, "Sheet2", 1, 1), 77.0);
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);

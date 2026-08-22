@@ -104,7 +104,6 @@ struct CollectorState {
 
 const MAX_DIAGNOSTIC_EDGES: usize = 1_000_000;
 
-pub(crate) const EDGE_NESTED_FAIL_CLOSED: u8 = 1 << 0;
 pub(crate) const EDGE_RANGE_EXPANSION: u8 = 1 << 1;
 pub(crate) const EDGE_NON_IF_LAZY: u8 = 1 << 2;
 pub(crate) const EDGE_EVALUATED_SCALAR: u8 = 1 << 3;
@@ -367,38 +366,6 @@ impl LiveEdgeCollector {
         }
     }
 
-    /// Record a declared arm reference retained by an unevaluable IF. These
-    /// edges participate in classification but are not part of the selected
-    /// argument walk.
-    pub fn record_failed_rect(
-        &self,
-        sheet_id: SheetId,
-        sr: u32,
-        sc: u32,
-        er: u32,
-        ec: u32,
-        range_expansion: bool,
-    ) {
-        let mechanisms = EDGE_NESTED_FAIL_CLOSED
-            | if range_expansion {
-                EDGE_RANGE_EXPANSION
-            } else {
-                0
-            };
-        'rows: for row in sr..=er {
-            for col in sc..=ec {
-                if !self.record_diagnostic_cell(sheet_id, row, col, false, mechanisms) {
-                    break 'rows;
-                }
-            }
-        }
-        for (i, m) in self.members.iter().enumerate() {
-            if m.sheet_id == sheet_id && m.row >= sr && m.row <= er && m.col >= sc && m.col <= ec {
-                self.record_edge(i as u32, false, mechanisms);
-            }
-        }
-    }
-
     pub fn record_selected_non_if_lazy_rect(
         &self,
         sheet_id: SheetId,
@@ -439,13 +406,6 @@ impl LiveEdgeCollector {
             return;
         };
         self.record_edge(to, true, mechanisms);
-    }
-
-    pub fn record_failed_name(&self, folded_name: &str) {
-        let Some(&to) = self.name_index.get(folded_name) else {
-            return;
-        };
-        self.record_edge(to, false, EDGE_NESTED_FAIL_CLOSED);
     }
 
     pub fn record_selected_non_if_lazy_name(&self, folded_name: &str) {
@@ -575,22 +535,6 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
                 view.start_col() as u32,
                 view.end_row() as u32,
                 view.end_col() as u32,
-            );
-        }
-    }
-
-    fn record_failed_view(&self, reference: &ReferenceType, view: &RangeView<'_>) {
-        if view.is_empty() {
-            return;
-        }
-        if let Some(sid) = self.engine.sheet_id(view.sheet_name()) {
-            self.collector.record_failed_rect(
-                sid,
-                view.start_row() as u32,
-                view.start_col() as u32,
-                view.end_row() as u32,
-                view.end_col() as u32,
-                matches!(reference, ReferenceType::Range { .. }),
             );
         }
     }
@@ -812,15 +756,6 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     }
     fn chunk_hint(&self) -> Option<usize> {
         self.engine.chunk_hint()
-    }
-    fn record_failed_lazy_arm_reference(&self, reference: &ReferenceType, current_sheet: &str) {
-        if let ReferenceType::NamedRange(name) = reference {
-            let key = self.engine.graph.name_lookup_key(name);
-            self.collector.record_failed_name(&key);
-        }
-        if let Ok(view) = self.engine.resolve_range_view(reference, current_sheet) {
-            self.record_failed_view(reference, &view);
-        }
     }
     fn record_selected_non_if_lazy_reference(
         &self,

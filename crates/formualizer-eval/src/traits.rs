@@ -1794,11 +1794,6 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
-    /// Record one declared reference from the arms of a lazy conditional whose
-    /// condition could not select a branch. Ordinary contexts ignore this;
-    /// recording contexts retain only the failed conditional's arm edges.
-    fn record_failed_lazy_arm_reference(&self, _reference: &ReferenceType, _current_sheet: &str) {}
-
     /// Mark a declared reference from the selected arm of a short-circuiting
     /// function other than IF. Diagnostic recording contexts use this only
     /// to label the already-selected live edge.
@@ -2081,9 +2076,6 @@ pub trait FunctionContext<'ctx> {
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken>;
     fn chunk_hint(&self) -> Option<usize>;
 
-    /// See [`EvaluationContext::record_failed_lazy_arm_reference`].
-    fn record_failed_lazy_arm_reference(&self, _reference: &ReferenceType) {}
-
     /// See [`EvaluationContext::record_selected_non_if_lazy_reference`].
     fn record_selected_non_if_lazy_reference(&self, _reference: &ReferenceType) {}
 
@@ -2260,11 +2252,6 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     fn chunk_hint(&self) -> Option<usize> {
         self.base.chunk_hint()
     }
-    fn record_failed_lazy_arm_reference(&self, reference: &ReferenceType) {
-        self.base
-            .record_failed_lazy_arm_reference(reference, self.current_sheet);
-    }
-
     fn record_selected_non_if_lazy_reference(&self, reference: &ReferenceType) {
         self.base
             .record_selected_non_if_lazy_reference(reference, self.current_sheet);

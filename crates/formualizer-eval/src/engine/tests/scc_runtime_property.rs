@@ -442,14 +442,8 @@ impl Oracle {
                                 self.walk_node(&args[2]);
                             }
                         }
-                        // No branch can be selected. Runtime classification
-                        // fails closed by retaining both declared arms.
-                        None => {
-                            self.walk_node(&args[1]);
-                            if args.len() > 2 {
-                                self.walk_node(&args[2]);
-                            }
-                        }
+                        // An errored guard selects no arm.
+                        None => {}
                     }
                 }
                 "NOT" => self.walk_node(&args[0]),
@@ -495,7 +489,7 @@ impl Oracle {
     /// with `GuardEval` (the same arithmetic / short-circuit / error rules as
     /// the value phase, so arm selection is identical in both phases). A guard
     /// that resolves to a clean bool/number selects an arm; an error/circular
-    /// guard returns None, causing the caller to retain both arms.
+    /// guard returns None, so neither arm is live.
     fn live_branch(&mut self, guard: &ASTNode) -> Option<bool> {
         match self.eval_guard(guard) {
             OVal::Bool(b) => Some(b),

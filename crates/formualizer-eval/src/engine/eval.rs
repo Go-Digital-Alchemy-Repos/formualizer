@@ -10,9 +10,8 @@ use crate::engine::graph::prepared_legacy_graph::{
 use crate::engine::graph::{FormulaDirtyEventSnapshot, FormulaDirtyLease, WholeSpanDirtyReason};
 use crate::engine::ingest_pipeline::{DependencyPlanRow, FormulaAstInput};
 use crate::engine::live_edges::{
-    DiagnosticRecordedEdge, EDGE_EVALUATED_SCALAR, EDGE_LAZY_INACTIVE_BRANCH,
-    EDGE_NESTED_FAIL_CLOSED, EDGE_NON_IF_LAZY, EDGE_RANGE_EXPANSION, LiveEdgeCollector,
-    RecordedEdge, RecordingContext,
+    DiagnosticRecordedEdge, EDGE_EVALUATED_SCALAR, EDGE_LAZY_INACTIVE_BRANCH, EDGE_NON_IF_LAZY,
+    EDGE_RANGE_EXPANSION, LiveEdgeCollector, RecordedEdge, RecordingContext,
 };
 use crate::engine::live_graph::analyze_live_graph;
 use crate::engine::lookup_index_cache::{
@@ -25714,9 +25713,6 @@ where
                                 record.row + 1
                             );
                             let mut mechanisms = Vec::new();
-                            if record.mechanisms & EDGE_NESTED_FAIL_CLOSED != 0 {
-                                mechanisms.push("nested-fail-closed");
-                            }
                             if record.mechanisms & EDGE_RANGE_EXPANSION != 0 {
                                 mechanisms.push("range-expansion");
                             }
@@ -25817,9 +25813,6 @@ where
                                             break;
                                         }
                                         let mut mechanisms = Vec::new();
-                                        if record.mechanisms & EDGE_NESTED_FAIL_CLOSED != 0 {
-                                            mechanisms.push("nested-fail-closed");
-                                        }
                                         if record.mechanisms & EDGE_LAZY_INACTIVE_BRANCH != 0 {
                                             mechanisms.push("lazy-inactive-branch");
                                         }

@@ -497,22 +497,9 @@ impl Function for IfFn {
             )));
         }
 
-        let record_failed_arms = || {
-            for arg in &args[1..] {
-                for reference in arg.declared_references() {
-                    ctx.record_failed_lazy_arm_reference(&reference);
-                }
-            }
-        };
         let condition = match args[0].value() {
             Ok(value) => value.into_literal(),
-            Err(error) => {
-                // Resolver/operator failures also leave the condition unable
-                // to select an arm. Preserve the existing error result while
-                // retaining this IF's arms for runtime cycle classification.
-                record_failed_arms();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let b = match condition {
             LiteralValue::Boolean(b) => b,
@@ -523,12 +510,6 @@ impl Function for IfFn {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
             }
             _ => {
-                // The condition cannot select an arm, so retain both arms'
-                // declared references for runtime cycle classification. Do
-                // this at the IF call site: widening the containing formula
-                // would resurrect inactive edges from outer or sibling lazy
-                // expressions.
-                record_failed_arms();
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("IF condition must be boolean or number"),
                 )));
