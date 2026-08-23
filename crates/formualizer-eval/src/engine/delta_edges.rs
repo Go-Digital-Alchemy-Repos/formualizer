@@ -528,10 +528,19 @@ impl DeltaEdgeSlab {
         coords: &[VertexAddr],
         vertex_ids: &[u32],
     ) -> CsrEdges {
-        let mut adjacency = Vec::with_capacity(vertex_ids.len());
+        // A full-adjacency ingest can replace `vertex_ids` with the latest
+        // batch while the CSR still carries edges owned by earlier batches.
+        // Keep those base sources when a later write delta is folded, or the
+        // rebuild silently drops their dependency edges.
+        let mut all_vertex_ids = vertex_ids.to_vec();
+        all_vertex_ids.extend(base.iter().map(|(vertex, _)| vertex.0));
+        all_vertex_ids.sort_unstable();
+        all_vertex_ids.dedup();
+
+        let mut adjacency = Vec::with_capacity(all_vertex_ids.len());
 
         // Build new adjacency list by merging base and delta
-        for &vid in vertex_ids {
+        for vid in all_vertex_ids {
             let v = VertexId(vid);
             let merged = self.merged_view(base, v);
 
@@ -925,9 +934,21 @@ impl CsrMutableEdges {
         coords: Vec<VertexAddr>,
         vertex_ids: Vec<u32>,
     ) {
-        self.base = CsrEdges::from_adjacency(adjacency, &coords);
-        self.coords = coords;
-        self.vertex_ids = vertex_ids;
+        // Ingest is incremental: the supplied registry describes the latest
+        // batch, while the carried-forward adjacency can still contain older
+        // formula vertices. Keep one persistent address entry for both sets so
+        // later full and delta rebuilds cannot forget the older sources.
+        let mut registry: FxHashMap<u32, VertexAddr> = self
+            .vertex_ids
+            .iter()
+            .copied()
+            .zip(self.coords.iter().copied())
+            .collect();
+        registry.extend(vertex_ids.into_iter().zip(coords));
+        let mut entries: Vec<(u32, VertexAddr)> = registry.into_iter().collect();
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        (self.vertex_ids, self.coords) = entries.into_iter().unzip();
+        self.base = CsrEdges::from_adjacency(adjacency, &self.coords);
         self.vertex_pos = self
             .vertex_ids
             .iter()
