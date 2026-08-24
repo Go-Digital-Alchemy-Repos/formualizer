@@ -320,12 +320,102 @@ impl Function for TruncFn {
 
 #[derive(Debug)]
 pub struct RoundFn; // ROUND(number, digits)
+
+fn increment_decimal_digits(digits: &mut Vec<u8>) {
+    for digit in digits.iter_mut().rev() {
+        if *digit < 9 {
+            *digit += 1;
+            return;
+        }
+        *digit = 0;
+    }
+    digits.insert(0, 1);
+}
+
+fn normalize_decimal_digits(digits: &mut Vec<u8>, exponent: &mut i64) {
+    while digits.len() > 1 && digits.last() == Some(&0) {
+        digits.pop();
+        *exponent += 1;
+    }
+}
+
+/// Excel ROUND first treats a binary64 value as its 15-significant-digit
+/// decimal rendering, then rounds that decimal half away from zero.
+fn excel_round(number: f64, requested_digits: i32) -> f64 {
+    if !number.is_finite() || number == 0.0 {
+        return number;
+    }
+
+    let negative = number.is_sign_negative();
+    let rendered = number.abs().to_string();
+    let (mantissa, scientific_exponent) = rendered
+        .split_once(['e', 'E'])
+        .map_or((rendered.as_str(), 0_i64), |(mantissa, exponent)| {
+            (mantissa, exponent.parse::<i64>().unwrap())
+        });
+    let fractional_digits = mantissa
+        .split_once('.')
+        .map_or(0_i64, |(_, fraction)| fraction.len() as i64);
+    let mut digits: Vec<u8> = mantissa
+        .bytes()
+        .filter(|byte| byte.is_ascii_digit())
+        .map(|byte| byte - b'0')
+        .collect();
+    let first_nonzero = digits.iter().position(|digit| *digit != 0).unwrap();
+    digits.drain(..first_nonzero);
+    let mut exponent = scientific_exponent - fractional_digits;
+    normalize_decimal_digits(&mut digits, &mut exponent);
+
+    if digits.len() > 15 {
+        let discarded = digits.len() - 15;
+        let round_up = digits[15] >= 5;
+        digits.truncate(15);
+        exponent += discarded as i64;
+        if round_up {
+            increment_decimal_digits(&mut digits);
+        }
+        normalize_decimal_digits(&mut digits, &mut exponent);
+    }
+
+    let unit_exponent = -(requested_digits as i64);
+    if exponent < unit_exponent {
+        let discarded = (unit_exponent - exponent) as usize;
+        if discarded > digits.len() {
+            return if negative { -0.0 } else { 0.0 };
+        }
+        if discarded == digits.len() {
+            if digits[0] < 5 {
+                return if negative { -0.0 } else { 0.0 };
+            }
+            digits.clear();
+            digits.push(1);
+        } else {
+            let retained = digits.len() - discarded;
+            let round_up = digits[retained] >= 5;
+            digits.truncate(retained);
+            if round_up {
+                increment_decimal_digits(&mut digits);
+            }
+        }
+        exponent = unit_exponent;
+        normalize_decimal_digits(&mut digits, &mut exponent);
+    }
+
+    let coefficient: String = digits
+        .iter()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect();
+    let rounded = format!("{coefficient}e{exponent}").parse::<f64>().unwrap();
+    if negative { -rounded } else { rounded }
+}
 /// Rounds a number to a specified number of digits.
 ///
 /// # Remarks
 /// - Positive `digits` rounds to the right of the decimal point.
 /// - Negative `digits` rounds to the left of the decimal point.
-/// - Uses standard half-up style rounding from Rust's `round` behavior.
+/// - The input is first reduced to 15 significant decimal digits, matching Excel's
+///   numeric precision, then rounded at the requested position.
+/// - Halfway cases round away from zero.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -387,12 +477,7 @@ impl Function for RoundFn {
             }
             other => coerce_num(&other)? as i32,
         };
-        let f = 10f64.powi(digits.abs());
-        let out = if digits >= 0 {
-            (n * f).round() / f
-        } else {
-            (n / f).round() * f
-        };
+        let out = excel_round(n, digits);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
 }
@@ -3335,12 +3420,104 @@ mod tests_numeric {
     use crate::traits::ArgumentHandle;
     use formualizer_common::LiteralValue;
     use formualizer_parse::parser::{ASTNode, ASTNodeType};
+    use proptest::prelude::*;
 
     fn interp(wb: &TestWorkbook) -> crate::interpreter::Interpreter<'_> {
         wb.interpreter()
     }
     fn lit(v: LiteralValue) -> ASTNode {
         ASTNode::new(ASTNodeType::Literal(v), None)
+    }
+
+    fn evaluate_round(number: f64, digits: i32) -> f64 {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(RoundFn));
+        let ctx = interp(&wb);
+        let function = ctx.context.get_function("", "ROUND").unwrap();
+        let number = lit(LiteralValue::Number(number));
+        let digits = lit(LiteralValue::Int(digits as i64));
+        match function
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&number, &ctx),
+                    ArgumentHandle::new(&digits, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal()
+        {
+            LiteralValue::Number(value) => value,
+            other => panic!("expected numeric ROUND result, got {other:?}"),
+        }
+    }
+
+    fn decimal_reference_round(number: f64, requested_digits: i32) -> f64 {
+        if !number.is_finite() || number == 0.0 {
+            return number;
+        }
+        let negative = number.is_sign_negative();
+        let rendered = number.abs().to_string();
+        let (mantissa, scientific_exponent) = rendered
+            .split_once(['e', 'E'])
+            .map_or((rendered.as_str(), 0_i64), |(mantissa, exponent)| {
+                (mantissa, exponent.parse::<i64>().unwrap())
+            });
+        let fractional_digits = mantissa
+            .split_once('.')
+            .map_or(0_i64, |(_, fraction)| fraction.len() as i64);
+        let mut coefficient_digits: Vec<u8> = mantissa
+            .bytes()
+            .filter(|byte| byte.is_ascii_digit())
+            .map(|digit| digit - b'0')
+            .collect();
+        let mut exponent = scientific_exponent - fractional_digits;
+        while coefficient_digits.first() == Some(&0) {
+            coefficient_digits.remove(0);
+        }
+        while coefficient_digits.last() == Some(&0) {
+            coefficient_digits.pop();
+            exponent += 1;
+        }
+        let mut coefficient = coefficient_digits
+            .into_iter()
+            .fold(0_u128, |value, digit| value * 10 + digit as u128);
+
+        let significant_digits = coefficient.ilog10() + 1;
+        if significant_digits > 15 {
+            let discarded = significant_digits - 15;
+            let divisor = 10_u128.pow(discarded);
+            let remainder = coefficient % divisor;
+            coefficient /= divisor;
+            if remainder * 2 >= divisor {
+                coefficient += 1;
+            }
+            exponent += discarded as i64;
+            while coefficient % 10 == 0 {
+                coefficient /= 10;
+                exponent += 1;
+            }
+        }
+
+        let unit_exponent = -(requested_digits as i64);
+        if exponent < unit_exponent {
+            let discarded = unit_exponent - exponent;
+            if discarded > 38 {
+                return if negative { -0.0 } else { 0.0 };
+            }
+            let divisor = 10_u128.pow(discarded as u32);
+            let remainder = coefficient % divisor;
+            coefficient /= divisor;
+            if remainder * 2 >= divisor {
+                coefficient += 1;
+            }
+            if coefficient == 0 {
+                return if negative { -0.0 } else { 0.0 };
+            }
+            exponent = unit_exponent;
+        }
+
+        let magnitude = format!("{coefficient}e{exponent}").parse::<f64>().unwrap();
+        if negative { -magnitude } else { magnitude }
     }
 
     // ABS
@@ -3574,6 +3751,130 @@ mod tests_numeric {
             .into_literal(),
             LiteralValue::Number(1.235)
         );
+    }
+
+    fn assert_round_symmetry(bits: u64, digits: i32, expected: f64) {
+        let input = f64::from_bits(bits);
+        assert_eq!(
+            evaluate_round(input, digits),
+            expected,
+            "ROUND({input:.17}, {digits})"
+        );
+        assert_eq!(
+            evaluate_round(-input, digits),
+            -expected,
+            "ROUND({:.17}, {digits})",
+            -input
+        );
+    }
+
+    #[test]
+    fn round_excel_half_rule_one_ulp_below() {
+        assert_round_symmetry(0x4100_6A0C_FFFF_FFFF, 2, 134_465.63);
+    }
+
+    #[test]
+    fn round_excel_half_rule_two_ulps_below() {
+        assert_round_symmetry(0x4100_6A0C_FFFF_FFFE, 2, 134_465.63);
+    }
+
+    #[test]
+    fn round_excel_half_rule_three_ulps_below() {
+        assert_round_symmetry(0x4100_6A0C_FFFF_FFFD, 2, 134_465.63);
+    }
+
+    #[test]
+    fn round_excel_half_rule_controls() {
+        let vectors = [
+            (0x4100_6A0C_FFFF_FFE0, 2, 134_465.62),
+            (0x4100_6A0D_0000_0000, 2, 134_465.63),
+            (0x4100_6A0C_FFCB_923A, 2, 134_465.62),
+            (0x4005_6666_6666_6666, 2, 2.68),
+            (0x40E5_E2BC_0000_0000, 2, 44_821.88),
+        ];
+
+        for (bits, digits, expected) in vectors {
+            assert_round_symmetry(bits, digits, expected);
+        }
+    }
+
+    #[test]
+    fn round_excel_half_rule_zero_digits() {
+        assert_round_symmetry(0x4093_49FF_FFFF_FFFE, 0, 1_235.0);
+    }
+
+    #[test]
+    fn round_excel_half_rule_negative_digits() {
+        assert_round_symmetry(0x40FE_239F_FFFF_FFFE, -2, 123_500.0);
+    }
+
+    #[test]
+    fn round_excel_half_rule_extreme_contracts() {
+        assert_eq!(excel_round(0.0, i32::MIN).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(excel_round(-0.0, i32::MAX).to_bits(), (-0.0_f64).to_bits());
+        assert!(excel_round(f64::NAN, 2).is_nan());
+        assert_eq!(excel_round(f64::INFINITY, 2), f64::INFINITY);
+        assert_eq!(excel_round(f64::NEG_INFINITY, 2), f64::NEG_INFINITY);
+        assert_eq!(
+            excel_round(1.234_567_890_123_456_7, i32::MAX),
+            1.234_567_890_123_46
+        );
+        assert_eq!(
+            excel_round(1.234_567_890_123_456_7e300, 2),
+            1.234_567_890_123_46e300
+        );
+        assert_eq!(
+            excel_round(f64::from_bits(1), i32::MIN).to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    #[ignore = "report-only old-vs-new difference census"]
+    fn round_old_vs_new_sampled_census() {
+        let mut state = 0x1870_0043_0028_0001_u64;
+        let mut finite_samples = 0_u64;
+        let mut differences = 0_u64;
+        for index in 0..100_000_i32 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let number = f64::from_bits(state);
+            if !number.is_finite() {
+                continue;
+            }
+            let digits = index % 31 - 15;
+            let factor = 10_f64.powi(digits.unsigned_abs() as i32);
+            let old = if digits >= 0 {
+                (number * factor).round() / factor
+            } else {
+                (number / factor).round() * factor
+            };
+            if old.to_bits() != excel_round(number, digits).to_bits() {
+                differences += 1;
+            }
+            finite_samples += 1;
+        }
+        eprintln!(
+            "ROUND old-vs-new census: {differences} differences among {finite_samples} finite samples"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 2_000,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x1870_0028),
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn round_matches_independent_decimal_reference(bits in any::<u64>(), digits in -340_i32..=340_i32) {
+            let number = f64::from_bits(bits);
+            prop_assume!(number.is_finite());
+            let actual = excel_round(number, digits);
+            let expected = decimal_reference_round(number, digits);
+            prop_assert_eq!(actual.to_bits(), expected.to_bits());
+        }
     }
 
     // ROUNDDOWN
