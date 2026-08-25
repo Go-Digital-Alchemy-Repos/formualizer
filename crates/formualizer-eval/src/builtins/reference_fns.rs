@@ -140,11 +140,8 @@ impl IndexFn {
         match arg.value()? {
             crate::traits::CalcValue::Range(_)
             | crate::traits::CalcValue::Scalar(LiteralValue::Array(_)) => Ok(None),
-            value => match value.into_literal() {
-                LiteralValue::Number(number) => Ok(Some(number as i64)),
-                LiteralValue::Int(integer) => Ok(Some(integer)),
-                _ => Err(ExcelError::new(ExcelErrorKind::Value)),
-            },
+            value => crate::coercion::to_number_strict(&value.into_literal())
+                .map(|number| Some(number as i64)),
         }
     }
 
@@ -687,21 +684,17 @@ impl Function for OffsetFn {
             Ok(r) => r,
             Err(e) => return Some(Err(e)),
         };
-        let dr = match args[1].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Number(n) => n as i64,
-                LiteralValue::Int(i) => i,
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
-            Err(e) => return Some(Err(e)),
+        let numeric_argument = |argument: &ArgumentHandle<'a, 'b>| {
+            let value = argument.value()?.into_literal();
+            crate::coercion::to_number_strict(&value).map(|number| number as i64)
         };
-        let dc = match args[2].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Number(n) => n as i64,
-                LiteralValue::Int(i) => i,
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
-            Err(e) => return Some(Err(e)),
+        let dr = match numeric_argument(&args[1]) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        let dc = match numeric_argument(&args[2]) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
         };
 
         // Unbounded ranges (e.g. B:B, 2:2) are clamped to the used region
@@ -714,25 +707,17 @@ impl Function for OffsetFn {
         let nsr = (sr as i64) + dr;
         let nsc = (sc as i64) + dc;
         let height = if args.len() >= 4 && !args[3].is_omitted() {
-            match args[3].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
-                Err(e) => return Some(Err(e)),
+            match numeric_argument(&args[3]) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
             }
         } else {
             (er as i64) - (sr as i64) + 1
         };
         let width = if args.len() >= 5 && !args[4].is_omitted() {
-            match args[4].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
-                Err(e) => return Some(Err(e)),
+            match numeric_argument(&args[4]) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
             }
         } else {
             (ec as i64) - (sc as i64) + 1
@@ -762,25 +747,27 @@ impl Function for OffsetFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        if let Some(Ok(r)) = self.eval_reference(args, ctx) {
-            let current_sheet = ctx.current_sheet();
-            match ctx.resolve_range_view(&r, current_sheet) {
-                Ok(rv) => {
-                    let (rows, cols) = rv.dims();
-                    if rows == 1 && cols == 1 {
-                        Ok(crate::traits::CalcValue::Scalar(
-                            rv.as_1x1().unwrap_or(LiteralValue::Empty),
-                        ))
-                    } else {
-                        Ok(crate::traits::CalcValue::Range(rv))
+        match self.eval_reference(args, ctx) {
+            Some(Ok(reference)) => {
+                let current_sheet = ctx.current_sheet();
+                match ctx.resolve_range_view(&reference, current_sheet) {
+                    Ok(view) => {
+                        let (rows, cols) = view.dims();
+                        if rows == 1 && cols == 1 {
+                            Ok(crate::traits::CalcValue::Scalar(
+                                view.as_1x1().unwrap_or(LiteralValue::Empty),
+                            ))
+                        } else {
+                            Ok(crate::traits::CalcValue::Range(view))
+                        }
                     }
+                    Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
                 }
-                Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             }
-        } else {
-            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            Some(Err(error)) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Ref),
-            )))
+            ))),
         }
     }
 }
@@ -1032,6 +1019,25 @@ mod tests {
             .parse()
             .map_err(|e| ExcelError::new(ExcelErrorKind::Error).with_message(e.message.clone()))?;
         Ok(interp(wb).evaluate_ast(&ast)?.into_literal())
+    }
+
+    fn assert_error_kind(value: LiteralValue, expected: ExcelErrorKind) {
+        match value {
+            LiteralValue::Error(error) => assert_eq!(error.kind, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
+        }
+    }
+
+    fn offset_probe_workbook() -> TestWorkbook {
+        TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(7))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Empty)
+            .with_cell_a1(
+                "Sheet1",
+                "D1",
+                LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div)),
+            )
+            .with_function(std::sync::Arc::new(OffsetFn))
     }
 
     #[test]
@@ -1406,5 +1412,74 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(v, LiteralValue::Number(5.0));
+    }
+
+    #[test]
+    fn offset_blank_rows_and_columns_coerce_to_zero() {
+        let wb = offset_probe_workbook();
+
+        assert_eq!(
+            evaluate_formula("=OFFSET(A1,0,B1)", &wb).unwrap(),
+            LiteralValue::Number(7.0)
+        );
+        assert_eq!(
+            evaluate_formula("=OFFSET(A1,B1,0)", &wb).unwrap(),
+            LiteralValue::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn offset_numeric_argument_errors_follow_excel_semantics() {
+        let wb = offset_probe_workbook();
+
+        assert_error_kind(
+            evaluate_formula("=OFFSET(A1,0,\"x\")", &wb).unwrap(),
+            ExcelErrorKind::Value,
+        );
+        assert_error_kind(
+            evaluate_formula("=OFFSET(A1,0,D1)", &wb).unwrap(),
+            ExcelErrorKind::Div,
+        );
+    }
+
+    #[test]
+    fn offset_out_of_range_and_zero_dimensions_are_ref() {
+        let wb = offset_probe_workbook();
+
+        for formula in [
+            "=OFFSET(A1,-5,0)",
+            "=OFFSET(A1,0,0,B1,1)",
+            "=OFFSET(A1,0,0,1,B1)",
+        ] {
+            assert_error_kind(evaluate_formula(formula, &wb).unwrap(), ExcelErrorKind::Ref);
+        }
+    }
+
+    #[test]
+    fn offset_omitted_dimensions_keep_anchor_size() {
+        let wb = offset_probe_workbook();
+
+        assert_eq!(
+            evaluate_formula("=OFFSET(A1,0,0,1,1)", &wb).unwrap(),
+            LiteralValue::Number(7.0)
+        );
+        assert_eq!(
+            evaluate_formula("=OFFSET(A1,0,0)", &wb).unwrap(),
+            LiteralValue::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn index_blank_row_coerces_to_zero_for_whole_column() {
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(7))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Empty)
+            .with_function(std::sync::Arc::new(IndexFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::aggregate::SumFn));
+
+        assert_eq!(
+            evaluate_formula("=SUM(INDEX(A1:A3,B1))", &wb).unwrap(),
+            LiteralValue::Number(7.0)
+        );
     }
 }
