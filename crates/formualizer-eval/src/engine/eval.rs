@@ -5762,11 +5762,33 @@ where
 
     /// Stage a formula text instead of inserting into the graph (used when deferring is enabled).
     pub fn stage_formula_text(&mut self, sheet: &str, row: u32, col: u32, text: String) {
+        self.graph.stage_formula_authorship(
+            sheet,
+            row,
+            col,
+            crate::engine::FormulaAuthorship::for_api(
+                self.config.api_created_formula_kind,
+                row,
+                col,
+            ),
+        );
         self.staged_formulas
             .entry(sheet.to_string())
             .or_default()
             .stage(row, col, text);
         self.staged_formula_index.stage(sheet, row, col);
+    }
+
+    #[doc(hidden)]
+    pub fn stage_loaded_formula_authorship(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        authorship: crate::engine::FormulaAuthorship,
+    ) {
+        self.graph
+            .stage_formula_authorship(sheet, row, col, authorship);
     }
 
     fn index_removed_staged_sheet(&mut self, sheet: &str, staged: &StagedSheet) {
@@ -17987,6 +18009,7 @@ where
             .get_cell_ref(vertex_id)
             .expect("cell ref for vertex");
         let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+        let authorship = self.graph.formula_authorship(vertex_id);
 
         let result =
             interpreter.evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg());
@@ -17997,7 +18020,9 @@ where
                 let derived_format = cv.format_id();
                 self.record_derived_format(vertex_id, derived_format);
                 let result_literal =
-                    crate::engine::result_finalization::finalize_formula_result(cv.into_literal());
+                    crate::engine::result_finalization::finalize_authored_formula_result(
+                        cv, authorship, cell_ref,
+                    );
                 let output_sheet_name = sheet_name.to_string();
                 self.write_computed_overlay_format_0based(
                     &output_sheet_name,
@@ -23422,6 +23447,7 @@ where
             .get_cell_ref(vertex_id)
             .expect("cell ref for vertex");
         let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+        let authorship = self.graph.formula_authorship(vertex_id);
 
         interpreter
             .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
@@ -23432,7 +23458,9 @@ where
                     .unwrap()
                     .insert(vertex_id, format);
                 self.record_derived_format(vertex_id, format);
-                crate::engine::result_finalization::finalize_formula_result(cv.into_literal())
+                crate::engine::result_finalization::finalize_authored_formula_result(
+                    cv, authorship, cell_ref,
+                )
             })
     }
 
@@ -26138,6 +26166,7 @@ where
                     .get_cell_ref(vertex_id)
                     .expect("cell ref for vertex");
                 let interpreter = Interpreter::new_with_cell(ctx, sheet_name, cell_ref);
+                let authorship = self.graph.formula_authorship(vertex_id);
                 interpreter
                     .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
                     .map(|cv| {
@@ -26147,8 +26176,8 @@ where
                             .unwrap()
                             .insert(vertex_id, format);
                         self.record_derived_format(vertex_id, format);
-                        crate::engine::result_finalization::finalize_formula_result(
-                            cv.into_literal(),
+                        crate::engine::result_finalization::finalize_authored_formula_result(
+                            cv, authorship, cell_ref,
                         )
                     })
             }

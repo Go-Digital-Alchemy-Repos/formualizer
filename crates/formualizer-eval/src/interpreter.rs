@@ -61,6 +61,71 @@ pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
     }
 }
 
+pub(crate) fn implicit_intersection_calc_at<'a>(
+    cv: crate::traits::CalcValue<'a>,
+    current_cell: Option<CellRef>,
+) -> LiteralValue {
+    let (cur_r0, cur_c0) = match current_cell {
+        Some(cell) => (cell.coord.row() as usize, cell.coord.col() as usize),
+        None => (0usize, 0usize),
+    };
+
+    match cv {
+        crate::traits::CalcValue::Scalar(v)
+        | crate::traits::CalcValue::AnnotatedScalar(v, _) => match v {
+            LiteralValue::Array(arr) => {
+                if arr.is_empty() || arr.first().is_none_or(|row| row.is_empty()) {
+                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+                }
+                arr[0][0].clone()
+            }
+            other => other,
+        },
+        crate::traits::CalcValue::Range(rv) => {
+            if rv.is_empty() {
+                return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+            }
+
+            // Computed arrays use a temporary backing sheet and have no source coordinates.
+            if rv.sheet_name() == "__tmp" {
+                return rv.get_cell(0, 0);
+            }
+
+            if let Some(v) = rv.as_1x1() {
+                return v;
+            }
+
+            let (rows, cols) = rv.dims();
+            let sr = rv.start_row();
+            let sc = rv.start_col();
+            let er = rv.end_row();
+            let ec = rv.end_col();
+
+            if cols == 1 {
+                if cur_r0 < sr || cur_r0 > er {
+                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+                }
+                return rv.get_cell(cur_r0 - sr, 0);
+            }
+
+            if rows == 1 {
+                if cur_c0 < sc || cur_c0 > ec {
+                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+                }
+                return rv.get_cell(0, cur_c0 - sc);
+            }
+
+            if cur_r0 < sr || cur_r0 > er || cur_c0 < sc || cur_c0 > ec {
+                return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+            }
+            rv.get_cell(cur_r0 - sr, cur_c0 - sc)
+        }
+        crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
+            ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
+        ),
+    }
+}
+
 fn array_lifted_argument_positions(name: &str) -> Option<&'static [usize]> {
     match name.to_ascii_uppercase().as_str() {
         "XLOOKUP" | "XMATCH" | "MATCH" | "LOOKUP" => Some(&[0]),
@@ -1374,76 +1439,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn eval_implicit_intersection_calc(&self, cv: crate::traits::CalcValue<'a>) -> LiteralValue {
-        let (cur_r0, cur_c0) = match self.current_cell {
-            Some(cell) => (cell.coord.row() as usize, cell.coord.col() as usize),
-            None => (0usize, 0usize),
-        };
-
-        match cv {
-            crate::traits::CalcValue::Scalar(v)
-            | crate::traits::CalcValue::AnnotatedScalar(v, _) => match v {
-                LiteralValue::Array(arr) => {
-                    if arr.is_empty() || arr.first().map(|r| r.is_empty()).unwrap_or(true) {
-                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                    }
-                    arr[0][0].clone()
-                }
-                other => other,
-            },
-            crate::traits::CalcValue::Range(rv) => {
-                if rv.is_empty() {
-                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                }
-
-                // Array results (array literals and many dynamic-array functions) are materialized
-                // into an owned RangeView with a temporary backing sheet ("__tmp").
-                // For explicit @, interpret these as anchored at the formula cell and select the
-                // top-left element.
-                if rv.sheet_name() == "__tmp" {
-                    return rv.get_cell(0, 0);
-                }
-
-                if let Some(v) = rv.as_1x1() {
-                    return v;
-                }
-
-                let (rows, cols) = rv.dims();
-                let sr = rv.start_row();
-                let sc = rv.start_col();
-                let er = rv.end_row();
-                let ec = rv.end_col();
-
-                // Excel-compatible implicit intersection (simplified):
-                // - Nx1: pick by row
-                // - 1xM: pick by column
-                // - NxM: pick by (row,col)
-                if cols == 1 {
-                    if cur_r0 < sr || cur_r0 > er {
-                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                    }
-                    let rel_r = cur_r0 - sr;
-                    return rv.get_cell(rel_r, 0);
-                }
-
-                if rows == 1 {
-                    if cur_c0 < sc || cur_c0 > ec {
-                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                    }
-                    let rel_c = cur_c0 - sc;
-                    return rv.get_cell(0, rel_c);
-                }
-
-                if cur_r0 < sr || cur_r0 > er || cur_c0 < sc || cur_c0 > ec {
-                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                }
-                let rel_r = cur_r0 - sr;
-                let rel_c = cur_c0 - sc;
-                rv.get_cell(rel_r, rel_c)
-            }
-            crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
-            ),
-        }
+        implicit_intersection_calc_at(cv, self.current_cell)
     }
 
     fn implicit_intersection_from_reference(&self, reference: &ReferenceType) -> LiteralValue {

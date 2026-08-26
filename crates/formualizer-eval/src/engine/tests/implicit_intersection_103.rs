@@ -1,4 +1,4 @@
-use crate::engine::{Engine, EvalConfig};
+use crate::engine::{AuthoredFormulaKind, Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::LiteralValue;
 use formualizer_parse::parser::parse;
@@ -138,4 +138,78 @@ fn implicit_intersection_against_spilled_values_requires_at_for_scalar() {
 
     // B2 should be scalar (no spill).
     assert_eq!(engine.get_cell_value("Sheet1", 3, 2), None);
+}
+
+#[test]
+fn api_created_formula_defaults_to_dynamic_array() {
+    let wb = TestWorkbook::new();
+    let mut engine = Engine::new(wb, serial_eval_config());
+    for (row, value) in [(1, 11.0), (2, 22.0), (3, 33.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 2, 4, parse("=OFFSET(A1:A3,0,0)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 4),
+        Some(LiteralValue::Number(11.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 4),
+        Some(LiteralValue::Number(22.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 4, 4),
+        Some(LiteralValue::Number(33.0))
+    );
+}
+
+#[test]
+fn api_formula_kind_knob_can_request_legacy_scalar() {
+    let wb = TestWorkbook::new();
+    let mut config = serial_eval_config();
+    config.api_created_formula_kind = AuthoredFormulaKind::LegacyScalar;
+    let mut engine = Engine::new(wb, config);
+    for (row, value) in [(1, 11.0), (2, 22.0), (3, 33.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 2, 4, parse("=OFFSET(A1:A3,0,0)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 4),
+        Some(LiteralValue::Number(22.0))
+    );
+    assert_eq!(engine.get_cell_value("Sheet1", 3, 4), None);
+}
+
+#[test]
+fn api_created_dynamic_array_blocked_spill_still_errors() {
+    let wb = TestWorkbook::new();
+    let mut engine = Engine::new(wb, serial_eval_config());
+    for (row, value) in [(1, 11.0), (2, 22.0), (3, 33.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_value("Sheet1", 3, 4, LiteralValue::Text("block".to_string()))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 4, parse("=OFFSET(A1:A3,0,0)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    match engine.get_cell_value("Sheet1", 2, 4) {
+        Some(LiteralValue::Error(error)) => assert_eq!(error.to_string(), "#SPILL!"),
+        other => panic!("expected #SPILL!, got {other:?}"),
+    }
 }

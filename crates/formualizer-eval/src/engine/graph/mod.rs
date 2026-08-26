@@ -39,6 +39,7 @@ mod sources;
 mod tables;
 pub(crate) use tables::TableEntry;
 
+use super::FormulaAuthorship;
 use super::addr::{GridAddr, SymbolAddr, VertexAddr};
 use super::arena::{AstNodeId, DataStore, ValueRef};
 use super::delta_edges::CsrMutableEdges;
@@ -198,6 +199,8 @@ pub struct DependencyGraph {
     // and set representation behind this single authority.
     formula_dirty: FormulaDirtyState,
     volatile_vertices: FxHashSet<VertexId>,
+    formula_authorship: FxHashMap<VertexId, FormulaAuthorship>,
+    pending_formula_authorship: FxHashMap<(String, u32, u32), FormulaAuthorship>,
 
     /// Monotonic count of vertices processed by dirty-propagation BFS loops
     /// (`mark_dirty_many` / `mark_dirty_many_value_cells`). Cheap plain
@@ -928,6 +931,86 @@ impl DependencyGraph {
         self.vertex_formulas.reserve(additional);
         self.formula_dirty.legacy_reserve(additional);
         self.volatile_vertices.reserve(additional);
+        self.formula_authorship.reserve(additional);
+    }
+
+    pub(crate) fn stage_formula_authorship(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        authorship: FormulaAuthorship,
+    ) {
+        if let Some(sheet_id) = self.sheet_id(sheet) {
+            let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+            if let Some(&vertex) = self.cell_to_vertex.get(&cell) {
+                self.formula_authorship.insert(vertex, authorship);
+                return;
+            }
+        }
+        self.pending_formula_authorship
+            .insert((sheet.to_lowercase(), row, col), authorship);
+    }
+
+    fn adopt_pending_formula_authorship(&mut self, vertex: VertexId) {
+        let Some(cell) = self.get_cell_ref(vertex) else {
+            return;
+        };
+        let key = (
+            self.sheet_name(cell.sheet_id).to_lowercase(),
+            cell.coord.row() + 1,
+            cell.coord.col() + 1,
+        );
+        if let Some(authorship) = self.pending_formula_authorship.remove(&key) {
+            self.formula_authorship.insert(vertex, authorship);
+        } else {
+            let row = cell.coord.row() + 1;
+            let col = cell.coord.col() + 1;
+            self.formula_authorship.entry(vertex).or_insert_with(|| {
+                FormulaAuthorship::for_api(self.config.api_created_formula_kind, row, col)
+            });
+        }
+    }
+
+    pub(crate) fn set_api_formula_authorship(&mut self, vertex: VertexId) {
+        let Some(cell) = self.get_cell_ref(vertex) else {
+            return;
+        };
+        let key = (
+            self.sheet_name(cell.sheet_id).to_lowercase(),
+            cell.coord.row() + 1,
+            cell.coord.col() + 1,
+        );
+        self.pending_formula_authorship.remove(&key);
+        self.formula_authorship.insert(
+            vertex,
+            FormulaAuthorship::for_api(
+                self.config.api_created_formula_kind,
+                cell.coord.row() + 1,
+                cell.coord.col() + 1,
+            ),
+        );
+    }
+
+    pub(crate) fn formula_authorship(&self, vertex: VertexId) -> FormulaAuthorship {
+        if let Some(authorship) = self.formula_authorship.get(&vertex) {
+            return *authorship;
+        }
+        if let Some(cell) = self.get_cell_ref(vertex)
+            && let Some(authorship) = self.pending_formula_authorship.get(&(
+                self.sheet_name(cell.sheet_id).to_lowercase(),
+                cell.coord.row() + 1,
+                cell.coord.col() + 1,
+            ))
+        {
+            return *authorship;
+        }
+        let cell = self.get_cell_ref(vertex);
+        FormulaAuthorship::for_api(
+            self.config.api_created_formula_kind,
+            cell.map(|cell| cell.coord.row() + 1).unwrap_or(1),
+            cell.map(|cell| cell.coord.col() + 1).unwrap_or(1),
+        )
     }
 
     /// Lookup VertexId for a (SheetId, AbsCoord)
@@ -960,6 +1043,7 @@ impl DependencyGraph {
             .set_kind(vid, crate::engine::vertex::VertexKind::FormulaScalar);
         self.vertex_values.remove(&vid);
         self.vertex_formulas.insert(vid, ast_id);
+        self.adopt_pending_formula_authorship(vid);
         self.mark_volatile(vid, volatile);
         self.store.set_dynamic(vid, dynamic);
 
@@ -984,6 +1068,7 @@ impl DependencyGraph {
             .set_kind(vid, crate::engine::vertex::VertexKind::FormulaScalar);
         self.vertex_values.remove(&vid);
         self.vertex_formulas.insert(vid, ast_id);
+        self.adopt_pending_formula_authorship(vid);
         self.mark_volatile(vid, volatile);
         self.store.set_dynamic(vid, dynamic);
     }
@@ -1216,6 +1301,8 @@ impl DependencyGraph {
             cell_to_vertex: std::collections::HashMap::with_hasher(CoordBuildHasher),
             load_packed_to_vertex: std::collections::HashMap::with_hasher(CoordBuildHasher),
             formula_dirty: FormulaDirtyState::default(),
+            formula_authorship: FxHashMap::default(),
+            pending_formula_authorship: FxHashMap::default(),
             dirty_propagation_visits: 0,
             deferred_dirty_depth: 0,
             deferred_dirty_pending: Vec::new(),
@@ -2289,6 +2376,7 @@ impl DependencyGraph {
         self.store
             .set_kind(addr_vertex_id, VertexKind::FormulaScalar);
         self.vertex_formulas.insert(addr_vertex_id, ast_id);
+        self.set_api_formula_authorship(addr_vertex_id);
         self.store.set_dirty(addr_vertex_id, true);
 
         // Clear any cached value since this is now a formula

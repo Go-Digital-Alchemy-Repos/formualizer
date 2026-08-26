@@ -694,6 +694,7 @@ impl DependencyGraph {
             self.store
                 .set_kind(formula.target, VertexKind::FormulaScalar);
             self.vertex_formulas.insert(formula.target, formula.ast_id);
+            self.adopt_pending_formula_authorship(formula.target);
             self.mark_volatile(formula.target, formula.plan.volatile);
             self.store.set_dynamic(formula.target, formula.plan.dynamic);
         }

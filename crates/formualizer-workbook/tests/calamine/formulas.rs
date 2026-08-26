@@ -31,6 +31,43 @@ fn replace_zip_entry(bytes: Vec<u8>, entry_name: &str, replacement: &[u8]) -> Ve
     writer.finish().unwrap().into_inner()
 }
 
+fn inject_metadata_part(bytes: Vec<u8>, metadata_xml: &str) -> Vec<u8> {
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).unwrap();
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let name = entry.name().to_string();
+        if entry.is_dir() {
+            writer.add_directory(name, options).unwrap();
+            continue;
+        }
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        if name == "[Content_Types].xml" {
+            let xml = String::from_utf8(data).unwrap().replace(
+                "</Types>",
+                r#"<Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>"#,
+            );
+            data = xml.into_bytes();
+        } else if name == "xl/_rels/workbook.xml.rels" {
+            let xml = String::from_utf8(data).unwrap().replace(
+                "</Relationships>",
+                r#"<Relationship Id="rIdMetadata" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/></Relationships>"#,
+            );
+            data = xml.into_bytes();
+        }
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&data).unwrap();
+    }
+
+    writer.start_file("xl/metadata.xml", options).unwrap();
+    writer.write_all(metadata_xml.as_bytes()).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
 fn workbook_with_raw_sheet(sheet_xml: &str) -> (std::path::PathBuf, Vec<u8>) {
     let path = build_workbook(|_| {});
     let bytes = std::fs::read(&path).unwrap();
@@ -50,6 +87,31 @@ fn assert_number(
         Some(LiteralValue::Number(expected)),
         "unexpected value at row {row}, column {col}"
     );
+}
+
+fn assert_empty(
+    engine: &Engine<formualizer_eval::test_workbook::TestWorkbook>,
+    row: u32,
+    col: u32,
+) {
+    assert!(
+        matches!(
+            engine.get_cell_value("Sheet1", row, col),
+            None | Some(LiteralValue::Empty)
+        ),
+        "expected empty value at row {row}, column {col}"
+    );
+}
+
+fn assert_value_error(
+    engine: &Engine<formualizer_eval::test_workbook::TestWorkbook>,
+    row: u32,
+    col: u32,
+) {
+    match engine.get_cell_value("Sheet1", row, col) {
+        Some(LiteralValue::Error(error)) => assert_eq!(error.to_string(), "#VALUE!"),
+        other => panic!("expected #VALUE! at row {row}, column {col}, got {other:?}"),
+    }
 }
 
 fn inject_external_link_rels(bytes: Vec<u8>, idx: u32, target: &str) -> Vec<u8> {
@@ -190,7 +252,10 @@ fn array_formula_ref_cached_values_do_not_block() {
     let mut adapter = CalamineAdapter::open_path(path).unwrap();
     let mut engine = Engine::new(
         formualizer_eval::test_workbook::TestWorkbook::new(),
-        EvalConfig::default(),
+        EvalConfig {
+            defer_graph_building: true,
+            ..EvalConfig::default()
+        },
     );
     adapter.stream_into_engine(&mut engine).unwrap();
     engine.evaluate_all().unwrap();
@@ -222,7 +287,10 @@ fn array_formula_ref_empty_members_do_not_parse() {
     let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
     let mut engine = Engine::new(
         formualizer_eval::test_workbook::TestWorkbook::new(),
-        EvalConfig::default(),
+        EvalConfig {
+            defer_graph_building: true,
+            ..EvalConfig::default()
+        },
     );
     let load = adapter.stream_into_engine(&mut engine);
     assert!(
@@ -291,4 +359,185 @@ fn array_formula_ref_shared_unchanged() {
     assert_number(&engine, 3, 2, 31.0);
     let stats = adapter.load_stats().unwrap();
     assert_eq!(stats.shared_formula_tags_observed, Some(3));
+}
+
+#[test]
+fn plain_formula_final_range_uses_legacy_positional_intersection() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:D4"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>11</v></c></row>
+    <row r="2"><c r="A2"><v>22</v></c><c r="D2"><f>OFFSET(A1:A3,0,0)</f></c></row>
+    <row r="3"><c r="A3"><v>33</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig {
+            defer_graph_building: true,
+            ..EvalConfig::default()
+        },
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 2, 4, 22.0);
+    assert_empty(&engine, 3, 4);
+    assert_empty(&engine, 4, 4);
+}
+
+#[test]
+fn plain_formula_legacy_finalization_handles_horizontal_outside_2d_and_computed_arrays() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:N13"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>11</v></c><c r="B1"><v>22</v></c><c r="C1"><v>33</v></c></row>
+    <row r="2"><c r="A2"><v>22</v></c><c r="B2"><v>44</v></c></row>
+    <row r="3"><c r="A3"><v>33</v></c></row>
+    <row r="5"><c r="B5"><f>OFFSET(A1:C1,0,0)</f></c></row>
+    <row r="8"><c r="G8"><f>OFFSET(A1:A3,0,0)</f></c><c r="M8"><f>OFFSET(A1:B2,0,0)</f></c><c r="N8"><f>@OFFSET(A1:B2,0,0)</f></c></row>
+    <row r="12"><c r="J12"><f>SEQUENCE(2,2)</f></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 5, 2, 22.0);
+    assert_empty(&engine, 5, 3);
+    assert_empty(&engine, 5, 4);
+    assert_value_error(&engine, 8, 7);
+    assert_value_error(&engine, 8, 13);
+    assert_value_error(&engine, 8, 14);
+    assert_number(&engine, 12, 10, 1.0);
+    assert_empty(&engine, 12, 11);
+    assert_empty(&engine, 13, 10);
+}
+
+#[test]
+fn cse_single_cell_fence_uses_top_left_and_never_implicit_intersection() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:D4"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>11</v></c></row>
+    <row r="2"><c r="A2"><v>22</v></c><c r="D2"><f t="array" ref="D2">OFFSET(A1:A3,0,0)</f></c></row>
+    <row r="3"><c r="A3"><v>33</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 2, 4, 11.0);
+    assert_empty(&engine, 3, 4);
+    assert_empty(&engine, 4, 4);
+}
+
+#[test]
+fn cse_multi_cell_fence_clips_result_to_authored_rectangle() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:D4"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>11</v></c></row>
+    <row r="2"><c r="A2"><v>22</v></c><c r="D2"><f t="array" ref="D2:D3">OFFSET(A1:A3,0,0)</f></c></row>
+    <row r="3"><c r="A3"><v>33</v></c><c r="D3"><v>22</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 2, 4, 11.0);
+    assert_number(&engine, 3, 4, 22.0);
+    assert_empty(&engine, 4, 4);
+}
+
+#[test]
+fn xldapr_dynamic_array_ignores_single_cell_array_ref_fence() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:D4"/>
+  <sheetData>
+    <row r="1"><c r="A1"><v>11</v></c></row>
+    <row r="2"><c r="A2"><v>22</v></c><c r="D2" cm="1"><f t="array" ref="D2">OFFSET(A1:A3,0,0)</f></c></row>
+    <row r="3"><c r="A3"><v>33</v></c></row>
+  </sheetData>
+</worksheet>"#;
+    let metadata_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray">
+  <metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" cellMeta="1"/></metadataTypes>
+  <futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata>
+  <cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata>
+</metadata>"#;
+    let (_, bytes) = workbook_with_raw_sheet(sheet_xml);
+    let bytes = inject_metadata_part(bytes, metadata_xml);
+    let mut adapter = CalamineAdapter::open_bytes(bytes).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig {
+            defer_graph_building: true,
+            ..EvalConfig::default()
+        },
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 2, 4, 11.0);
+    assert_number(&engine, 3, 4, 22.0);
+    assert_number(&engine, 4, 4, 33.0);
+}
+
+#[test]
+fn loaded_legacy_whole_column_and_cross_sheet_ranges_intersect_positionally() {
+    let path = build_workbook(|book| {
+        let sheet = book.get_sheet_by_name_mut("Sheet1").unwrap();
+        sheet.get_cell_mut((1, 1)).set_value_number(11);
+        sheet.get_cell_mut((1, 2)).set_value_number(22);
+        sheet.get_cell_mut((1, 3)).set_value_number(33);
+        sheet.get_cell_mut((2, 2)).set_formula("A:A");
+
+        book.new_sheet("Other").unwrap();
+        book.get_sheet_by_name_mut("Other")
+            .unwrap()
+            .get_cell_mut((4, 2))
+            .set_formula("OFFSET(Sheet1!A1:A3,0,0)");
+    });
+    let mut adapter = CalamineAdapter::open_path(path).unwrap();
+    let mut engine = Engine::new(
+        formualizer_eval::test_workbook::TestWorkbook::new(),
+        EvalConfig::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_number(&engine, 2, 2, 22.0);
+    assert_eq!(
+        engine.get_cell_value("Other", 2, 4),
+        Some(LiteralValue::Number(22.0))
+    );
+    assert!(matches!(
+        engine.get_cell_value("Other", 3, 4),
+        None | Some(LiteralValue::Empty)
+    ));
 }

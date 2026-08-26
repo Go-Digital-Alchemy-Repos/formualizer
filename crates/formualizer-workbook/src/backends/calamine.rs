@@ -19,11 +19,11 @@ use formualizer_eval::arrow_store::{IngestBuilder, OverlayValue, map_error_code}
 use formualizer_eval::engine::ingest::EngineLoadStream;
 use formualizer_eval::engine::{
     DeferredFormulaPackage, Engine as EvalEngine, ExplicitPartitionLegacyMembers,
-    FormulaCompressedPreparation, FormulaCompressedSourceBatch, FormulaCompressedSourceReport,
-    FormulaIngestBatch, FormulaIngestRecord, FormulaSpoolDiskPolicy, PartitionLegacyMember,
-    PartitionLegacyMemberKind, PartitionReconciliation, PartitionedSourceFormulaFamily,
-    SourceCoord, SourceFamilyId, SourceFormulaFamily, SourceFormulaOrder, SourceRect,
-    WorkbookLoadLimits,
+    FormulaAuthorship, FormulaCompressedPreparation, FormulaCompressedSourceBatch,
+    FormulaCompressedSourceReport, FormulaFence, FormulaIngestBatch, FormulaIngestRecord,
+    FormulaSpoolDiskPolicy, PartitionLegacyMember, PartitionLegacyMemberKind,
+    PartitionReconciliation, PartitionedSourceFormulaFamily, SourceCoord, SourceFamilyId,
+    SourceFormulaFamily, SourceFormulaOrder, SourceRect, WorkbookLoadLimits,
 };
 use formualizer_eval::traits::EvaluationContext;
 use formualizer_parse::parser::{ASTNode, ReferenceType};
@@ -69,7 +69,7 @@ struct RawSavedFormulaValue {
 
 #[derive(Default)]
 struct ArrayFormulaMetadata {
-    anchors: BTreeSet<(u32, u32)>,
+    anchors: BTreeMap<(u32, u32), FormulaAuthorship>,
     non_anchor_members: BTreeSet<(u32, u32)>,
 }
 
@@ -190,6 +190,7 @@ struct StreamedSheet {
     formulas_observed: usize,
     formulas_handed_to_engine: usize,
     formulas: Vec<FormulaIngestRecord>,
+    formula_authorship: Vec<(u32, u32, FormulaAuthorship)>,
     saved_formula_values: Vec<(u32, u32, LiteralValue)>,
     formula_source_report: FormulaCompressedSourceReport,
     compressed_families: Vec<SourceFormulaFamily>,
@@ -405,7 +406,7 @@ impl CalamineAdapter {
         sheet_instance: u32,
         options: StreamWorksheetOptions,
         mut saved_formula_fallback: BTreeMap<(u32, u32), LiteralValue>,
-        array_formula_members: &BTreeSet<(u32, u32)>,
+        array_formula_metadata: &ArrayFormulaMetadata,
     ) -> Result<StreamedSheet, calamine::Error>
     where
         RS: Read + Seek,
@@ -458,6 +459,7 @@ impl CalamineAdapter {
         let mut values_handed_to_engine = 0usize;
         let mut formula_staging = FormulaStaging::new();
         let mut formula_count = 0usize;
+        let mut formula_authorship = Vec::new();
         let mut saved_formula_values = Vec::new();
         let mut deferred_source_coordinates = engine.config.defer_graph_building.then(Vec::new);
         let mut formula_evidence = MonotonicFormulaEvidence::new();
@@ -504,13 +506,22 @@ impl CalamineAdapter {
             max_row_seen = max_row_seen.max(row);
             max_col_seen = max_col_seen.max(col);
 
-            if array_formula_members.contains(&(row0 + 1, col0 + 1)) {
+            if array_formula_metadata
+                .non_anchor_members
+                .contains(&(row0 + 1, col0 + 1))
+            {
                 saved_formula_fallback.remove(&(row0 + 1, col0 + 1));
                 continue;
             }
 
             let has_formula = record.formula.is_some();
             if let Some(metadata) = record.formula {
+                let authorship = array_formula_metadata
+                    .anchors
+                    .get(&(row0 + 1, col0 + 1))
+                    .copied()
+                    .unwrap_or_else(FormulaAuthorship::legacy_scalar);
+                formula_authorship.push((row0 + 1, col0 + 1, authorship));
                 let saved = data_ref_to_literal(&record.value, engine.config.date_system)
                     .or_else(|| saved_formula_fallback.remove(&(row0 + 1, col0 + 1)));
                 if let Some(value) = saved {
@@ -955,6 +966,7 @@ impl CalamineAdapter {
             formulas_observed: formula_count,
             formulas_handed_to_engine: formula_count,
             formulas: formula_staging.formulas,
+            formula_authorship,
             saved_formula_values,
             formula_source_report,
             compressed_families,
@@ -1405,6 +1417,171 @@ impl CalamineAdapter {
         Ok(())
     }
 
+    fn scan_dynamic_array_cell_metadata_from_reader<R>(
+        reader: R,
+        limits: &WorkbookLoadLimits,
+    ) -> Result<BTreeSet<u32>, calamine::Error>
+    where
+        R: Read + Seek,
+    {
+        let mut archive = ZipArchive::new(reader)
+            .map_err(|error| Self::array_formula_metadata_error(error.to_string()))?;
+        let entry = match archive.by_name("xl/metadata.xml") {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(BTreeSet::new()),
+            Err(error) => {
+                return Err(Self::array_formula_metadata_error(error.to_string()));
+            }
+        };
+        let memory_budget =
+            usize::try_from(limits.max_formula_spool_memory_bytes).unwrap_or(usize::MAX);
+        let bounded_reader = BoundedXmlTokenReader {
+            inner: BufReader::new(entry),
+            token_bytes: 0,
+            max_token_bytes: ARRAY_FORMULA_XML_TOKEN_BYTES,
+        };
+        let mut xml = XmlReader::from_reader(bounded_reader);
+        let mut buf = Vec::new();
+        let mut in_metadata_types = false;
+        let mut metadata_type_index = 0u32;
+        let mut xldapr_type_indices = BTreeSet::new();
+        let mut in_dynamic_future_metadata = false;
+        let mut dynamic_future_index = 0u32;
+        let mut current_dynamic_future = None;
+        let mut dynamic_future_indices = BTreeSet::new();
+        let mut in_cell_metadata = false;
+        let mut cell_metadata_index = 0u32;
+        let mut current_cell_is_dynamic = None;
+        let mut dynamic_cell_metadata = BTreeSet::new();
+        let mut retained_bytes = 0usize;
+
+        loop {
+            buf.clear();
+            match xml.read_event_into(&mut buf) {
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"metadataTypes" => {
+                    in_metadata_types = true;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"metadataTypes" => {
+                    in_metadata_types = false;
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if in_metadata_types && event.local_name().as_ref() == b"metadataType" =>
+                {
+                    metadata_type_index = metadata_type_index.saturating_add(1);
+                    if Self::decode_attr(&xml, event, b"name").as_deref() == Some("XLDAPR")
+                        && xldapr_type_indices.insert(metadata_type_index)
+                    {
+                        Self::charge_array_formula_metadata_memory(
+                            &mut retained_bytes,
+                            memory_budget,
+                        )?;
+                    }
+                }
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"futureMetadata" => {
+                    in_dynamic_future_metadata =
+                        Self::decode_attr(&xml, event, b"name").as_deref() == Some("XLDAPR");
+                    dynamic_future_index = 0;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"futureMetadata" => {
+                    in_dynamic_future_metadata = false;
+                    current_dynamic_future = None;
+                }
+                Ok(Event::Start(ref event))
+                    if in_dynamic_future_metadata && event.local_name().as_ref() == b"bk" =>
+                {
+                    current_dynamic_future = Some(false);
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if current_dynamic_future.is_some()
+                        && event.local_name().as_ref() == b"dynamicArrayProperties" =>
+                {
+                    if matches!(
+                        Self::decode_attr(&xml, event, b"fDynamic").as_deref(),
+                        Some("1" | "true")
+                    ) {
+                        current_dynamic_future = Some(true);
+                    }
+                }
+                Ok(Event::End(ref event))
+                    if in_dynamic_future_metadata && event.local_name().as_ref() == b"bk" =>
+                {
+                    if current_dynamic_future.take() == Some(true)
+                        && dynamic_future_indices.insert(dynamic_future_index)
+                    {
+                        Self::charge_array_formula_metadata_memory(
+                            &mut retained_bytes,
+                            memory_budget,
+                        )?;
+                    }
+                    dynamic_future_index = dynamic_future_index.saturating_add(1);
+                }
+                Ok(Event::Start(ref event)) if event.local_name().as_ref() == b"cellMetadata" => {
+                    in_cell_metadata = true;
+                    cell_metadata_index = 0;
+                }
+                Ok(Event::End(ref event)) if event.local_name().as_ref() == b"cellMetadata" => {
+                    in_cell_metadata = false;
+                    current_cell_is_dynamic = None;
+                }
+                Ok(Event::Start(ref event))
+                    if in_cell_metadata && event.local_name().as_ref() == b"bk" =>
+                {
+                    cell_metadata_index = cell_metadata_index.saturating_add(1);
+                    current_cell_is_dynamic = Some(false);
+                }
+                Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
+                    if current_cell_is_dynamic.is_some()
+                        && event.local_name().as_ref() == b"rc" =>
+                {
+                    let type_index = Self::decode_attr(&xml, event, b"t")
+                        .and_then(|value| value.parse::<u32>().ok());
+                    let value_index = Self::decode_attr(&xml, event, b"v")
+                        .and_then(|value| value.parse::<u32>().ok());
+                    if type_index.is_some_and(|index| xldapr_type_indices.contains(&index))
+                        && value_index.is_some_and(|index| dynamic_future_indices.contains(&index))
+                    {
+                        current_cell_is_dynamic = Some(true);
+                    }
+                }
+                Ok(Event::End(ref event))
+                    if in_cell_metadata && event.local_name().as_ref() == b"bk" =>
+                {
+                    if current_cell_is_dynamic.take() == Some(true)
+                        && dynamic_cell_metadata.insert(cell_metadata_index)
+                    {
+                        Self::charge_array_formula_metadata_memory(
+                            &mut retained_bytes,
+                            memory_budget,
+                        )?;
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(error) => {
+                    return Err(Self::array_formula_metadata_error(error.to_string()));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(dynamic_cell_metadata)
+    }
+
+    fn scan_dynamic_array_cell_metadata(
+        &self,
+        limits: &WorkbookLoadLimits,
+    ) -> Result<BTreeSet<u32>, calamine::Error> {
+        match &self.source {
+            CalamineSource::File(path) => {
+                let file = File::open(path).map_err(calamine::Error::Io)?;
+                Self::scan_dynamic_array_cell_metadata_from_reader(BufReader::new(file), limits)
+            }
+            CalamineSource::Bytes(bytes) => Self::scan_dynamic_array_cell_metadata_from_reader(
+                Cursor::new(Arc::clone(bytes)),
+                limits,
+            ),
+        }
+    }
+
     fn charge_saved_cache_memory(
         retained: &mut usize,
         additional: usize,
@@ -1646,6 +1823,7 @@ impl CalamineAdapter {
         worksheet_path: &str,
         sheet: &str,
         limits: &WorkbookLoadLimits,
+        dynamic_cell_metadata: &BTreeSet<u32>,
     ) -> Result<ArrayFormulaMetadata, calamine::Error>
     where
         R: Read + Seek,
@@ -1665,6 +1843,7 @@ impl CalamineAdapter {
         let mut xml = XmlReader::from_reader(bounded_reader);
         let mut buf = Vec::new();
         let mut current_coord = None;
+        let mut current_cell_metadata = None;
         let mut row_index = 1u32;
         let mut col_index = 1u32;
         let mut retained_bytes = 0usize;
@@ -1707,6 +1886,8 @@ impl CalamineAdapter {
                     enforce_sheet_dimension_limits("calamine", sheet, row, col, limits)
                         .map_err(|error| Self::array_formula_metadata_error(error.to_string()))?;
                     current_coord = Some((row, col));
+                    current_cell_metadata = Self::decode_attr(&xml, event, b"cm")
+                        .and_then(|value| value.parse::<u32>().ok());
                     col_index = col.saturating_add(1);
                 }
                 Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event))
@@ -1751,7 +1932,15 @@ impl CalamineAdapter {
                             limits.max_sheet_logical_cells
                         )));
                     }
-                    if metadata.anchors.insert(anchor) {
+                    let fence = FormulaFence::new(first_row, first_col, last_row, last_col);
+                    let authorship = if current_cell_metadata
+                        .is_some_and(|index| dynamic_cell_metadata.contains(&index))
+                    {
+                        FormulaAuthorship::dynamic_array()
+                    } else {
+                        FormulaAuthorship::cse_array(fence)
+                    };
+                    if metadata.anchors.insert(anchor, authorship).is_none() {
                         Self::charge_array_formula_metadata_memory(
                             &mut retained_bytes,
                             memory_budget,
@@ -1774,6 +1963,7 @@ impl CalamineAdapter {
                 }
                 Ok(Event::End(ref event)) if event.local_name().as_ref() == b"c" => {
                     current_coord = None;
+                    current_cell_metadata = None;
                 }
                 Ok(Event::Eof) => break,
                 Err(error) => {
@@ -1782,7 +1972,7 @@ impl CalamineAdapter {
                 _ => {}
             }
         }
-        for anchor in &metadata.anchors {
+        for anchor in metadata.anchors.keys() {
             metadata.non_anchor_members.remove(anchor);
         }
         Ok(metadata)
@@ -1792,6 +1982,7 @@ impl CalamineAdapter {
         &self,
         sheet: &str,
         limits: &WorkbookLoadLimits,
+        dynamic_cell_metadata: &BTreeSet<u32>,
     ) -> Result<ArrayFormulaMetadata, calamine::Error> {
         let worksheet_path = self.worksheet_paths.get(sheet).ok_or_else(|| {
             Self::array_formula_metadata_error(format!(
@@ -1806,6 +1997,7 @@ impl CalamineAdapter {
                     worksheet_path,
                     sheet,
                     limits,
+                    dynamic_cell_metadata,
                 )
             }
             CalamineSource::Bytes(bytes) => Self::scan_array_formula_metadata_from_reader(
@@ -1813,6 +2005,7 @@ impl CalamineAdapter {
                 worksheet_path,
                 sheet,
                 limits,
+                dynamic_cell_metadata,
             ),
         }
     }
@@ -2405,6 +2598,8 @@ where
                 FormulaCompressedPreparation,
             )> = Vec::new();
             let mut saved_formula_values_by_sheet = Vec::new();
+            let dynamic_cell_metadata =
+                self.scan_dynamic_array_cell_metadata(engine.workbook_load_limits())?;
 
             for (sheet_instance, n) in names.iter().enumerate() {
                 let t_sheet = DebugTimer::start();
@@ -2417,8 +2612,11 @@ where
 
                 let shadow_relocation_comparator =
                     self.shadow_relocation_comparator.as_ref().map(Arc::clone);
-                let array_formula_metadata =
-                    self.scan_array_formula_metadata(n, engine.workbook_load_limits())?;
+                let array_formula_metadata = self.scan_array_formula_metadata(
+                    n,
+                    engine.workbook_load_limits(),
+                    &dynamic_cell_metadata,
+                )?;
                 let saved_formula_fallback = if matches!(
                     engine.config.cycle.policy,
                     formualizer_eval::engine::CyclePolicy::Iterate { .. }
@@ -2449,7 +2647,7 @@ where
                                 shadow_relocation_comparator: shadow_relocation_comparator.clone(),
                             },
                             saved_formula_fallback,
-                            &array_formula_metadata.non_anchor_members,
+                            &array_formula_metadata,
                         ),
                         CalamineWorkbook::Bytes(workbook) => Self::stream_worksheet(
                             workbook,
@@ -2466,7 +2664,7 @@ where
                                 shadow_relocation_comparator,
                             },
                             saved_formula_fallback,
-                            &array_formula_metadata.non_anchor_members,
+                            &array_formula_metadata,
                         ),
                     }?
                 };
@@ -2480,6 +2678,7 @@ where
                     formulas_observed: parsed_n,
                     formulas_handed_to_engine: formula_handed_to_engine,
                     formulas,
+                    formula_authorship,
                     saved_formula_values,
                     formula_source_report,
                     compressed_families,
@@ -2502,6 +2701,10 @@ where
                 total_values += values_handed_to_engine;
                 total_value_cells_observed += sheet_value_cells_observed;
                 total_shared_formula_tags += shared_formula_tags;
+
+                for (row, col, authorship) in formula_authorship {
+                    engine.stage_loaded_formula_authorship(n, row, col, authorship);
+                }
 
                 let store = engine.sheet_store_mut();
                 if let Some(pos) = store.sheets.iter().position(|s| s.name.as_ref() == n) {

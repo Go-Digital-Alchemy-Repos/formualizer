@@ -90,6 +90,84 @@ pub use graph::{
     ChangeEvent, DependencyGraph, DependencyRef, GraphBaselineStats, OperationSummary, StripeKey,
     StripeType, block_index,
 };
+
+/// Formula behavior recorded by the authoring application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthoredFormulaKind {
+    LegacyScalar,
+    CseArray,
+    DynamicArray,
+}
+
+/// One-based worksheet rectangle authored as a CSE array fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormulaFence {
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+}
+
+impl FormulaFence {
+    pub fn new(start_row: u32, start_col: u32, end_row: u32, end_col: u32) -> Self {
+        Self {
+            start_row: start_row.min(end_row),
+            start_col: start_col.min(end_col),
+            end_row: start_row.max(end_row),
+            end_col: start_col.max(end_col),
+        }
+    }
+
+    pub fn rows(self) -> usize {
+        self.end_row.saturating_sub(self.start_row) as usize + 1
+    }
+
+    pub fn cols(self) -> usize {
+        self.end_col.saturating_sub(self.start_col) as usize + 1
+    }
+
+    pub fn is_single_cell(self) -> bool {
+        self.start_row == self.end_row && self.start_col == self.end_col
+    }
+}
+
+/// Authored formula behavior plus the optional CSE output fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormulaAuthorship {
+    pub kind: AuthoredFormulaKind,
+    pub cse_fence: Option<FormulaFence>,
+}
+
+impl FormulaAuthorship {
+    pub const fn legacy_scalar() -> Self {
+        Self {
+            kind: AuthoredFormulaKind::LegacyScalar,
+            cse_fence: None,
+        }
+    }
+
+    pub const fn dynamic_array() -> Self {
+        Self {
+            kind: AuthoredFormulaKind::DynamicArray,
+            cse_fence: None,
+        }
+    }
+
+    pub const fn cse_array(fence: FormulaFence) -> Self {
+        Self {
+            kind: AuthoredFormulaKind::CseArray,
+            cse_fence: Some(fence),
+        }
+    }
+
+    pub fn for_api(kind: AuthoredFormulaKind, row: u32, col: u32) -> Self {
+        match kind {
+            AuthoredFormulaKind::LegacyScalar => Self::legacy_scalar(),
+            AuthoredFormulaKind::CseArray => Self::cse_array(FormulaFence::new(row, col, row, col)),
+            AuthoredFormulaKind::DynamicArray => Self::dynamic_array(),
+        }
+    }
+}
 pub use resource_ledger::{
     AdmissionResourceBudget, DeadlineResourceBudget, DiskScratchPolicy, EvaluationBudgets,
     EvaluationIncompleteReason, EvaluationResourceConfigDiagnostic,
@@ -834,6 +912,10 @@ pub struct EvalConfig {
     /// Public temporal materialisation policy.
     pub temporal_egress: TemporalEgress,
 
+    /// Authored behavior assigned to formulas created through mutation APIs.
+    /// Loaded workbook formulas carry their own classification instead.
+    pub api_created_formula_kind: AuthoredFormulaKind,
+
     /// Policy for malformed formulas encountered during ingest/graph-build.
     pub formula_parse_policy: FormulaParsePolicy,
 
@@ -912,6 +994,7 @@ impl Default for EvalConfig {
             max_overlay_memory_bytes: None,
             date_system: DateSystem::Excel1900,
             temporal_egress: TemporalEgress::default(),
+            api_created_formula_kind: AuthoredFormulaKind::DynamicArray,
             formula_parse_policy: FormulaParsePolicy::Strict,
             defer_graph_building: false,
             enable_virtual_dep_telemetry: false,
