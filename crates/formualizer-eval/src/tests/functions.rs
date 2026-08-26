@@ -1500,12 +1500,14 @@ fn may_return_reference_excludes_let_lambda_locals() {
 
 fn god187ad_reference_returning_engine() -> crate::engine::Engine<TestWorkbook> {
     ensure_lifting_builtins();
-    let mut engine = crate::engine::Engine::new(
-        TestWorkbook::new(),
-        crate::engine::EvalConfig::default(),
-    );
+    let mut engine =
+        crate::engine::Engine::new(TestWorkbook::new(), crate::engine::EvalConfig::default());
     for row in 1..=20 {
-        for (col, value) in [(1, row as i64), (2, 100 + row as i64), (3, 200 + row as i64)] {
+        for (col, value) in [
+            (1, row as i64),
+            (2, 100 + row as i64),
+            (3, 200 + row as i64),
+        ] {
             engine
                 .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
                 .expect("set reference fixture value");
@@ -1575,10 +1577,8 @@ fn if_family_reference_live_edges_idempotent() {
             "Sheet1",
             9,
             3,
-            formualizer_parse::parser::parse(
-                "=OFFSET(INDEX(IF(G1=1,Q1:Q100,R1:R100),50,1),0,0)",
-            )
-            .expect("valid live-edge formula"),
+            formualizer_parse::parser::parse("=OFFSET(INDEX(IF(G1=1,Q1:Q100,R1:R100),50,1),0,0)")
+                .expect("valid live-edge formula"),
         )
         .expect("set live-edge formula");
     engine

@@ -353,6 +353,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             value_override: self.value_override.clone(),
             cached_ast: self.cached_ast.clone(),
             cached_ref: self.cached_ref.clone(),
+            cached_reference_or_value: self.cached_reference_or_value.clone(),
             cached_resolved: self.cached_resolved.clone(),
             cached_value: self.cached_value.clone(),
         }

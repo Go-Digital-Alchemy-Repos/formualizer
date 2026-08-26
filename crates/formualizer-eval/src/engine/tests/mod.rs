@@ -105,6 +105,7 @@ mod arrow_sparse_extension;
 mod arrow_sparse_structural_ops;
 mod arrow_sparse_used_bounds;
 mod blank_formula_results;
+mod blocked_spill_recovery;
 mod compressed_range_scheduler;
 mod computed_array_aggregates;
 mod computed_flush;
@@ -199,6 +200,6 @@ mod scc_runtime_property;
 mod short_circuit_dispatch;
 
 mod approximate_lookup_ignored_entries;
-mod temporal_lookup_semantics;
 mod format_channel_t1;
+mod temporal_lookup_semantics;
 mod xlookup_excel_parity;

@@ -209,7 +209,9 @@ fn api_created_dynamic_array_blocked_spill_still_errors() {
     engine.evaluate_all().unwrap();
 
     match engine.get_cell_value("Sheet1", 2, 4) {
-        Some(LiteralValue::Error(error)) => assert_eq!(error.to_string(), "#SPILL!"),
+        Some(LiteralValue::Error(error)) => {
+            assert_eq!(error.kind, formualizer_common::ExcelErrorKind::Spill)
+        }
         other => panic!("expected #SPILL!, got {other:?}"),
     }
 }

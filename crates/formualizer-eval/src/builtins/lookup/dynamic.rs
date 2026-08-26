@@ -103,12 +103,14 @@ impl Function for SingleFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let value = match args[0].value()? {
-            crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => rows
+            crate::traits::CalcValue::Scalar(LiteralValue::Array(rows))
+            | crate::traits::CalcValue::AnnotatedScalar(LiteralValue::Array(rows), _) => rows
                 .first()
                 .and_then(|row| row.first())
                 .cloned()
                 .unwrap_or_else(|| LiteralValue::Error(ExcelError::new_value())),
-            crate::traits::CalcValue::Scalar(value) => value,
+            crate::traits::CalcValue::Scalar(value)
+            | crate::traits::CalcValue::AnnotatedScalar(value, _) => value,
             crate::traits::CalcValue::Range(view) => {
                 if view.is_empty() {
                     LiteralValue::Error(ExcelError::new_value())

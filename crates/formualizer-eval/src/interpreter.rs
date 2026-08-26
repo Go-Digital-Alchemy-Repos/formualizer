@@ -71,16 +71,17 @@ pub(crate) fn implicit_intersection_calc_at<'a>(
     };
 
     match cv {
-        crate::traits::CalcValue::Scalar(v)
-        | crate::traits::CalcValue::AnnotatedScalar(v, _) => match v {
-            LiteralValue::Array(arr) => {
-                if arr.is_empty() || arr.first().is_none_or(|row| row.is_empty()) {
-                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+        crate::traits::CalcValue::Scalar(v) | crate::traits::CalcValue::AnnotatedScalar(v, _) => {
+            match v {
+                LiteralValue::Array(arr) => {
+                    if arr.is_empty() || arr.first().is_none_or(|row| row.is_empty()) {
+                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+                    }
+                    arr[0][0].clone()
                 }
-                arr[0][0].clone()
+                other => other,
             }
-            other => other,
-        },
+        }
         crate::traits::CalcValue::Range(rv) => {
             if rv.is_empty() {
                 return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
@@ -619,6 +620,7 @@ impl<'a> Interpreter<'a> {
                 let left = ASTNode::new(ASTNodeType::Literal(left_value), None);
                 let right = ASTNode::new(ASTNodeType::Literal(right_value), None);
                 self.eval_binary(op, &left, &right)
+                    .map(crate::traits::CalcValue::into_literal)
             }
             ASTNodeType::UnaryOp { op, expr } => {
                 let value = self.evaluate_ast_at(expr, row, col)?;
@@ -927,6 +929,7 @@ impl<'a> Interpreter<'a> {
                 let left = ASTNode::new(ASTNodeType::Literal(left), None);
                 let right = ASTNode::new(ASTNodeType::Literal(right), None);
                 self.eval_binary(data_store.resolve_ast_string(*op_id), &left, &right)
+                    .map(crate::traits::CalcValue::into_literal)
             }
             AstNodeData::UnaryOp { op_id, expr_id } => {
                 let value =
@@ -1107,13 +1110,14 @@ impl<'a> Interpreter<'a> {
                     };
                 }
 
-                let evaluate_operand = |node_id| {
-                    match self.evaluate_arena_ast(node_id, data_store, sheet_registry) {
+                let evaluate_operand =
+                    |node_id| match self.evaluate_arena_ast(node_id, data_store, sheet_registry) {
                         Ok(value) => Ok(value),
                         Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
-                        Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
-                    }
-                };
+                        Err(error) => {
+                            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)))
+                        }
+                    };
                 let left_calc = evaluate_operand(*left_id)?;
                 let left_format = left_calc.format_id();
                 let left = left_calc.into_literal();

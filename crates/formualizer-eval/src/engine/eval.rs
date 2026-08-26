@@ -1052,6 +1052,11 @@ pub struct Engine<R> {
     /// mode intentionally disables that cache for grid-backed formulas.
     saved_formula_values: FxHashMap<CellRef, LiteralValue>,
 
+    /// Detailed spill errors keyed by formula vertex. Arrow's compact error encoding
+    /// stores only the Excel error kind, so message, context, and typed extra
+    /// data live here for canonical reads.
+    spill_error_details: FxHashMap<VertexId, ExcelError>,
+
     /// Final committed values of iterating-SCC members as of the end of the
     /// most recent recalc (spec §4 persistence). In canonical (value-cache
     /// disabled) mode the computed overlay is the ONLY home of a formula's
@@ -2853,6 +2858,7 @@ where
             active_resource_ledger: None,
             pending_iterative_redirty: Vec::new(),
             saved_formula_values: FxHashMap::default(),
+            spill_error_details: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
@@ -2999,6 +3005,7 @@ where
             active_resource_ledger: None,
             pending_iterative_redirty: Vec::new(),
             saved_formula_values: FxHashMap::default(),
+            spill_error_details: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
@@ -17221,6 +17228,9 @@ where
         self.graph.set_cell_value(sheet, row, col, value.clone())?;
         self.clear_cell_format_state(sheet, cell_ref);
         self.saved_formula_values.remove(&cell_ref);
+        if let Some(vertex_id) = self.graph.get_vertex_id_for_address(&cell_ref) {
+            self.spill_error_details.remove(vertex_id);
+        }
         self.record_formula_plane_changed_cell(sheet, row, col);
         if !sheet_existed || replaced_formula {
             self.mark_topology_edited();
@@ -17497,6 +17507,9 @@ where
         )?;
         self.clear_cell_format_state(sheet, placement);
         self.saved_formula_values.remove(&placement);
+        if let Some(vertex_id) = self.graph.get_vertex_id_for_address(&placement) {
+            self.spill_error_details.remove(vertex_id);
+        }
         self.record_formula_plane_changed_cell(sheet, row, col);
 
         // If the cell previously held a user value in the delta overlay, it must not continue
@@ -17556,6 +17569,9 @@ where
             let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
             self.clear_cell_format_state(sheet, cell);
             self.saved_formula_values.remove(&cell);
+            if let Some(vertex_id) = self.graph.get_vertex_id_for_address(&cell) {
+                self.spill_error_details.remove(vertex_id);
+            }
             self.record_formula_plane_changed_cell(sheet, row, col);
         }
         // Single topology bump after batch
@@ -17720,6 +17736,17 @@ where
         let r0 = row.saturating_sub(1) as usize;
         let c0 = col.saturating_sub(1) as usize;
         let v = asheet.get_cell_value(r0, c0);
+        if let LiteralValue::Error(ref stored_error) = v
+            && let Some(sheet_id) = self.graph.sheet_id(sheet)
+            && let Some(vertex_id) = self.graph.get_vertex_id_for_address(&CellRef::new(
+                sheet_id,
+                Coord::from_excel(row, col, true, true),
+            ))
+            && let Some(detailed_error) = self.spill_error_details.get(vertex_id)
+            && detailed_error.kind == stored_error.kind
+        {
+            return Some(LiteralValue::Error(detailed_error.clone()));
+        }
         if matches!(v, LiteralValue::Empty) {
             None
         } else {
@@ -17954,10 +17981,18 @@ where
             // Do not publish the selected result until the outer request's deadline succeeds.
             self.resource_checkpoint(0)?;
             let mut delta = delta;
-            for effect in &effects {
-                self.apply_effect_with_computed_writes(effect, delta.as_deref_mut(), None, None)?;
-            }
-            return Ok(value);
+            self.apply_effects_with_computed_writes(&effects, delta.as_deref_mut(), None, None)?;
+            let cell = self
+                .graph
+                .get_cell_ref(vertex_id)
+                .expect("cell ref for formula vertex");
+            return Ok(self
+                .read_cell_value(
+                    self.graph.sheet_name(cell.sheet_id),
+                    cell.coord.row() + 1,
+                    cell.coord.col() + 1,
+                )
+                .unwrap_or(value));
         }
 
         let mut delta = delta;
@@ -18163,6 +18198,9 @@ where
                                     delta.as_deref_mut(),
                                     None,
                                 ) {
+                                    if e.kind != ExcelErrorKind::Spill {
+                                        return Err(e);
+                                    }
                                     // If commit fails, mark as error
                                     self.clear_spill_projection_and_mirror(
                                         vertex_id,
@@ -26247,7 +26285,7 @@ where
         anchor_vertex: VertexId,
         targets: &[CellRef],
         rows: Vec<Vec<LiteralValue>>,
-        delta: Option<&mut DeltaCollector>,
+        mut delta: Option<&mut DeltaCollector>,
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
     ) -> Result<(), ExcelError> {
         let prev_spill_cells = self
@@ -26256,7 +26294,8 @@ where
             .map(|cells| cells.to_vec())
             .unwrap_or_default();
 
-        if let Some(delta) = delta
+        let mut changed_cells = Vec::new();
+        if let Some(delta) = delta.as_deref()
             && delta.mode != DeltaMode::Off
         {
             let target_set: std::collections::HashSet<CellRef, CoordBuildHasher> =
@@ -26273,7 +26312,7 @@ where
                     .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                     .unwrap_or(LiteralValue::Empty);
                 if old != empty {
-                    delta.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
+                    changed_cells.push(*cell);
                 }
             }
 
@@ -26293,7 +26332,7 @@ where
                         .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                         .unwrap_or(LiteralValue::Empty);
                     if old != new {
-                        delta.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
+                        changed_cells.push(*cell);
                     }
                 }
             } else {
@@ -26304,7 +26343,7 @@ where
                         .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                         .unwrap_or(LiteralValue::Empty);
                     if !matches!(old, LiteralValue::Empty) {
-                        delta.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
+                        changed_cells.push(*cell);
                     }
                 }
             }
@@ -26332,6 +26371,12 @@ where
                 }
             },
         )?;
+
+        if let Some(delta) = delta.as_deref_mut() {
+            for cell in changed_cells {
+                delta.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
+            }
+        }
 
         if let Some(scope) = Self::formula_plane_region_from_cells(&prev_spill_cells) {
             self.record_formula_plane_structural_change(scope);
@@ -26388,6 +26433,12 @@ where
 
 use crate::engine::effects::Effect;
 use crate::engine::graph::editor::change_log::{ChangeEvent, ChangeLog, SpillSnapshot};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectApplication {
+    Applied,
+    SpillRecovered { anchor_vertex: VertexId },
+}
 
 impl<R> Engine<R>
 where
@@ -26510,12 +26561,13 @@ where
         ) {
             Ok(()) => {
                 // Validate spill region is available.
-                if let Err(_e) = self.graph.plan_spill_region_allowing_formula_overwrite(
+                if let Err(error) = self.graph.plan_spill_region_allowing_formula_overwrite(
                     vertex_id,
                     &targets,
                     overwritable_formulas,
                 ) {
-                    return self.plan_spill_error_effects(vertex_id, "Spill blocked", h, w);
+                    let message = error.message.unwrap_or_else(|| "Spill blocked".to_string());
+                    return self.plan_spill_error_effects(vertex_id, &message, h, w);
                 }
 
                 // Arrow-canonical mode: graph planning cannot see non-empty value blockers because
@@ -26633,6 +26685,37 @@ where
         log: Option<&mut ChangeLog>,
     ) -> Result<(), ExcelError> {
         self.apply_effect_with_computed_writes(effect, delta, log, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn apply_effects_with_computed_writes(
+        &mut self,
+        effects: &[Effect],
+        mut delta: Option<&mut DeltaCollector>,
+        mut log: Option<&mut ChangeLog>,
+        mut computed_writes: Option<&mut ComputedWriteBuffer>,
+    ) -> Result<(), ExcelError> {
+        let mut suppressed_write = None;
+        for effect in effects {
+            if let Effect::WriteCell { vertex_id, .. } = effect
+                && suppressed_write == Some(*vertex_id)
+            {
+                suppressed_write = None;
+                continue;
+            }
+
+            if let EffectApplication::SpillRecovered { anchor_vertex } = self
+                .apply_effect_with_computed_writes(
+                    effect,
+                    delta.as_deref_mut(),
+                    log.as_deref_mut(),
+                    computed_writes.as_deref_mut(),
+                )?
+            {
+                suppressed_write = Some(anchor_vertex);
+            }
+        }
+        Ok(())
     }
 
     fn apply_effect_with_computed_writes(
@@ -26641,7 +26724,7 @@ where
         delta: Option<&mut DeltaCollector>,
         log: Option<&mut ChangeLog>,
         computed_writes: Option<&mut ComputedWriteBuffer>,
-    ) -> Result<(), ExcelError> {
+    ) -> Result<EffectApplication, ExcelError> {
         match effect {
             Effect::WriteCell { vertex_id, value } => {
                 self.apply_write_cell(*vertex_id, value, delta, computed_writes)?;
@@ -26655,17 +26738,21 @@ where
                 target_cells,
                 values,
             } => {
-                self.apply_spill_commit(
+                if self.apply_spill_commit(
                     *anchor_vertex,
                     target_cells,
                     values.clone(),
                     delta,
                     log,
                     computed_writes,
-                )?;
+                )? {
+                    return Ok(EffectApplication::SpillRecovered {
+                        anchor_vertex: *anchor_vertex,
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(EffectApplication::Applied)
     }
 
     /// Apply a WriteCell effect.
@@ -26691,6 +26778,13 @@ where
                     d.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
                 }
             }
+        }
+        if let LiteralValue::Error(error) = value
+            && error.kind == ExcelErrorKind::Spill
+        {
+            self.spill_error_details.insert(vertex_id, error.clone());
+        } else {
+            self.spill_error_details.remove(&vertex_id);
         }
         self.graph.update_vertex_value(vertex_id, value.clone());
         self.record_vertex_value_to_overlay(vertex_id, value, computed_writes)?;
@@ -26781,11 +26875,11 @@ where
         anchor_vertex: VertexId,
         target_cells: &[CellRef],
         values: Vec<Vec<LiteralValue>>,
-        delta: Option<&mut DeltaCollector>,
-        log: Option<&mut ChangeLog>,
-        computed_writes: Option<&mut ComputedWriteBuffer>,
-    ) -> Result<(), ExcelError> {
-        if let Some(buffer) = computed_writes {
+        mut delta: Option<&mut DeltaCollector>,
+        mut log: Option<&mut ChangeLog>,
+        mut computed_writes: Option<&mut ComputedWriteBuffer>,
+    ) -> Result<bool, ExcelError> {
+        if let Some(buffer) = computed_writes.as_deref_mut() {
             self.flush_computed_write_buffer(buffer)?;
         }
 
@@ -26797,13 +26891,32 @@ where
         };
 
         // Delegate to existing commit_spill_and_mirror for delta + overlay logic.
-        self.commit_spill_and_mirror(
+        let commit_result = self.commit_spill_and_mirror(
             anchor_vertex,
             target_cells,
             values.clone(),
-            delta,
+            delta.as_deref_mut(),
             None, // overwritable_formulas already validated in plan phase
-        )?;
+        );
+        if let Err(error) = commit_result {
+            if error.kind != ExcelErrorKind::Spill {
+                return Err(error);
+            }
+
+            self.apply_spill_clear(
+                anchor_vertex,
+                delta.as_deref_mut(),
+                log.as_deref_mut(),
+                computed_writes.as_deref_mut(),
+            )?;
+            self.apply_write_cell(
+                anchor_vertex,
+                &LiteralValue::Error(error),
+                delta.as_deref_mut(),
+                computed_writes.as_deref_mut(),
+            )?;
+            return Ok(true);
+        }
 
         // ChangeLog.
         if let Some(log) = log {
@@ -26816,7 +26929,7 @@ where
                 },
             });
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Snapshot a spill region for ChangeLog recording.
@@ -26922,14 +27035,12 @@ where
                 Err(e) => LiteralValue::Error(e),
             };
             let effects = self.plan_vertex_effects(vertex_id, value, None)?;
-            for effect in &effects {
-                self.apply_effect_with_computed_writes(
-                    effect,
-                    delta.as_deref_mut(),
-                    log.as_deref_mut(),
-                    None,
-                )?;
-            }
+            self.apply_effects_with_computed_writes(
+                &effects,
+                delta.as_deref_mut(),
+                log.as_deref_mut(),
+                None,
+            )?;
         }
         Ok(layer.vertices.len())
     }
@@ -26969,16 +27080,14 @@ where
                     return Err(e);
                 }
             };
-            for effect in &effects {
-                if let Err(e) = self.apply_effect_with_computed_writes(
-                    effect,
-                    None,
-                    None,
-                    Some(&mut computed_writes),
-                ) {
-                    self.flush_computed_write_buffer(&mut computed_writes)?;
-                    return Err(e);
-                }
+            if let Err(e) = self.apply_effects_with_computed_writes(
+                &effects,
+                None,
+                None,
+                Some(&mut computed_writes),
+            ) {
+                self.flush_computed_write_buffer(&mut computed_writes)?;
+                return Err(e);
             }
         }
         self.flush_computed_write_buffer(&mut computed_writes)?;
@@ -27021,16 +27130,14 @@ where
                     return Err(e);
                 }
             };
-            for effect in &effects {
-                if let Err(e) = self.apply_effect_with_computed_writes(
-                    effect,
-                    Some(delta),
-                    None,
-                    Some(&mut computed_writes),
-                ) {
-                    self.flush_computed_write_buffer(&mut computed_writes)?;
-                    return Err(e);
-                }
+            if let Err(e) = self.apply_effects_with_computed_writes(
+                &effects,
+                Some(delta),
+                None,
+                Some(&mut computed_writes),
+            ) {
+                self.flush_computed_write_buffer(&mut computed_writes)?;
+                return Err(e);
             }
         }
         self.flush_computed_write_buffer(&mut computed_writes)?;
@@ -27078,16 +27185,14 @@ where
                     return Err(e);
                 }
             };
-            for effect in &effects {
-                if let Err(e) = self.apply_effect_with_computed_writes(
-                    effect,
-                    None,
-                    None,
-                    Some(&mut computed_writes),
-                ) {
-                    self.flush_computed_write_buffer(&mut computed_writes)?;
-                    return Err(e);
-                }
+            if let Err(e) = self.apply_effects_with_computed_writes(
+                &effects,
+                None,
+                None,
+                Some(&mut computed_writes),
+            ) {
+                self.flush_computed_write_buffer(&mut computed_writes)?;
+                return Err(e);
             }
         }
         self.flush_computed_write_buffer(&mut computed_writes)?;
@@ -27135,16 +27240,14 @@ where
                     return Err(e);
                 }
             };
-            for effect in &effects {
-                if let Err(e) = self.apply_effect_with_computed_writes(
-                    effect,
-                    None,
-                    None,
-                    Some(&mut computed_writes),
-                ) {
-                    self.flush_computed_write_buffer(&mut computed_writes)?;
-                    return Err(e);
-                }
+            if let Err(e) = self.apply_effects_with_computed_writes(
+                &effects,
+                None,
+                None,
+                Some(&mut computed_writes),
+            ) {
+                self.flush_computed_write_buffer(&mut computed_writes)?;
+                return Err(e);
             }
         }
         self.flush_computed_write_buffer(&mut computed_writes)?;
@@ -27218,16 +27321,14 @@ where
                                 return Err(e);
                             }
                         };
-                        for effect in &effects {
-                            if let Err(e) = self.apply_effect_with_computed_writes(
-                                effect,
-                                None,
-                                None,
-                                Some(&mut computed_writes),
-                            ) {
-                                self.flush_computed_write_buffer(&mut computed_writes)?;
-                                return Err(e);
-                            }
+                        if let Err(e) = self.apply_effects_with_computed_writes(
+                            &effects,
+                            None,
+                            None,
+                            Some(&mut computed_writes),
+                        ) {
+                            self.flush_computed_write_buffer(&mut computed_writes)?;
+                            return Err(e);
                         }
                         applied = applied.saturating_add(1);
                     }
@@ -27246,16 +27347,14 @@ where
                                 return Err(e);
                             }
                         };
-                        for effect in &effects {
-                            if let Err(e) = self.apply_effect_with_computed_writes(
-                                effect,
-                                None,
-                                None,
-                                Some(&mut computed_writes),
-                            ) {
-                                self.flush_computed_write_buffer(&mut computed_writes)?;
-                                return Err(e);
-                            }
+                        if let Err(e) = self.apply_effects_with_computed_writes(
+                            &effects,
+                            None,
+                            None,
+                            Some(&mut computed_writes),
+                        ) {
+                            self.flush_computed_write_buffer(&mut computed_writes)?;
+                            return Err(e);
                         }
                         applied = applied.saturating_add(1);
                     }
@@ -27337,16 +27436,14 @@ where
                                 return Err(e);
                             }
                         };
-                        for effect in &effects {
-                            if let Err(e) = self.apply_effect_with_computed_writes(
-                                effect,
-                                Some(delta),
-                                None,
-                                Some(&mut computed_writes),
-                            ) {
-                                self.flush_computed_write_buffer(&mut computed_writes)?;
-                                return Err(e);
-                            }
+                        if let Err(e) = self.apply_effects_with_computed_writes(
+                            &effects,
+                            Some(delta),
+                            None,
+                            Some(&mut computed_writes),
+                        ) {
+                            self.flush_computed_write_buffer(&mut computed_writes)?;
+                            return Err(e);
                         }
                         applied = applied.saturating_add(1);
                     }
@@ -27364,16 +27461,14 @@ where
                                 return Err(e);
                             }
                         };
-                        for effect in &effects {
-                            if let Err(e) = self.apply_effect_with_computed_writes(
-                                effect,
-                                Some(delta),
-                                None,
-                                Some(&mut computed_writes),
-                            ) {
-                                self.flush_computed_write_buffer(&mut computed_writes)?;
-                                return Err(e);
-                            }
+                        if let Err(e) = self.apply_effects_with_computed_writes(
+                            &effects,
+                            Some(delta),
+                            None,
+                            Some(&mut computed_writes),
+                        ) {
+                            self.flush_computed_write_buffer(&mut computed_writes)?;
+                            return Err(e);
                         }
                         applied = applied.saturating_add(1);
                     }
@@ -27467,16 +27562,14 @@ where
                                 return Err(e);
                             }
                         };
-                        for effect in &effects {
-                            if let Err(e) = self.apply_effect_with_computed_writes(
-                                effect,
-                                None,
-                                None,
-                                Some(&mut computed_writes),
-                            ) {
-                                self.flush_computed_write_buffer(&mut computed_writes)?;
-                                return Err(e);
-                            }
+                        if let Err(e) = self.apply_effects_with_computed_writes(
+                            &effects,
+                            None,
+                            None,
+                            Some(&mut computed_writes),
+                        ) {
+                            self.flush_computed_write_buffer(&mut computed_writes)?;
+                            return Err(e);
                         }
                         applied = applied.saturating_add(1);
                     }
@@ -27494,16 +27587,14 @@ where
                                 return Err(e);
                             }
                         };
-                        for effect in &effects {
-                            if let Err(e) = self.apply_effect_with_computed_writes(
-                                effect,
-                                None,
-                                None,
-                                Some(&mut computed_writes),
-                            ) {
-                                self.flush_computed_write_buffer(&mut computed_writes)?;
-                                return Err(e);
-                            }
+                        if let Err(e) = self.apply_effects_with_computed_writes(
+                            &effects,
+                            None,
+                            None,
+                            Some(&mut computed_writes),
+                        ) {
+                            self.flush_computed_write_buffer(&mut computed_writes)?;
+                            return Err(e);
                         }
                         applied = applied.saturating_add(1);
                     }
@@ -27677,16 +27768,14 @@ where
                     return Err(e);
                 }
             };
-            for effect in &effects {
-                if let Err(e) = self.apply_effect_with_computed_writes(
-                    effect,
-                    None,
-                    Some(log),
-                    Some(&mut computed_writes),
-                ) {
-                    self.flush_computed_write_buffer(&mut computed_writes)?;
-                    return Err(e);
-                }
+            if let Err(e) = self.apply_effects_with_computed_writes(
+                &effects,
+                None,
+                Some(log),
+                Some(&mut computed_writes),
+            ) {
+                self.flush_computed_write_buffer(&mut computed_writes)?;
+                return Err(e);
             }
         }
         self.flush_computed_write_buffer(&mut computed_writes)?;
