@@ -362,6 +362,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     pub(crate) fn with_scalar_value(&self, value: LiteralValue) -> Self {
         let mut handle = self.duplicate();
         handle.value_override = Some(crate::traits::CalcValue::Scalar(value));
+        handle.cached_reference_or_value = std::cell::OnceCell::new();
         handle.cached_resolved = std::cell::OnceCell::new();
         handle.cached_value = std::cell::OnceCell::new();
         handle
@@ -464,6 +465,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// Unlike [`Self::has_reference_semantics`], this does not evaluate a
     /// reference-returning function to discover which arm it selects.
     pub(crate) fn may_return_reference(&self) -> bool {
+        if self.value_override.is_some() {
+            return false;
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {
@@ -671,6 +675,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     fn function_resolution_attempt(
         &self,
     ) -> Option<Result<crate::function::FunctionResolution<'b>, ExcelError>> {
+        if self.value_override.is_some() {
+            return None;
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => {
                 let ASTNodeType::Function { name, args } = &node.node_type else {

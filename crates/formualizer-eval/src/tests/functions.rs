@@ -1597,3 +1597,29 @@ fn if_family_reference_live_edges_idempotent() {
     let second = engine.cycle_instrumentation_targets()[0].edges.clone();
     assert_eq!(first, second, "live edges changed across identical recalcs");
 }
+
+#[test]
+fn lifted_scalar_override_cannot_reenter_reference_resolution() {
+    ensure_lifting_builtins();
+    let workbook = TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![vec![LiteralValue::Int(11)], vec![LiteralValue::Int(22)]],
+    );
+    let interpreter = workbook.interpreter();
+    let ast = formualizer_parse::parser::parse("=IF(TRUE,A1:A2,A1:A2)")
+        .expect("valid reference-returning IF");
+    let handle = ArgumentHandle::new(&ast, &interpreter).with_scalar_value(LiteralValue::Int(22));
+
+    assert!(!handle.may_return_reference());
+    match handle
+        .resolve_reference_or_value()
+        .expect("resolve projected scalar")
+    {
+        crate::function::FunctionResolution::Value(value) => {
+            assert_eq!(value.into_literal(), LiteralValue::Int(22));
+        }
+        _ => panic!("projected scalar re-entered reference resolution"),
+    }
+}
