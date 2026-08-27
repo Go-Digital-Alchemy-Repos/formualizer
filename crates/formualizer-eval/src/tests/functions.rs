@@ -1497,3 +1497,103 @@ fn may_return_reference_excludes_let_lambda_locals() {
         "a LET/LAMBDA local must not be sent down the named-range route"
     );
 }
+
+fn god187ad_reference_returning_engine() -> crate::engine::Engine<TestWorkbook> {
+    ensure_lifting_builtins();
+    let mut engine = crate::engine::Engine::new(
+        TestWorkbook::new(),
+        crate::engine::EvalConfig::default(),
+    );
+    for row in 1..=20 {
+        for (col, value) in [(1, row as i64), (2, 100 + row as i64), (3, 200 + row as i64)] {
+            engine
+                .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+                .expect("set reference fixture value");
+        }
+    }
+    engine
+}
+
+fn god187ad_evaluate_reference_formula(formula: &str) -> LiteralValue {
+    let mut engine = god187ad_reference_returning_engine();
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            10,
+            formualizer_parse::parser::parse(formula).expect("valid reference formula"),
+        )
+        .expect("set reference formula");
+    engine.evaluate_all().expect("evaluate reference formula");
+    engine
+        .get_cell_value("Sheet1", 1, 10)
+        .expect("formula result")
+}
+
+#[test]
+fn reference_returning_iferror_offset_index() {
+    assert_eq!(
+        god187ad_evaluate_reference_formula("=OFFSET(INDEX(IFERROR(1/0,A1:C20),2,1),0,1)"),
+        LiteralValue::Number(102.0)
+    );
+}
+
+#[test]
+fn reference_returning_ifna_offset_index() {
+    assert_eq!(
+        god187ad_evaluate_reference_formula("=OFFSET(INDEX(IFNA(NA(),A1:C20),2,1),0,1)"),
+        LiteralValue::Number(102.0)
+    );
+}
+
+#[test]
+fn if_family_reference_live_edges_idempotent() {
+    use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, EvalConfig};
+
+    ensure_lifting_builtins();
+    let mut engine = crate::engine::Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy: CyclePolicy::Error,
+        }),
+    );
+    engine.set_cycle_instrumentation_targets(vec![("Sheet1".to_string(), 9, 3)]);
+    engine
+        .set_cell_value("Sheet1", 1, 7, LiteralValue::Int(1))
+        .expect("set selector");
+    for row in 1..=100 {
+        engine
+            .set_cell_value("Sheet1", row, 17, LiteralValue::Int(row as i64))
+            .expect("set Q value");
+        engine
+            .set_cell_value("Sheet1", row, 18, LiteralValue::Int(1000 + row as i64))
+            .expect("set R value");
+    }
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            9,
+            3,
+            formualizer_parse::parser::parse(
+                "=OFFSET(INDEX(IF(G1=1,Q1:Q100,R1:R100),50,1),0,0)",
+            )
+            .expect("valid live-edge formula"),
+        )
+        .expect("set live-edge formula");
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            50,
+            17,
+            formualizer_parse::parser::parse("=C9").expect("valid back edge"),
+        )
+        .expect("set back edge");
+
+    engine.evaluate_all().expect("first recalc");
+    let first = engine.cycle_instrumentation_targets()[0].edges.clone();
+    assert!(!first.is_empty(), "first recalc must record live edges");
+    engine.evaluate_all().expect("second recalc");
+    let second = engine.cycle_instrumentation_targets()[0].edges.clone();
+    assert_eq!(first, second, "live edges changed across identical recalcs");
+}

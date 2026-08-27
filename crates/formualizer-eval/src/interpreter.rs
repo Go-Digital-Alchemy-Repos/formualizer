@@ -479,7 +479,8 @@ impl<'a> Interpreter<'a> {
                     .cloned()
                     .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
             }
-            crate::traits::CalcValue::Scalar(value) => value,
+            crate::traits::CalcValue::Scalar(value)
+            | crate::traits::CalcValue::AnnotatedScalar(value, _) => value,
             crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
             ),
@@ -1795,7 +1796,10 @@ impl<'a> Interpreter<'a> {
                 Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(rows))) => {
                     Ok(LiftGrid::Array(rows))
                 }
-                Ok(crate::traits::CalcValue::Scalar(value)) => Ok(LiftGrid::Scalar(value)),
+                Ok(crate::traits::CalcValue::Scalar(value))
+                | Ok(crate::traits::CalcValue::AnnotatedScalar(value, _)) => {
+                    Ok(LiftGrid::Scalar(value))
+                }
                 Ok(crate::traits::CalcValue::Callable(_)) => {
                     Ok(LiftGrid::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Calc)
@@ -1813,7 +1817,8 @@ impl<'a> Interpreter<'a> {
                 crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => {
                     LiftGrid::Array(rows)
                 }
-                crate::traits::CalcValue::Scalar(value) => LiftGrid::Scalar(value),
+                crate::traits::CalcValue::Scalar(value)
+                | crate::traits::CalcValue::AnnotatedScalar(value, _) => LiftGrid::Scalar(value),
                 crate::traits::CalcValue::Callable(_) => LiftGrid::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Calc)
                         .with_message("LAMBDA value must be invoked"),

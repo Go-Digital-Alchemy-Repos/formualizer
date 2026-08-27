@@ -287,7 +287,7 @@ pub struct IfErrorFn; // IFERROR(value, fallback)
 /// Variadic: false
 /// Signature: IFERROR(arg1: any@scalar, arg2: any@scalar)
 /// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
-/// Caps: PURE, SHORT_CIRCUIT
+/// Caps: PURE, RETURNS_REFERENCE, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for IfErrorFn {
     fn propagate_format(
@@ -300,7 +300,7 @@ impl Function for IfErrorFn {
     // SHORT_CIRCUIT: dispatch must not eagerly evaluate the fallback arm —
     // the eval body below evaluates arg0 first and touches arg1 only when
     // arg0 produced an error (same defect class as the IF fix in #118).
-    func_caps!(PURE, SHORT_CIRCUIT, MAY_SPILL);
+    func_caps!(PURE, SHORT_CIRCUIT, RETURNS_REFERENCE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "IFERROR"
     }
@@ -316,6 +316,21 @@ impl Function for IfErrorFn {
         static TWO: LazyLock<Vec<ArgSchema>> =
             LazyLock::new(|| vec![ArgSchema::any(), ArgSchema::any()]);
         &TWO[..]
+    }
+    fn eval_reference<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
+        resolution_to_reference(resolve_iferror_reference_or_value(args, ctx))
+    }
+    fn resolve_reference_or_value<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+        _value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
+    ) -> Result<FunctionResolution<'b>, ExcelError> {
+        resolve_iferror_reference_or_value(args, ctx)
     }
     fn eval<'a, 'b, 'c>(
         &self,
@@ -394,7 +409,7 @@ pub struct IfNaFn; // IFNA(value, fallback)
 /// Variadic: false
 /// Signature: IFNA(arg1: any@scalar, arg2: any@scalar)
 /// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
-/// Caps: PURE, SHORT_CIRCUIT
+/// Caps: PURE, RETURNS_REFERENCE, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for IfNaFn {
     fn propagate_format(
@@ -406,7 +421,7 @@ impl Function for IfNaFn {
 
     // SHORT_CIRCUIT: the fallback arm is evaluated only when arg0 is #N/A;
     // all other values/errors pass through without touching arg1.
-    func_caps!(PURE, SHORT_CIRCUIT, MAY_SPILL);
+    func_caps!(PURE, SHORT_CIRCUIT, RETURNS_REFERENCE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "IFNA"
     }
@@ -421,6 +436,21 @@ impl Function for IfNaFn {
         static TWO: LazyLock<Vec<ArgSchema>> =
             LazyLock::new(|| vec![ArgSchema::any(), ArgSchema::any()]);
         &TWO[..]
+    }
+    fn eval_reference<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
+        resolution_to_reference(resolve_ifna_reference_or_value(args, ctx))
+    }
+    fn resolve_reference_or_value<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+        _value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
+    ) -> Result<FunctionResolution<'b>, ExcelError> {
+        resolve_ifna_reference_or_value(args, ctx)
     }
     fn eval<'a, 'b, 'c>(
         &self,
@@ -582,6 +612,43 @@ fn value_error_resolution<'b>() -> FunctionResolution<'b> {
     FunctionResolution::Value(crate::traits::CalcValue::Scalar(LiteralValue::Error(
         ExcelError::new_value(),
     )))
+}
+
+fn resolve_iferror_reference_or_value<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<FunctionResolution<'b>, ExcelError> {
+    if args.len() != 2 {
+        return Ok(value_error_resolution());
+    }
+    match args[0].resolve_reference_or_value() {
+        Ok(FunctionResolution::Value(crate::traits::CalcValue::Scalar(LiteralValue::Error(_))))
+        | Ok(FunctionResolution::ReferenceError(_))
+        | Err(_) => resolve_selected_non_if(&args[1], ctx),
+        Ok(result) => Ok(result),
+    }
+}
+
+fn resolve_ifna_reference_or_value<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<FunctionResolution<'b>, ExcelError> {
+    if args.len() != 2 {
+        return Ok(value_error_resolution());
+    }
+    match args[0].resolve_reference_or_value()? {
+        FunctionResolution::Value(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            ref error,
+        ))) if error.kind == formualizer_common::ExcelErrorKind::Na => {
+            resolve_selected_non_if(&args[1], ctx)
+        }
+        FunctionResolution::ReferenceError(ref error)
+            if error.kind == formualizer_common::ExcelErrorKind::Na =>
+        {
+            resolve_selected_non_if(&args[1], ctx)
+        }
+        result => Ok(result),
+    }
 }
 
 fn resolve_ifs_reference_or_value<'b>(
