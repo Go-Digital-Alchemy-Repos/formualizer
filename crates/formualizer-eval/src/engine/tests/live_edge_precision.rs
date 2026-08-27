@@ -167,21 +167,14 @@ fn index_unselected_error_is_ignored() {
 }
 
 #[test]
-fn index_selected_error_phantom_cycle_stays_acyclic() {
-    let mut engine = runtime_engine();
-    set_formula(&mut engine, 1, 17, "=1/0");
-    set_formula(&mut engine, 3, 17, "=C9");
-    set_formula(&mut engine, 9, 3, "=INDEX(Q1:Q3,1)");
+fn index_rect_edge_error_selection_keeps_whole_rect_edges() {
+    let mut engine = build_guarded_chain("=INDEX(Q1:Q100,24)");
+    set_formula(&mut engine, 24, 17, "=1/0");
     engine.evaluate_all().expect("evaluate");
-    for (row, col, label) in [(9, 3, "C9"), (3, 17, "Q3")] {
-        assert!(
-            matches!(
-                engine.get_cell_value("Sheet1", row, col),
-                Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Div
-            ),
-            "{label} must propagate DIV/0 without a circular error"
-        );
-    }
+    assert!(
+        is_circ(&engine, 9, 3),
+        "errored selected cell must retain eager whole-rect edges"
+    );
 }
 
 /// Test-only INDEX stand-in with a non-None format policy. The precise path

@@ -319,6 +319,13 @@ impl IndexFn {
             return None;
         };
         let value = Self::materialize_reference(ctx, &reference).ok()?;
+        if matches!(
+            &value,
+            crate::traits::CalcValue::Scalar(LiteralValue::Error(_))
+                | crate::traits::CalcValue::AnnotatedScalar(LiteralValue::Error(_), _)
+        ) {
+            return None;
+        }
         Some(function.apply_format_propagation(value))
     }
 
