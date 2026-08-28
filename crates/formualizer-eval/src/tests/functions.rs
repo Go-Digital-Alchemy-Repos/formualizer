@@ -125,6 +125,99 @@ fn range_concat_lifts_elementwise_engine_arena() {
     );
 }
 
+#[test]
+fn switch_array_lifts_and_preserves_lazy_arms_direct_ast() {
+    let wb = TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![LiteralValue::Int(1)],
+            vec![LiteralValue::Int(2)],
+            vec![LiteralValue::Int(1)],
+        ],
+    );
+    assert_eq!(
+        evaluate_lifting_formula(
+            &wb,
+            "=SUM(SWITCH(TRUE,A1:A3=1,10,A1:A3=2,20,0))",
+        ),
+        LiteralValue::Number(40.0)
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=SWITCH(TRUE,A1:A3=1,10,A1:A3=2,20)"),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0)],
+            vec![LiteralValue::Number(20.0)],
+            vec![LiteralValue::Number(10.0)],
+        ])
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=SUM(SWITCH(TRUE,A1:A3>0,10,1/0))"),
+        LiteralValue::Number(30.0)
+    );
+}
+
+#[test]
+fn switch_array_lift_engine_ignores_untaken_error_and_back_edge() {
+    ensure_lifting_builtins();
+    use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, EvalConfig};
+    let mut engine = crate::engine::Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy: CyclePolicy::Error,
+        }),
+    );
+    for row in 1..=3 {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(1))
+            .expect("set SWITCH condition value");
+    }
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            2,
+            3,
+            formualizer_parse::parser::parse("=$F$4").expect("valid back edge"),
+        )
+        .expect("set back edge");
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            4,
+            6,
+            formualizer_parse::parser::parse(
+                "=SUM(SWITCH(TRUE,$A$1:$A$3=1,10,$A$1:$A$3=2,1/0,$C$1:$C$3))",
+            )
+            .expect("valid arena SWITCH formula"),
+        )
+        .expect("set arena SWITCH formula");
+    engine.evaluate_all().expect("untaken SWITCH arms stay lazy");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 4, 6).expect("SWITCH sum"),
+        LiteralValue::Number(30.0)
+    );
+}
+
+#[test]
+fn ifs_array_lift_audit_records_distinct_value_resolution_path() {
+    let wb = TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![LiteralValue::Int(1)],
+            vec![LiteralValue::Int(2)],
+            vec![LiteralValue::Int(1)],
+        ],
+    );
+    assert!(matches!(
+        evaluate_lifting_formula(&wb, "=SUM(IFS(A1:A3=1,10,A1:A3=2,20,TRUE,0))"),
+        LiteralValue::Error(error) if error.kind == ExcelErrorKind::Value
+    ));
+}
+
 fn array_lifting_engine() -> crate::engine::Engine<TestWorkbook> {
     ensure_lifting_builtins();
     let mut engine =

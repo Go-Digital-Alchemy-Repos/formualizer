@@ -127,14 +127,21 @@ pub(crate) fn implicit_intersection_calc_at<'a>(
     }
 }
 
-fn array_lifted_argument_positions(name: &str) -> Option<&'static [usize]> {
+fn array_lifted_argument_positions(name: &str, args_len: usize) -> Option<Vec<usize>> {
     match name.to_ascii_uppercase().as_str() {
-        "XLOOKUP" | "XMATCH" | "MATCH" | "LOOKUP" => Some(&[0]),
-        "INDEX" => Some(&[1, 2]),
-        "VLOOKUP" | "HLOOKUP" => Some(&[0, 2]),
-        "ABS" | "LEN" | "ISNUMBER" | "SQRT" => Some(&[0]),
-        "ROUND" | "MOD" | "EDATE" => Some(&[0, 1]),
-        "IF" => Some(&[0, 1, 2]),
+        "XLOOKUP" | "XMATCH" | "MATCH" | "LOOKUP" => Some(vec![0]),
+        "INDEX" => Some(vec![1, 2]),
+        "VLOOKUP" | "HLOOKUP" => Some(vec![0, 2]),
+        "ABS" | "LEN" | "ISNUMBER" | "SQRT" => Some(vec![0]),
+        "ROUND" | "MOD" | "EDATE" => Some(vec![0, 1]),
+        "IF" => Some(vec![0, 1, 2]),
+        "SWITCH" => {
+            let rest = args_len.saturating_sub(1);
+            let paired = rest - usize::from(rest % 2 == 1);
+            let mut positions = vec![0];
+            positions.extend((1..1 + paired).step_by(2));
+            Some(positions)
+        }
         _ => None,
     }
 }
@@ -584,7 +591,7 @@ impl<'a> Interpreter<'a> {
                         .map(|(rows, cols)| (rows as usize, cols as usize));
                 }
                 let canonical = function.name();
-                let positions = array_lifted_argument_positions(canonical)?;
+                let positions = array_lifted_argument_positions(canonical, args.len())?;
                 let shapes: Vec<_> = positions
                     .iter()
                     .filter_map(|position| args.get(*position))
@@ -872,8 +879,8 @@ impl<'a> Interpreter<'a> {
                         .map(|(rows, cols)| (rows as usize, cols as usize));
                 }
                 let canonical = function.name();
-                let positions = array_lifted_argument_positions(canonical)?;
                 let args = data_store.get_args(node_id)?;
+                let positions = array_lifted_argument_positions(canonical, args.len())?;
                 let shapes: Vec<_> = positions
                     .iter()
                     .filter_map(|position| args.get(*position))
@@ -1736,7 +1743,7 @@ impl<'a> Interpreter<'a> {
         row: usize,
         col: usize,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        let Some(lifted_positions) = array_lifted_argument_positions(fun.name()) else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len()) else {
             return fun.dispatch(handles, fctx);
         };
         if fun.name().eq_ignore_ascii_case("IF") {
@@ -1774,7 +1781,7 @@ impl<'a> Interpreter<'a> {
         row: usize,
         col: usize,
     ) -> Result<LiteralValue, ExcelError> {
-        let Some(lifted_positions) = array_lifted_argument_positions(fun.name()) else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len()) else {
             return fun
                 .dispatch(handles, fctx)
                 .map(|value| self.project_calc_value(value, row, col));
@@ -1933,7 +1940,7 @@ impl<'a> Interpreter<'a> {
         }
 
         let canonical_name = fun.name();
-        let Some(lifted_positions) = array_lifted_argument_positions(canonical_name) else {
+        let Some(lifted_positions) = array_lifted_argument_positions(canonical_name, handles.len()) else {
             return fun.dispatch(handles, fctx);
         };
 
@@ -2015,7 +2022,7 @@ impl<'a> Interpreter<'a> {
 
         let mut grids = Vec::with_capacity(lifted_positions.len());
         let mut shapes = Vec::with_capacity(lifted_positions.len());
-        for &position in lifted_positions {
+        for position in lifted_positions.iter().copied() {
             if let Some(handle) = handles.get(position) {
                 let grid = grid_from_handle(handle)?;
                 shapes.push(grid.shape());
@@ -2031,8 +2038,9 @@ impl<'a> Interpreter<'a> {
         if target == (1, 1) {
             return fun.dispatch(handles, fctx);
         }
+        let preserves_lazy_arms = canonical_name == "SWITCH";
         for (position, handle) in handles.iter().enumerate() {
-            if !lifted_positions.contains(&position) {
+            if !preserves_lazy_arms && !lifted_positions.contains(&position) {
                 handle.resolve_once()?;
             }
         }
