@@ -1270,15 +1270,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
 
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
-                ASTNodeType::Reference { .. } => {
-                    let view = self.range_view()?;
-                    let mut values: Vec<LiteralValue> = Vec::new();
-                    view.for_each_cell(&mut |v| {
-                        values.push(v.clone());
-                        Ok(())
-                    })?;
-                    Ok(Box::new(values.into_iter()))
-                }
+                ASTNodeType::Reference { .. } => resolved_values(self),
                 ASTNodeType::Array(rows) => {
                     struct ArrayEvalIter<'a, 'b> {
                         rows: &'a [Vec<ASTNode>],
@@ -1333,15 +1325,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 })?;
 
                 match node {
-                    crate::engine::arena::AstNodeData::Reference { .. } => {
-                        let view = self.range_view()?;
-                        let mut values: Vec<LiteralValue> = Vec::new();
-                        view.for_each_cell(&mut |v| {
-                            values.push(v.clone());
-                            Ok(())
-                        })?;
-                        Ok(Box::new(values.into_iter()))
-                    }
+                    crate::engine::arena::AstNodeData::Reference { .. } => resolved_values(self),
                     crate::engine::arena::AstNodeData::Array { .. } => {
                         let (rows, cols, elements) =
                             data_store.get_array_elems(*id).ok_or_else(|| {
