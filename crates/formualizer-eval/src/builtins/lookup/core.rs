@@ -249,6 +249,12 @@ impl Function for MatchFn {
             let current_sheet = ctx.current_sheet();
             match ctx.resolve_range_view(&r, current_sheet) {
                 Ok(rv) => {
+                    let (rows, cols) = rv.dims();
+                    if rows > 1 && cols > 1 {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                            ExcelError::new(ExcelErrorKind::Na),
+                        )));
+                    }
                     if mt == 0 {
                         let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
                         if !wildcard_mode {
@@ -373,7 +379,12 @@ impl Function for MatchFn {
             let v = args[1].value()?.into_literal();
             let values: Vec<LiteralValue> = match v {
                 LiteralValue::Array(rows) => {
-                    // Flatten the array (MATCH works on 1D, so take first row or column)
+                    let is_two_dimensional = rows.len() > 1 && rows.iter().any(|row| row.len() > 1);
+                    if is_two_dimensional {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                            ExcelError::new(ExcelErrorKind::Na),
+                        )));
+                    }
                     if rows.len() == 1 {
                         // Single row - use as-is
                         rows.into_iter().next().unwrap_or_default()
@@ -383,8 +394,7 @@ impl Function for MatchFn {
                             .filter_map(|r| r.into_iter().next())
                             .collect()
                     } else {
-                        // 2D array - flatten row by row
-                        rows.into_iter().flatten().collect()
+                        Vec::new()
                     }
                 }
                 other => vec![other],

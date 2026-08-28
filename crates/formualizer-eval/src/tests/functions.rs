@@ -99,6 +99,176 @@ fn concat_match_workbook() -> TestWorkbook {
     )
 }
 
+fn match_gate_workbook() -> TestWorkbook {
+    TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        5,
+        vec![
+            vec![LiteralValue::Int(10), LiteralValue::Int(20)],
+            vec![LiteralValue::Int(30), LiteralValue::Int(40)],
+        ],
+    )
+}
+
+fn assert_match_index(workbook: &TestWorkbook, formula: &str, expected: i64) {
+    assert_eq!(
+        evaluate_lifting_formula(workbook, formula),
+        LiteralValue::Int(expected),
+        "{formula}"
+    );
+}
+
+fn assert_match_na(workbook: &TestWorkbook, formula: &str) {
+    assert!(
+        matches!(
+            evaluate_lifting_formula(workbook, formula),
+            LiteralValue::Error(error) if error.kind == ExcelErrorKind::Na
+        ),
+        "{formula}"
+    );
+}
+
+#[test]
+fn match_gate_lift_1xn_num_first() {
+    assert_match_index(
+        &TestWorkbook::new(),
+        r#"=MATCH("2b",{1,2,3}&{"a","b","c"},0)"#,
+        2,
+    );
+}
+
+#[test]
+fn match_gate_lift_1xn_str_first() {
+    assert_match_index(
+        &TestWorkbook::new(),
+        r#"=MATCH("b2",{"a","b","c"}&{1,2,3},0)"#,
+        2,
+    );
+}
+
+#[test]
+fn match_gate_lift_1xn_scalar_rhs() {
+    assert_match_index(&TestWorkbook::new(), r#"=MATCH("2b",{1,2,3}&"b",0)"#, 2);
+}
+
+#[test]
+fn match_gate_lift_1xn_scalar_lhs() {
+    assert_match_index(&TestWorkbook::new(), r#"=MATCH("b2","b"&{1,2,3},0)"#, 2);
+}
+
+#[test]
+fn match_gate_lift_nx1_num_first() {
+    assert_match_index(
+        &TestWorkbook::new(),
+        r#"=MATCH("2b",{1;2;3}&{"a";"b";"c"},0)"#,
+        2,
+    );
+}
+
+#[test]
+fn match_gate_lift_nx1_str_first() {
+    assert_match_index(
+        &TestWorkbook::new(),
+        r#"=MATCH("b2",{"a";"b";"c"}&{1;2;3},0)"#,
+        2,
+    );
+}
+
+#[test]
+fn match_gate_literal_1xn() {
+    assert_match_index(&TestWorkbook::new(), "=MATCH(2,{1,2,3},0)", 2);
+}
+
+#[test]
+fn match_gate_literal_nx1() {
+    assert_match_index(&TestWorkbook::new(), "=MATCH(2,{1;2;3},0)", 2);
+}
+
+#[test]
+fn match_gate_rejects_lifted_2d_matching() {
+    assert_match_na(
+        &TestWorkbook::new(),
+        r#"=MATCH("2b",{1,2;3,4}&{"a","b";"c","d"},0)"#,
+    );
+}
+
+#[test]
+fn match_gate_rejects_lifted_2d_nonmatching() {
+    assert_match_na(
+        &TestWorkbook::new(),
+        r#"=MATCH("zz",{1,2;3,4}&{"a","b";"c","d"},0)"#,
+    );
+}
+
+#[test]
+fn match_gate_rejects_literal_2d() {
+    assert_match_na(&TestWorkbook::new(), "=MATCH(3,{1,2;3,4},0)");
+}
+
+#[test]
+fn match_gate_rejects_reference_2d() {
+    assert_match_na(&match_gate_workbook(), "=MATCH(30,E1:F2,0)");
+}
+
+#[test]
+fn match_gate_reference_1row() {
+    assert_match_index(&match_gate_workbook(), "=MATCH(20,E1:F1,0)", 2);
+}
+
+#[test]
+fn match_gate_reference_1col() {
+    assert_match_index(&match_gate_workbook(), "=MATCH(30,E1:E2,0)", 2);
+}
+
+#[test]
+fn match_gate_rejects_literal_2x3() {
+    assert_match_na(&TestWorkbook::new(), "=MATCH(3,{1,2,3;4,5,6},0)");
+}
+
+#[test]
+fn match_gate_rejects_literal_3x2() {
+    assert_match_na(&TestWorkbook::new(), "=MATCH(3,{1,2;3,4;5,6},0)");
+}
+
+#[test]
+fn match_gate_rejects_lifted_2x3() {
+    assert_match_na(
+        &TestWorkbook::new(),
+        r#"=MATCH("2b",{1,2,3;4,5,6}&{"a","b","c";"d","e","f"},0)"#,
+    );
+}
+
+#[test]
+fn match_gate_rejects_approx1_literal_2d() {
+    assert_match_na(&TestWorkbook::new(), "=MATCH(3,{1,2;3,4},1)");
+}
+
+#[test]
+fn match_gate_rejects_approxm1_literal_2d() {
+    assert_match_na(&TestWorkbook::new(), "=MATCH(3,{4,3;2,1},-1)");
+}
+
+#[test]
+fn match_gate_approx1_1d_exact() {
+    assert_match_index(&TestWorkbook::new(), "=MATCH(3,{1,3,4},1)", 2);
+}
+
+#[test]
+fn match_gate_approxm1_1d_exact() {
+    assert_match_index(&TestWorkbook::new(), "=MATCH(3,{4,3,1},-1)", 2);
+}
+
+#[test]
+fn match_gate_rejects_approx1_reference_2d() {
+    assert_match_na(&match_gate_workbook(), "=MATCH(30,E1:F2,1)");
+}
+
+#[test]
+fn match_gate_rejects_approxm1_reference_2d() {
+    assert_match_na(&match_gate_workbook(), "=MATCH(30,E1:F2,-1)");
+}
+
 #[test]
 fn range_concat_lifts_elementwise_direct_ast() {
     let wb = concat_match_workbook();
