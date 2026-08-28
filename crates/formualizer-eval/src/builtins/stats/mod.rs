@@ -104,6 +104,52 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
     Ok(out)
 }
 
+fn collect_large_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
+    let mut out = Vec::new();
+    for arg in args {
+        if let Some(values) = arg.comma_union_values() {
+            for value in values? {
+                match value {
+                    crate::traits::CalcValue::Range(view) => {
+                        view.for_each_cell(&mut |cell| {
+                            match cell {
+                                LiteralValue::Error(error) => return Err(error.clone()),
+                                LiteralValue::Number(number) => out.push(*number),
+                                LiteralValue::Int(integer) => out.push(*integer as f64),
+                                LiteralValue::Date(_)
+                                | LiteralValue::DateTime(_)
+                                | LiteralValue::Time(_)
+                                | LiteralValue::Duration(_) => {
+                                    if let Ok(number) = crate::coercion::to_serial_strict(
+                                        cell,
+                                        arg.date_system(),
+                                    ) {
+                                        out.push(number);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    value => {
+                        let literal = value.into_literal();
+                        if let LiteralValue::Error(error) = literal {
+                            return Err(error);
+                        }
+                        if let Ok(number) = coerce_num(&literal) {
+                            out.push(number);
+                        }
+                    }
+                }
+            }
+        } else {
+            out.extend(collect_numeric_stats(std::slice::from_ref(arg))?);
+        }
+    }
+    Ok(out)
+}
+
 /* ─────────────── order-statistic selection (quickselect) ───────────────
  *
  * LARGE/SMALL/MEDIAN and the PERCENTILE/QUARTILE family need at most two
@@ -520,7 +566,7 @@ impl Function for LARGE {
                 ExcelError::new_num(),
             )));
         }
-        let mut nums = collect_numeric_stats(&args[..args.len() - 1])?;
+        let mut nums = collect_large_numeric_stats(&args[..args.len() - 1])?;
         if nums.is_empty() || k as usize > nums.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),

@@ -21,6 +21,29 @@ fn evaluate_lifting_formula(wb: &TestWorkbook, formula: &str) -> LiteralValue {
     }
 }
 
+#[test]
+fn large_accepts_parenthesized_reference_union() {
+    let wb = TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![LiteralValue::Int(9)],
+            vec![LiteralValue::Int(5)],
+            vec![LiteralValue::Int(7)],
+        ],
+    );
+
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=LARGE((A1,A2,A3),1)"),
+        LiteralValue::Number(9.0)
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=LARGE(A1:A3,1)"),
+        LiteralValue::Number(9.0)
+    );
+}
+
 fn array_lifting_engine() -> crate::engine::Engine<TestWorkbook> {
     ensure_lifting_builtins();
     let mut engine =

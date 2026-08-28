@@ -406,6 +406,82 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// Evaluate the leaves of a parenthesized comma reference union.
+    ///
+    /// This is intentionally exposed only to functions with measured union semantics. A generic
+    /// comma value operator would broaden behavior for every function that receives a union.
+    pub(crate) fn comma_union_values(
+        &self,
+    ) -> Option<Result<Vec<crate::traits::CalcValue<'b>>, ExcelError>> {
+        if self.value_override.is_some() {
+            return None;
+        }
+
+        fn ast_leaves<'b>(
+            node: &ASTNode,
+            interp: &Interpreter<'b>,
+            out: &mut Vec<crate::traits::CalcValue<'b>>,
+        ) -> Result<(), ExcelError> {
+            if let ASTNodeType::BinaryOp { op, left, right } = &node.node_type
+                && op == ","
+            {
+                ast_leaves(left, interp, out)?;
+                ast_leaves(right, interp, out)?;
+            } else {
+                out.push(interp.evaluate_ast(node)?);
+            }
+            Ok(())
+        }
+
+        fn arena_leaves<'b>(
+            id: crate::engine::arena::AstNodeId,
+            interp: &Interpreter<'b>,
+            data_store: &crate::engine::arena::DataStore,
+            sheet_registry: &crate::engine::sheet_registry::SheetRegistry,
+            out: &mut Vec<crate::traits::CalcValue<'b>>,
+        ) -> Result<(), ExcelError> {
+            if let Some(crate::engine::arena::AstNodeData::BinaryOp {
+                op_id,
+                left_id,
+                right_id,
+            }) = data_store.get_node(id)
+                && data_store.resolve_ast_string(*op_id) == ","
+            {
+                arena_leaves(*left_id, interp, data_store, sheet_registry, out)?;
+                arena_leaves(*right_id, interp, data_store, sheet_registry, out)?;
+            } else {
+                out.push(interp.evaluate_arena_ast(id, data_store, sheet_registry)?);
+            }
+            Ok(())
+        }
+
+        let mut values = Vec::new();
+        let result = match &self.expr {
+            ArgumentExpr::Ast(node)
+                if matches!(&node.node_type, ASTNodeType::BinaryOp { op, .. } if op == ",") =>
+            {
+                ast_leaves(node, self.interp, &mut values)
+            }
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } if matches!(
+                data_store.get_node(*id),
+                Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. })
+                    if data_store.resolve_ast_string(*op_id) == ","
+            ) => arena_leaves(
+                *id,
+                self.interp,
+                data_store,
+                sheet_registry,
+                &mut values,
+            ),
+            _ => return None,
+        };
+        Some(result.map(|()| values))
+    }
+
     pub(crate) fn value_block_at(
         &self,
         row: usize,
