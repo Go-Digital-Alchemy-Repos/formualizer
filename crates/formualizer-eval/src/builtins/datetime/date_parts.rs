@@ -388,28 +388,68 @@ impl Function for YearFracFn {
 
         let actual_days = (e - s).num_days() as f64;
         let frac = match basis {
-            0 | 4 => {
-                // MS-OI29500 2.1.1072(a): YEARFRAC maps February 28/29 and day 31
-                // to day 30 for its documented 30/360 bases.
-                let adjusted_day = |date: NaiveDate| {
-                    if (date.month() == 2 && matches!(date.day(), 28 | 29)) || date.day() == 31 {
-                        30
-                    } else {
-                        date.day()
-                    }
-                };
+            0 => {
+                // ODF 1.3 4.11.7 Procedure A (US NASD 30/360). The rules are
+                // ordered and the end-day adjustment depends on the adjusted start day.
+                let start_is_last_february = s.month() == 2 && is_last_day_of_month(s);
+                let end_is_last_february = e.month() == 2 && is_last_day_of_month(e);
+                let mut start_day = s.day();
+                let mut end_day = e.day();
+                if start_day == 31 {
+                    start_day = 30;
+                }
+                if start_day == 30 && end_day == 31 {
+                    end_day = 30;
+                }
+                if start_is_last_february && end_is_last_february {
+                    end_day = 30;
+                }
+                if start_is_last_february {
+                    start_day = 30;
+                }
                 let days = (e.year() - s.year()) * 360
                     + (e.month() as i32 - s.month() as i32) * 30
-                    + adjusted_day(e) as i32
-                    - adjusted_day(s) as i32;
+                    + end_day as i32
+                    - start_day as i32;
+                days as f64 / 360.0
+            }
+            4 => {
+                // ODF 1.3 4.11.7 Procedure C (European 30/360).
+                let start_day = if s.day() == 31 { 30 } else { s.day() };
+                let end_day = if e.day() == 31 { 30 } else { e.day() };
+                let days = (e.year() - s.year()) * 360
+                    + (e.month() as i32 - s.month() as i32) * 30
+                    + end_day as i32
+                    - start_day as i32;
                 days as f64 / 360.0
             }
             1 => {
-                // MS-OI29500 2.1.1072(d): use the average length of every calendar
-                // year crossed, regardless of where the endpoints fall in those years.
-                let year_count = (e.year() - s.year() + 1) as f64;
-                let total_year_days: f64 = (s.year()..=e.year()).map(days_in_year).sum();
-                actual_days / (total_year_days / year_count)
+                // ODF 1.3 4.11.7 Procedure E, with the corrected F-gate reading.
+                let different_year = s.year() != e.year();
+                let not_adjacent_year = e.year() != s.year() + 1;
+                let start_month_before_end = s.month() < e.month();
+                let same_month = s.month() == e.month();
+                let start_day_before_end = s.day() < e.day();
+                let use_average = (different_year && not_adjacent_year)
+                    || (different_year && start_month_before_end)
+                    || (different_year && same_month && start_day_before_end);
+                let denominator = if use_average {
+                    let year_count = (e.year() - s.year() + 1) as f64;
+                    let total_year_days: f64 = (s.year()..=e.year()).map(days_in_year).sum();
+                    total_year_days / year_count
+                } else {
+                    let same_leap_year = s.year() == e.year() && days_in_year(s.year()) == 366.0;
+                    let contains_february_29 = (s.year()..=e.year()).any(|year| {
+                        NaiveDate::from_ymd_opt(year, 2, 29)
+                            .is_some_and(|february_29| s <= february_29 && february_29 <= e)
+                    });
+                    if same_leap_year || contains_february_29 {
+                        366.0
+                    } else {
+                        365.0
+                    }
+                };
+                actual_days / denominator
             }
             2 => actual_days / 360.0,
             3 => actual_days / 365.0,
@@ -1226,7 +1266,7 @@ mod tests {
                 (2026, 1, 1),
                 (2026, 1, 31),
                 [
-                    29.0 / 360.0,
+                    30.0 / 360.0,
                     30.0 / 365.0,
                     30.0 / 360.0,
                     30.0 / 365.0,
@@ -1248,11 +1288,11 @@ mod tests {
                 (2024, 2, 28),
                 (2024, 3, 1),
                 [
-                    1.0 / 360.0,
+                    3.0 / 360.0,
                     2.0 / 366.0,
                     2.0 / 360.0,
                     2.0 / 365.0,
-                    1.0 / 360.0,
+                    3.0 / 360.0,
                 ],
             ),
             (
@@ -1293,6 +1333,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn yearfrac_serial_value(start: f64, end: f64, basis: i64) -> f64 {
+        let wb = TestWorkbook::new().with_function(Arc::new(YearFracFn));
+        let ctx = wb.interpreter();
+        let function = ctx.context.get_function("", "YEARFRAC").unwrap();
+        let start = lit(LiteralValue::Number(start));
+        let end = lit(LiteralValue::Number(end));
+        let basis = lit(LiteralValue::Int(basis));
+        match function
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&start, &ctx),
+                    ArgumentHandle::new(&end, &ctx),
+                    ArgumentHandle::new(&basis, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal()
+        {
+            LiteralValue::Number(value) => value,
+            other => panic!("expected numeric YEARFRAC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yearfrac_director_headline_serials_agree_in_both_argument_orders() {
+        let cases = [
+            (46023.0, 46053.0, 0, 30.0 / 360.0),
+            (45350.0, 45352.0, 0, 3.0 / 360.0),
+            (45350.0, 45352.0, 4, 3.0 / 360.0),
+            (45351.0, 45716.0, 4, 359.0 / 360.0),
+            (45350.0, 45716.0, 1, 1.0),
+            (45261.0, 45306.0, 1, 45.0 / 365.0),
+        ];
+        for (start, end, basis, expected) in cases {
+            for (left, right) in [(start, end), (end, start)] {
+                let actual = yearfrac_serial_value(left, right, basis);
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "YEARFRAC({left},{right},{basis}) = {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yearfrac_basis4_full_policy_year_roundup_idiom_is_one() {
+        use crate::builtins::math::numeric::RoundUpFn;
+
+        let fraction = yearfrac_serial_value(45351.0, 45716.0, 4);
+        let wb = TestWorkbook::new().with_function(Arc::new(RoundUpFn));
+        let ctx = wb.interpreter();
+        let function = ctx.context.get_function("", "ROUNDUP").unwrap();
+        let number = lit(LiteralValue::Number(0.000001 + fraction));
+        let digits = lit(LiteralValue::Int(0));
+        let actual = function
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&number, &ctx),
+                    ArgumentHandle::new(&digits, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+        assert_eq!(actual, LiteralValue::Number(1.0));
     }
 
     fn eval_date_part_formula(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
