@@ -110,7 +110,7 @@ fn collect_large_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, Exce
         if let Some(values) = arg.comma_union_values() {
             for value in values? {
                 match value {
-                    crate::traits::CalcValue::Range(view) => {
+                    crate::traits::ResolvedArgument::Range(view) => {
                         view.for_each_cell(&mut |cell| {
                             match cell {
                                 LiteralValue::Error(error) => return Err(error.clone()),
@@ -120,10 +120,9 @@ fn collect_large_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, Exce
                                 | LiteralValue::DateTime(_)
                                 | LiteralValue::Time(_)
                                 | LiteralValue::Duration(_) => {
-                                    if let Ok(number) = crate::coercion::to_serial_strict(
-                                        cell,
-                                        arg.date_system(),
-                                    ) {
+                                    if let Ok(number) =
+                                        crate::coercion::to_serial_strict(cell, arg.date_system())
+                                    {
                                         out.push(number);
                                     }
                                 }
@@ -132,7 +131,8 @@ fn collect_large_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, Exce
                             Ok(())
                         })?;
                     }
-                    value => {
+                    crate::traits::ResolvedArgument::ReferenceError(error) => return Err(error),
+                    crate::traits::ResolvedArgument::Value(value) => {
                         let literal = value.into_literal();
                         if let LiteralValue::Error(error) = literal {
                             return Err(error);

@@ -44,6 +44,37 @@ fn large_accepts_parenthesized_reference_union() {
     );
 }
 
+#[test]
+fn large_union_keeps_reference_cell_coercion_rules() {
+    let wb = TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![LiteralValue::Boolean(true)],
+            vec![LiteralValue::Int(2)],
+            vec![LiteralValue::Text("9".into())],
+        ],
+    );
+
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=LARGE((A1,A2),2)"),
+        LiteralValue::Error(formualizer_common::ExcelError::new(ExcelErrorKind::Num))
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=LARGE((A2,A3),2)"),
+        LiteralValue::Error(formualizer_common::ExcelError::new(ExcelErrorKind::Num))
+    );
+    assert!(matches!(
+        evaluate_lifting_formula(&wb, "=LARGE((1,2),1)"),
+        LiteralValue::Error(error) if error.kind == ExcelErrorKind::Value
+    ));
+    assert!(matches!(
+        evaluate_lifting_formula(&wb, "=LARGE((A2,3),1)"),
+        LiteralValue::Error(error) if error.kind == ExcelErrorKind::Value
+    ));
+}
+
 fn concat_match_workbook() -> TestWorkbook {
     TestWorkbook::new().with_range(
         "Sheet1",
@@ -89,10 +120,8 @@ fn range_concat_lifts_elementwise_direct_ast() {
 #[test]
 fn range_concat_lifts_elementwise_engine_arena() {
     ensure_lifting_builtins();
-    let mut engine = crate::engine::Engine::new(
-        TestWorkbook::new(),
-        crate::engine::EvalConfig::default(),
-    );
+    let mut engine =
+        crate::engine::Engine::new(TestWorkbook::new(), crate::engine::EvalConfig::default());
     for (row, col, value) in [
         (1, 3, LiteralValue::Text("B".into())),
         (1, 4, LiteralValue::Int(2)),
@@ -112,16 +141,58 @@ fn range_concat_lifts_elementwise_engine_arena() {
             "Sheet1",
             1,
             1,
-            formualizer_parse::parser::parse(
-                "=MATCH($C$1&$D$1,OFFSET($E$1:$G$1,0,0)&$E$2:$G$2,0)",
-            )
-            .expect("valid arena concat formula"),
+            formualizer_parse::parser::parse("=MATCH($C$1&$D$1,OFFSET($E$1:$G$1,0,0)&$E$2:$G$2,0)")
+                .expect("valid arena concat formula"),
         )
         .expect("set arena concat formula");
-    engine.evaluate_all().expect("evaluate arena concat formula");
+    engine
+        .evaluate_all()
+        .expect("evaluate arena concat formula");
     assert_eq!(
-        engine.get_cell_value("Sheet1", 1, 1).expect("concat result"),
+        engine
+            .get_cell_value("Sheet1", 1, 1)
+            .expect("concat result"),
         LiteralValue::Number(2.0)
+    );
+}
+
+#[test]
+fn range_concat_shape_discovery_does_not_evaluate_untaken_if_arm() {
+    ensure_lifting_builtins();
+    use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, EvalConfig};
+    let mut engine = crate::engine::Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy: CyclePolicy::Error,
+        }),
+    );
+    for row in 1..=3 {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(1))
+            .expect("set IF condition");
+    }
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            2,
+            3,
+            formualizer_parse::parser::parse("=$F$4").expect("valid back edge"),
+        )
+        .expect("set back edge");
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            4,
+            6,
+            formualizer_parse::parser::parse("=SUM(IF(A1:A3=1,10,OFFSET(E1:E3,C2,0)))")
+                .expect("valid IF formula"),
+        )
+        .expect("set IF formula");
+    engine.evaluate_all().expect("evaluate lazy IF formula");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 4, 6).expect("IF sum"),
+        LiteralValue::Number(30.0)
     );
 }
 
@@ -138,10 +209,7 @@ fn switch_array_lifts_and_preserves_lazy_arms_direct_ast() {
         ],
     );
     assert_eq!(
-        evaluate_lifting_formula(
-            &wb,
-            "=SUM(SWITCH(TRUE,A1:A3=1,10,A1:A3=2,20,0))",
-        ),
+        evaluate_lifting_formula(&wb, "=SUM(SWITCH(TRUE,A1:A3=1,10,A1:A3=2,20,0))",),
         LiteralValue::Number(40.0)
     );
     assert_eq!(
@@ -155,6 +223,76 @@ fn switch_array_lifts_and_preserves_lazy_arms_direct_ast() {
     assert_eq!(
         evaluate_lifting_formula(&wb, "=SUM(SWITCH(TRUE,A1:A3>0,10,1/0))"),
         LiteralValue::Number(30.0)
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=SWITCH(TRUE,A1:A3=1,10)"),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0)],
+            vec![LiteralValue::Error(formualizer_common::ExcelError::new(
+                ExcelErrorKind::Na
+            ))],
+            vec![LiteralValue::Number(10.0)],
+        ])
+    );
+
+    let circular = LiteralValue::Error(formualizer_common::ExcelError::new(ExcelErrorKind::Circ));
+    let wb_with_circular_reference = TestWorkbook::new()
+        .with_range(
+            "Sheet1",
+            1,
+            1,
+            vec![
+                vec![LiteralValue::Int(1)],
+                vec![LiteralValue::Int(2)],
+                vec![LiteralValue::Int(1)],
+            ],
+        )
+        .with_range(
+            "Sheet1",
+            1,
+            4,
+            vec![
+                vec![circular.clone()],
+                vec![circular.clone()],
+                vec![circular],
+            ],
+        );
+    assert_eq!(
+        evaluate_lifting_formula(
+            &wb_with_circular_reference,
+            "=SUM(SWITCH(TRUE,A1:A3>0,10,OFFSET(D1:D3,0,0)))",
+        ),
+        LiteralValue::Number(30.0)
+    );
+
+    let wb = wb
+        .with_range(
+            "Sheet1",
+            1,
+            2,
+            vec![
+                vec![LiteralValue::Int(10)],
+                vec![LiteralValue::Int(20)],
+                vec![LiteralValue::Int(30)],
+            ],
+        )
+        .with_range(
+            "Sheet1",
+            1,
+            3,
+            vec![
+                vec![LiteralValue::Int(100)],
+                vec![LiteralValue::Int(200)],
+                vec![LiteralValue::Int(300)],
+            ],
+        );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=SWITCH(TRUE,A1:A3=1,B1:B3,A1:A3=2,C1:C3)"),
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(10.0)],
+            vec![LiteralValue::Number(200.0)],
+            vec![LiteralValue::Number(30.0)],
+        ])
     );
 }
 
@@ -173,6 +311,12 @@ fn switch_array_lift_engine_ignores_untaken_error_and_back_edge() {
         engine
             .set_cell_value("Sheet1", row, 1, LiteralValue::Int(1))
             .expect("set SWITCH condition value");
+        engine
+            .set_cell_value("Sheet1", row, 4, LiteralValue::Int(row as i64 * 10))
+            .expect("set first SWITCH result range");
+        engine
+            .set_cell_value("Sheet1", row, 5, LiteralValue::Int(row as i64 * 100))
+            .expect("set second SWITCH result range");
     }
     engine
         .set_cell_formula(
@@ -193,11 +337,32 @@ fn switch_array_lift_engine_ignores_untaken_error_and_back_edge() {
             .expect("valid arena SWITCH formula"),
         )
         .expect("set arena SWITCH formula");
-    engine.evaluate_all().expect("untaken SWITCH arms stay lazy");
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            4,
+            7,
+            formualizer_parse::parser::parse(
+                "=SWITCH(TRUE,$A$1:$A$3=1,$D$1:$D$3,$A$1:$A$3=2,$E$1:$E$3)",
+            )
+            .expect("valid arena SWITCH range-result formula"),
+        )
+        .expect("set arena SWITCH range-result formula");
+    engine
+        .evaluate_all()
+        .expect("untaken SWITCH arms stay lazy");
     assert_eq!(
         engine.get_cell_value("Sheet1", 4, 6).expect("SWITCH sum"),
         LiteralValue::Number(30.0)
     );
+    for (row, expected) in [(4, 10), (5, 20), (6, 30)] {
+        assert_eq!(
+            engine
+                .get_cell_value("Sheet1", row, 7)
+                .expect("SWITCH projected result"),
+            LiteralValue::Number(expected as f64)
+        );
+    }
 }
 
 #[test]
@@ -1828,9 +1993,12 @@ fn binary_lifted_scalar_override_cannot_reenter_reference_resolution() {
     let interpreter = workbook.interpreter();
     let ast = formualizer_parse::parser::parse("=OFFSET(C1:E1,0,0)")
         .expect("valid reference-returning OFFSET");
-    let handle = ArgumentHandle::new(&ast, &interpreter)
-        .with_scalar_value(LiteralValue::Text("B".into()));
+    let handle =
+        ArgumentHandle::new(&ast, &interpreter).with_scalar_value(LiteralValue::Text("B".into()));
 
     assert!(!handle.may_return_reference());
-    assert_eq!(handle.value_at(0, 0).unwrap(), LiteralValue::Text("B".into()));
+    assert_eq!(
+        handle.value_at(0, 0).unwrap(),
+        LiteralValue::Text("B".into())
+    );
 }

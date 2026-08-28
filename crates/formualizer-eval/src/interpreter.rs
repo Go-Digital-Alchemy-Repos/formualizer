@@ -4,6 +4,16 @@ use crate::{
     coercion,
     traits::{ArgumentHandle, DefaultFunctionContext, EvaluationContext},
 };
+
+fn calc_value_shape(value: &crate::traits::CalcValue<'_>) -> (usize, usize) {
+    match value {
+        crate::traits::CalcValue::Range(view) => view.dims(),
+        crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => {
+            (rows.len(), rows.first().map_or(0, Vec::len))
+        }
+        _ => (1, 1),
+    }
+}
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 use rustc_hash::FxHashMap;
@@ -579,17 +589,6 @@ impl<'a> Interpreter<'a> {
             .ok(),
             ASTNodeType::Function { name, args } => {
                 let function = self.context.get_function("", name)?;
-                if self
-                    .context
-                    .function_capabilities("", name)
-                    .is_some_and(|caps| {
-                        caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
-                    })
-                    && let Some(Ok(reference)) = self.try_evaluate_ast_as_reference(node)
-                {
-                    return probe_range_dimensions(self.context, self.current_sheet, &reference)
-                        .map(|(rows, cols)| (rows as usize, cols as usize));
-                }
                 let canonical = function.name();
                 let positions = array_lifted_argument_positions(canonical, args.len())?;
                 let shapes: Vec<_> = positions
@@ -629,6 +628,22 @@ impl<'a> Interpreter<'a> {
                 self.evaluate_ast_at(cell, 0, 0)
             }
             ASTNodeType::BinaryOp { op, left, right } => {
+                if op == "&" {
+                    let left = self.evaluate_ast(left)?;
+                    let right = self.evaluate_ast(right)?;
+                    let left_shape = calc_value_shape(&left);
+                    let right_shape = calc_value_shape(&right);
+                    broadcast_shape(&[left_shape, right_shape])?;
+                    let left_index = project_index((row, col), left_shape);
+                    let right_index = project_index((row, col), right_shape);
+                    let left = self.project_calc_value(left, left_index.0, left_index.1);
+                    let right = self.project_calc_value(right, right_index.0, right_index.1);
+                    let left = ASTNode::new(ASTNodeType::Literal(left), None);
+                    let right = ASTNode::new(ASTNodeType::Literal(right), None);
+                    return self
+                        .eval_binary(op, &left, &right)
+                        .map(crate::traits::CalcValue::into_literal);
+                }
                 let left_shape = self.ast_shape_hint(left).unwrap_or((1, 1));
                 let right_shape = self.ast_shape_hint(right).unwrap_or((1, 1));
                 broadcast_shape(&[left_shape, right_shape])?;
@@ -863,21 +878,6 @@ impl<'a> Interpreter<'a> {
             AstNodeData::Function { name_id, .. } => {
                 let raw_name = data_store.resolve_ast_string(*name_id);
                 let function = self.context.get_function("", raw_name)?;
-                if self
-                    .context
-                    .function_capabilities("", raw_name)
-                    .is_some_and(|caps| {
-                        caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
-                    })
-                    && let Some(Ok(reference)) = self.try_evaluate_arena_ast_as_reference(
-                        node_id,
-                        data_store,
-                        sheet_registry,
-                    )
-                {
-                    return probe_range_dimensions(self.context, self.current_sheet, &reference)
-                        .map(|(rows, cols)| (rows as usize, cols as usize));
-                }
                 let canonical = function.name();
                 let args = data_store.get_args(node_id)?;
                 let positions = array_lifted_argument_positions(canonical, args.len())?;
@@ -938,6 +938,23 @@ impl<'a> Interpreter<'a> {
                 left_id,
                 right_id,
             } => {
+                let op = data_store.resolve_ast_string(*op_id);
+                if op == "&" {
+                    let left = self.evaluate_arena_ast(*left_id, data_store, sheet_registry)?;
+                    let right = self.evaluate_arena_ast(*right_id, data_store, sheet_registry)?;
+                    let left_shape = calc_value_shape(&left);
+                    let right_shape = calc_value_shape(&right);
+                    broadcast_shape(&[left_shape, right_shape])?;
+                    let left_index = project_index((row, col), left_shape);
+                    let right_index = project_index((row, col), right_shape);
+                    let left = self.project_calc_value(left, left_index.0, left_index.1);
+                    let right = self.project_calc_value(right, right_index.0, right_index.1);
+                    let left = ASTNode::new(ASTNodeType::Literal(left), None);
+                    let right = ASTNode::new(ASTNodeType::Literal(right), None);
+                    return self
+                        .eval_binary(op, &left, &right)
+                        .map(crate::traits::CalcValue::into_literal);
+                }
                 let left_shape = self
                     .arena_shape_hint(*left_id, data_store, sheet_registry)
                     .unwrap_or((1, 1));
@@ -963,7 +980,7 @@ impl<'a> Interpreter<'a> {
                 )?;
                 let left = ASTNode::new(ASTNodeType::Literal(left), None);
                 let right = ASTNode::new(ASTNodeType::Literal(right), None);
-                self.eval_binary(data_store.resolve_ast_string(*op_id), &left, &right)
+                self.eval_binary(op, &left, &right)
                     .map(crate::traits::CalcValue::into_literal)
             }
             AstNodeData::UnaryOp { op_id, expr_id } => {
@@ -1167,18 +1184,15 @@ impl<'a> Interpreter<'a> {
                     self.evaluate_arena_ast(node_id, data_store, sheet_registry)
                 };
 
-                let evaluate_operand =
-                    |node_id| match if op == "&" {
-                        evaluate_concat_operand(node_id)
-                    } else {
-                        self.evaluate_arena_ast(node_id, data_store, sheet_registry)
-                    } {
-                        Ok(value) => Ok(value),
-                        Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
-                        Err(error) => {
-                            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)))
-                        }
-                    };
+                let evaluate_operand = |node_id| match if op == "&" {
+                    evaluate_concat_operand(node_id)
+                } else {
+                    self.evaluate_arena_ast(node_id, data_store, sheet_registry)
+                } {
+                    Ok(value) => Ok(value),
+                    Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+                    Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+                };
                 let left_calc = evaluate_operand(*left_id)?;
                 let left_format = left_calc.format_id();
                 let left = left_calc.into_literal();
@@ -1743,7 +1757,8 @@ impl<'a> Interpreter<'a> {
         row: usize,
         col: usize,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len()) else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len())
+        else {
             return fun.dispatch(handles, fctx);
         };
         if fun.name().eq_ignore_ascii_case("IF") {
@@ -1781,7 +1796,8 @@ impl<'a> Interpreter<'a> {
         row: usize,
         col: usize,
     ) -> Result<LiteralValue, ExcelError> {
-        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len()) else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len())
+        else {
             return fun
                 .dispatch(handles, fctx)
                 .map(|value| self.project_calc_value(value, row, col));
@@ -1940,7 +1956,8 @@ impl<'a> Interpreter<'a> {
         }
 
         let canonical_name = fun.name();
-        let Some(lifted_positions) = array_lifted_argument_positions(canonical_name, handles.len()) else {
+        let Some(lifted_positions) = array_lifted_argument_positions(canonical_name, handles.len())
+        else {
             return fun.dispatch(handles, fctx);
         };
 
@@ -2064,6 +2081,9 @@ impl<'a> Interpreter<'a> {
                     })
                     .collect();
                 let value = match fun.dispatch(&cell_handles, fctx) {
+                    Ok(value) if preserves_lazy_arms => {
+                        LiftGrid::Scalar(self.project_calc_value(value, row, col))
+                    }
                     Ok(value) => grid_from_calc(value),
                     Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
                     Err(error) => LiftGrid::Scalar(LiteralValue::Error(error)),

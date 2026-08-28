@@ -270,7 +270,7 @@ impl Function for Days360Fn {
 ///
 /// # Remarks
 /// - Supported `basis` values: `0` (US 30/360), `1` (actual/actual), `2` (actual/360), `3` (actual/365), `4` (European 30/360).
-/// - If `start_date > end_date`, the result is negative.
+/// - If `start_date > end_date`, Excel swaps the dates and returns the same positive fraction.
 /// - Invalid `basis` values return `#NUM!`.
 /// - Serial dates are interpreted with the workbook's date system (Excel 1900 or Excel 1904).
 ///
@@ -380,38 +380,43 @@ impl Function for YearFracFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
         }
 
-        let (s, e, sign) = if start <= end {
-            (start, end, 1.0)
+        let (s, e) = if start <= end {
+            (start, end)
         } else {
-            (end, start, -1.0)
+            (end, start)
         };
 
         let actual_days = (e - s).num_days() as f64;
         let frac = match basis {
-            0 => days_360_between(s, e, false) as f64 / 360.0,
-            1 => {
-                if s.year() == e.year() {
-                    actual_days / days_in_year(s.year())
-                } else {
-                    let start_year_end = NaiveDate::from_ymd_opt(s.year() + 1, 1, 1).unwrap();
-                    let end_year_start = NaiveDate::from_ymd_opt(e.year(), 1, 1).unwrap();
-
-                    let mut out = (start_year_end - s).num_days() as f64 / days_in_year(s.year());
-                    for year in (s.year() + 1)..e.year() {
-                        out += 1.0;
+            0 | 4 => {
+                // MS-OI29500 2.1.1072(a): YEARFRAC maps February 28/29 and day 31
+                // to day 30 for its documented 30/360 bases.
+                let adjusted_day = |date: NaiveDate| {
+                    if (date.month() == 2 && matches!(date.day(), 28 | 29)) || date.day() == 31 {
+                        30
+                    } else {
+                        date.day()
                     }
-                    out + (e - end_year_start).num_days() as f64 / days_in_year(e.year())
-                }
+                };
+                let days = (e.year() - s.year()) * 360
+                    + (e.month() as i32 - s.month() as i32) * 30
+                    + adjusted_day(e) as i32
+                    - adjusted_day(s) as i32;
+                days as f64 / 360.0
+            }
+            1 => {
+                // MS-OI29500 2.1.1072(d): use the average length of every calendar
+                // year crossed, regardless of where the endpoints fall in those years.
+                let year_count = (e.year() - s.year() + 1) as f64;
+                let total_year_days: f64 = (s.year()..=e.year()).map(days_in_year).sum();
+                actual_days / (total_year_days / year_count)
             }
             2 => actual_days / 360.0,
             3 => actual_days / 365.0,
-            4 => days_360_between(s, e, true) as f64 / 360.0,
             _ => unreachable!(),
         };
 
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            sign * frac,
-        )))
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(frac)))
     }
 }
 
@@ -1209,6 +1214,85 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(iso, LiteralValue::Int(53));
+    }
+
+    #[test]
+    fn yearfrac_is_order_independent_with_documented_basis_magnitudes() {
+        let wb = TestWorkbook::new().with_function(Arc::new(YearFracFn));
+        let ctx = wb.interpreter();
+        let function = ctx.context.get_function("", "YEARFRAC").unwrap();
+        let cases = [
+            (
+                (2026, 1, 1),
+                (2026, 1, 31),
+                [
+                    29.0 / 360.0,
+                    30.0 / 365.0,
+                    30.0 / 360.0,
+                    30.0 / 365.0,
+                    29.0 / 360.0,
+                ],
+            ),
+            (
+                (2026, 1, 31),
+                (2026, 3, 31),
+                [
+                    1.0 / 6.0,
+                    59.0 / 365.0,
+                    59.0 / 360.0,
+                    59.0 / 365.0,
+                    1.0 / 6.0,
+                ],
+            ),
+            (
+                (2024, 2, 28),
+                (2024, 3, 1),
+                [
+                    1.0 / 360.0,
+                    2.0 / 366.0,
+                    2.0 / 360.0,
+                    2.0 / 365.0,
+                    1.0 / 360.0,
+                ],
+            ),
+            (
+                (2023, 6, 15),
+                (2026, 6, 15),
+                [3.0, 4384.0 / 1461.0, 1096.0 / 360.0, 1096.0 / 365.0, 3.0],
+            ),
+        ];
+        for (start_parts, end_parts, expected_by_basis) in cases {
+            let start_date =
+                chrono::NaiveDate::from_ymd_opt(start_parts.0, start_parts.1, start_parts.2)
+                    .unwrap();
+            let end_date =
+                chrono::NaiveDate::from_ymd_opt(end_parts.0, end_parts.1, end_parts.2).unwrap();
+            for (basis, expected) in expected_by_basis.into_iter().enumerate() {
+                for (start, end) in [(start_date, end_date), (end_date, start_date)] {
+                    let start = lit(LiteralValue::Date(start));
+                    let end = lit(LiteralValue::Date(end));
+                    let basis = lit(LiteralValue::Int(basis as i64));
+                    let actual = function
+                        .dispatch(
+                            &[
+                                ArgumentHandle::new(&start, &ctx),
+                                ArgumentHandle::new(&end, &ctx),
+                                ArgumentHandle::new(&basis, &ctx),
+                            ],
+                            &ctx.function_context(None),
+                        )
+                        .unwrap()
+                        .into_literal();
+                    match actual {
+                        LiteralValue::Number(value) => assert!(
+                            (value - expected).abs() < 1e-12,
+                            "YEARFRAC {start_parts:?} {end_parts:?} basis {basis:?}: {value} != {expected}"
+                        ),
+                        other => panic!("expected numeric YEARFRAC, got {other:?}"),
+                    }
+                }
+            }
+        }
     }
 
     fn eval_date_part_formula(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
