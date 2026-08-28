@@ -19,6 +19,78 @@ fn canonical_cfg() -> EvalConfig {
 }
 
 #[test]
+fn named_ranges_work_in_reference_taking_arguments() {
+    let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
+    for (row, col, value) in [
+        (1, 1, 10.0),
+        (1, 2, 11.0),
+        (2, 1, 20.0),
+        (2, 2, 22.0),
+        (3, 1, 60.0),
+        (3, 2, 75.0),
+        (1, 4, 20.0),
+        (2, 4, 30.0),
+        (3, 4, 40.0),
+        (1, 6, 5.0),
+        (1, 7, 10.0),
+    ] {
+        engine
+            .set_cell_value("Sheet1", row, col, LiteralValue::Number(value))
+            .unwrap();
+    }
+    let sid = engine.sheet_id("Sheet1").unwrap();
+    let range = |sr, sc, er, ec| {
+        RangeRef::new(
+            CellRef::new(sid, Coord::from_excel(sr, sc, true, true)),
+            CellRef::new(sid, Coord::from_excel(er, ec, true, true)),
+        )
+    };
+    for (name, definition) in [
+        ("JF", range(1, 1, 3, 2)),
+        ("AGES", range(1, 4, 3, 4)),
+        ("YEARS", range(1, 6, 1, 7)),
+    ] {
+        engine
+            .define_name(
+                name,
+                NamedDefinition::Range(definition),
+                NameScope::Workbook,
+            )
+            .unwrap();
+    }
+    for (row, formula) in [
+        (1, "=INDEX(JF,2,2)"),
+        (2, "=OFFSET(JF,1,1,1,1)"),
+        (3, "=VLOOKUP(20,JF,2,FALSE)"),
+        (4, "=SUM(JF)"),
+        (5, "=MATCH(35,AGES,1)"),
+        (6, "=MATCH(35,D1:D3,1)"),
+        (7, "=INDEX(JF,MATCH(35,AGES,1),MATCH(10,YEARS,0))"),
+    ] {
+        engine
+            .set_cell_formula("Sheet1", row, 10, parse(formula).unwrap())
+            .unwrap();
+    }
+
+    engine.evaluate_all().unwrap();
+    for (row, expected) in [
+        (1, 22.0),
+        (2, 22.0),
+        (3, 22.0),
+        (4, 198.0),
+        (5, 2.0),
+        (6, 2.0),
+        (7, 22.0),
+    ] {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row, 10),
+            Some(LiteralValue::Number(expected)),
+            "named-range formula row {row}"
+        );
+    }
+}
+
+#[test]
 fn workbook_named_literal_invalidation_updates_dependents() {
     let mut engine = Engine::new(TestWorkbook::new(), canonical_cfg());
 

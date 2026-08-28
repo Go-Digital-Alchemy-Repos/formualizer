@@ -125,6 +125,19 @@ fn resolve_reference_bounds<'b>(
         ReferenceType::Cell {
             sheet, row, col, ..
         } => Ok((sheet.clone(), *row, *col, *row, *col)),
+        ReferenceType::NamedRange(_) => {
+            let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
+            if rv.is_empty() {
+                return Err(ExcelError::new(ExcelErrorKind::Ref));
+            }
+            Ok((
+                Some(rv.sheet_name().to_string()),
+                rv.start_row() as u32 + 1,
+                rv.start_col() as u32 + 1,
+                rv.end_row() as u32 + 1,
+                rv.end_col() as u32 + 1,
+            ))
+        }
         _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
     }
 }
