@@ -571,7 +571,19 @@ impl<'a> Interpreter<'a> {
             ])
             .ok(),
             ASTNodeType::Function { name, args } => {
-                let canonical = self.context.get_function("", name)?.name();
+                let function = self.context.get_function("", name)?;
+                if self
+                    .context
+                    .function_capabilities("", name)
+                    .is_some_and(|caps| {
+                        caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
+                    })
+                    && let Some(Ok(reference)) = self.try_evaluate_ast_as_reference(node)
+                {
+                    return probe_range_dimensions(self.context, self.current_sheet, &reference)
+                        .map(|(rows, cols)| (rows as usize, cols as usize));
+                }
+                let canonical = function.name();
                 let positions = array_lifted_argument_positions(canonical)?;
                 let shapes: Vec<_> = positions
                     .iter()
@@ -843,7 +855,23 @@ impl<'a> Interpreter<'a> {
             .ok(),
             AstNodeData::Function { name_id, .. } => {
                 let raw_name = data_store.resolve_ast_string(*name_id);
-                let canonical = self.context.get_function("", raw_name)?.name();
+                let function = self.context.get_function("", raw_name)?;
+                if self
+                    .context
+                    .function_capabilities("", raw_name)
+                    .is_some_and(|caps| {
+                        caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
+                    })
+                    && let Some(Ok(reference)) = self.try_evaluate_arena_ast_as_reference(
+                        node_id,
+                        data_store,
+                        sheet_registry,
+                    )
+                {
+                    return probe_range_dimensions(self.context, self.current_sheet, &reference)
+                        .map(|(rows, cols)| (rows as usize, cols as usize));
+                }
+                let canonical = function.name();
                 let positions = array_lifted_argument_positions(canonical)?;
                 let args = data_store.get_args(node_id)?;
                 let shapes: Vec<_> = positions
@@ -1110,8 +1138,34 @@ impl<'a> Interpreter<'a> {
                     };
                 }
 
+                let evaluate_concat_operand = |node_id| {
+                    let returns_reference = match data_store.get_node(node_id) {
+                        Some(AstNodeData::Function { name_id, .. }) => self
+                            .context
+                            .function_capabilities("", data_store.resolve_ast_string(*name_id))
+                            .is_some_and(|caps| {
+                                caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
+                            }),
+                        _ => false,
+                    };
+                    if returns_reference
+                        && let Some(reference) = self.try_evaluate_arena_ast_as_reference(
+                            node_id,
+                            data_store,
+                            sheet_registry,
+                        )
+                    {
+                        return self.eval_reference_to_calc(&reference?);
+                    }
+                    self.evaluate_arena_ast(node_id, data_store, sheet_registry)
+                };
+
                 let evaluate_operand =
-                    |node_id| match self.evaluate_arena_ast(node_id, data_store, sheet_registry) {
+                    |node_id| match if op == "&" {
+                        evaluate_concat_operand(node_id)
+                    } else {
+                        self.evaluate_arena_ast(node_id, data_store, sheet_registry)
+                    } {
                         Ok(value) => Ok(value),
                         Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
                         Err(error) => {
@@ -1153,13 +1207,15 @@ impl<'a> Interpreter<'a> {
                     "^" => self
                         .power(left, right)
                         .map(crate::traits::CalcValue::Scalar),
-                    "&" => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-                        format!(
-                            "{}{}",
-                            crate::coercion::to_text_invariant(&left),
-                            crate::coercion::to_text_invariant(&right)
-                        ),
-                    ))),
+                    "&" => self
+                        .broadcast_apply(left, right, |left, right| {
+                            Ok(LiteralValue::Text(format!(
+                                "{}{}",
+                                crate::coercion::to_text_invariant(&left),
+                                crate::coercion::to_text_invariant(&right)
+                            )))
+                        })
+                        .map(crate::traits::CalcValue::Scalar),
                     _ => Err(ExcelError::new(ExcelErrorKind::NImpl)
                         .with_message(format!("Binary op '{op}'"))),
                 }
@@ -1602,13 +1658,15 @@ impl<'a> Interpreter<'a> {
             "^" => self
                 .power(left, right)
                 .map(crate::traits::CalcValue::Scalar),
-            "&" => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-                format!(
-                    "{}{}",
-                    crate::coercion::to_text_invariant(&left),
-                    crate::coercion::to_text_invariant(&right)
-                ),
-            ))),
+            "&" => self
+                .broadcast_apply(left, right, |left, right| {
+                    Ok(LiteralValue::Text(format!(
+                        "{}{}",
+                        crate::coercion::to_text_invariant(&left),
+                        crate::coercion::to_text_invariant(&right)
+                    )))
+                })
+                .map(crate::traits::CalcValue::Scalar),
             ":" => {
                 let left_ref = self.evaluate_ast_as_reference(left_node)?;
                 let right_ref = self.evaluate_ast_as_reference(right_node)?;

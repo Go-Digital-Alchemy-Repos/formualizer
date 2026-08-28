@@ -44,6 +44,87 @@ fn large_accepts_parenthesized_reference_union() {
     );
 }
 
+fn concat_match_workbook() -> TestWorkbook {
+    TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![
+                LiteralValue::Text("B".into()),
+                LiteralValue::Int(2),
+                LiteralValue::Text("A".into()),
+                LiteralValue::Text("B".into()),
+                LiteralValue::Text("C".into()),
+            ],
+            vec![
+                LiteralValue::Empty,
+                LiteralValue::Empty,
+                LiteralValue::Int(1),
+                LiteralValue::Int(2),
+                LiteralValue::Int(3),
+            ],
+        ],
+    )
+}
+
+#[test]
+fn range_concat_lifts_elementwise_direct_ast() {
+    let wb = concat_match_workbook();
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=MATCH(A1&B1,C1:E1&C2:E2,0)"),
+        LiteralValue::Int(2)
+    );
+    assert_eq!(
+        evaluate_lifting_formula(&wb, "=MATCH(A1&B1,OFFSET(C1:E1,0,0)&C2:E2,0)"),
+        LiteralValue::Int(2)
+    );
+
+    let ast = formualizer_parse::parser::parse("=OFFSET(C1:E1,0,0)")
+        .expect("valid reference-returning operand");
+    let interpreter = wb.interpreter();
+    assert!(ArgumentHandle::new(&ast, &interpreter).may_return_reference());
+}
+
+#[test]
+fn range_concat_lifts_elementwise_engine_arena() {
+    ensure_lifting_builtins();
+    let mut engine = crate::engine::Engine::new(
+        TestWorkbook::new(),
+        crate::engine::EvalConfig::default(),
+    );
+    for (row, col, value) in [
+        (1, 3, LiteralValue::Text("B".into())),
+        (1, 4, LiteralValue::Int(2)),
+        (1, 5, LiteralValue::Text("A".into())),
+        (1, 6, LiteralValue::Text("B".into())),
+        (1, 7, LiteralValue::Text("C".into())),
+        (2, 5, LiteralValue::Int(1)),
+        (2, 6, LiteralValue::Int(2)),
+        (2, 7, LiteralValue::Int(3)),
+    ] {
+        engine
+            .set_cell_value("Sheet1", row, col, value)
+            .expect("set arena concat fixture");
+    }
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            1,
+            formualizer_parse::parser::parse(
+                "=MATCH($C$1&$D$1,OFFSET($E$1:$G$1,0,0)&$E$2:$G$2,0)",
+            )
+            .expect("valid arena concat formula"),
+        )
+        .expect("set arena concat formula");
+    engine.evaluate_all().expect("evaluate arena concat formula");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1).expect("concat result"),
+        LiteralValue::Number(2.0)
+    );
+}
+
 fn array_lifting_engine() -> crate::engine::Engine<TestWorkbook> {
     ensure_lifting_builtins();
     let mut engine =
@@ -1645,4 +1726,18 @@ fn lifted_scalar_override_cannot_reenter_reference_resolution() {
         }
         _ => panic!("projected scalar re-entered reference resolution"),
     }
+}
+
+#[test]
+fn binary_lifted_scalar_override_cannot_reenter_reference_resolution() {
+    ensure_lifting_builtins();
+    let workbook = concat_match_workbook();
+    let interpreter = workbook.interpreter();
+    let ast = formualizer_parse::parser::parse("=OFFSET(C1:E1,0,0)")
+        .expect("valid reference-returning OFFSET");
+    let handle = ArgumentHandle::new(&ast, &interpreter)
+        .with_scalar_value(LiteralValue::Text("B".into()));
+
+    assert!(!handle.may_return_reference());
+    assert_eq!(handle.value_at(0, 0).unwrap(), LiteralValue::Text("B".into()));
 }
