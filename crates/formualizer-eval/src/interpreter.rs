@@ -1229,12 +1229,14 @@ impl<'a> Interpreter<'a> {
                         .power(left, right)
                         .map(crate::traits::CalcValue::Scalar),
                     "&" => self
-                        .broadcast_apply(left, right, |left, right| {
-                            Ok(LiteralValue::Text(format!(
+                        .broadcast_apply(left, right, |left, right| match (left, right) {
+                            (LiteralValue::Error(error), _) => Ok(LiteralValue::Error(error)),
+                            (_, LiteralValue::Error(error)) => Ok(LiteralValue::Error(error)),
+                            (left, right) => Ok(LiteralValue::Text(format!(
                                 "{}{}",
                                 crate::coercion::to_text_invariant(&left),
                                 crate::coercion::to_text_invariant(&right)
-                            )))
+                            ))),
                         })
                         .map(crate::traits::CalcValue::Scalar),
                     _ => Err(ExcelError::new(ExcelErrorKind::NImpl)
@@ -1680,12 +1682,14 @@ impl<'a> Interpreter<'a> {
                 .power(left, right)
                 .map(crate::traits::CalcValue::Scalar),
             "&" => self
-                .broadcast_apply(left, right, |left, right| {
-                    Ok(LiteralValue::Text(format!(
+                .broadcast_apply(left, right, |left, right| match (left, right) {
+                    (LiteralValue::Error(error), _) => Ok(LiteralValue::Error(error)),
+                    (_, LiteralValue::Error(error)) => Ok(LiteralValue::Error(error)),
+                    (left, right) => Ok(LiteralValue::Text(format!(
                         "{}{}",
                         crate::coercion::to_text_invariant(&left),
                         crate::coercion::to_text_invariant(&right)
-                    )))
+                    ))),
                 })
                 .map(crate::traits::CalcValue::Scalar),
             ":" => {
