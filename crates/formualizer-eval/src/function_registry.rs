@@ -2006,7 +2006,7 @@ mod tests {
             );
         }
         const SHORT_CIRCUIT: &[&str] = &[
-            "IF", "IFERROR", "IFNA", "IFS", "SWITCH", "CHOOSE", "LET", "LAMBDA", "AND", "OR",
+            "IF", "IFERROR", "IFNA", "IFS", "SWITCH", "CHOOSE", "LET", "LAMBDA",
         ];
         let observed_short_circuit: std::collections::BTreeSet<_> = snapshot_registered()
             .into_iter()

@@ -1249,6 +1249,25 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     pub fn lazy_values_owned(
         &'a self,
     ) -> Result<Box<dyn Iterator<Item = LiteralValue> + 'a>, ExcelError> {
+        fn resolved_values<'a, 'b>(
+            handle: &'a ArgumentHandle<'a, 'b>,
+        ) -> Result<Box<dyn Iterator<Item = LiteralValue> + 'a>, ExcelError> {
+            match handle.resolve_once()? {
+                ResolvedArgument::Range(view) => {
+                    let mut values = Vec::new();
+                    view.for_each_cell(&mut |value| {
+                        values.push(value.clone());
+                        Ok(())
+                    })?;
+                    Ok(Box::new(values.into_iter()))
+                }
+                ResolvedArgument::ReferenceError(error) => Err(error),
+                ResolvedArgument::Value(value) => {
+                    Ok(Box::new(std::iter::once(value.into_literal())))
+                }
+            }
+        }
+
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { .. } => {
@@ -1302,11 +1321,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     };
                     Ok(Box::new(it))
                 }
-                _ => {
-                    // Single value expression
-                    let v = self.value()?.into_literal();
-                    Ok(Box::new(std::iter::once(v)))
-                }
+                _ => resolved_values(self),
             },
             ArgumentExpr::Arena {
                 id,
@@ -1368,12 +1383,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         };
                         Ok(Box::new(it))
                     }
-                    _ => {
-                        let v = self
-                            .interp
-                            .evaluate_arena_ast(*id, data_store, sheet_registry)?;
-                        Ok(Box::new(std::iter::once(v.into_literal())))
-                    }
+                    _ => resolved_values(self),
                 }
             }
         }

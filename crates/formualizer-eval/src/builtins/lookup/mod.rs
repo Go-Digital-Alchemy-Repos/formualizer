@@ -20,7 +20,7 @@ pub use choose::ChooseFn;
 #[cfg(test)]
 pub use core::MatchFn;
 #[cfg(test)]
-pub use dynamic::RandArrayFn;
+pub use dynamic::{RandArrayFn, SequenceFn, TransposeFn};
 
 /// Register all lookup and reference functions
 pub fn register_builtins() {

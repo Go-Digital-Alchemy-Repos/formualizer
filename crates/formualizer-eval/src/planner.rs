@@ -441,8 +441,6 @@ mod tests {
     fn short_circuit_functions_are_sequential() {
         let p = plan_for("=IF(1,2,3)");
         assert!(matches!(p.root.strategy, ExecStrategy::Sequential));
-        let p2 = plan_for("=AND(TRUE(), FALSE())");
-        assert!(matches!(p2.root.strategy, ExecStrategy::Sequential));
     }
 
     #[test]
@@ -531,8 +529,8 @@ mod tests {
 
     #[test]
     fn nested_short_circuit_child_remains_sequential_under_parallel_parent() {
-        // Force low thresholds to encourage arg-parallel at parent, but AND child must stay Sequential
-        let ast = formualizer_parse::parser::parse("=SUM(AND(TRUE(), FALSE()), 1, 2, 3)").unwrap();
+        // Force low thresholds to encourage arg-parallel at parent, but IF child must stay Sequential
+        let ast = formualizer_parse::parser::parse("=SUM(IF(TRUE(), 1, 0), 1, 2, 3)").unwrap();
         ensure_builtins_registered();
         let cfg = PlanConfig {
             enable_parallel: true,
@@ -549,7 +547,7 @@ mod tests {
             plan.root.strategy,
             ExecStrategy::ArgParallel | ExecStrategy::Sequential
         ));
-        // First child corresponds to AND(...) and must be Sequential due to SHORT_CIRCUIT
+        // First child corresponds to IF(...) and must be Sequential due to SHORT_CIRCUIT
         assert!(!plan.root.children.is_empty());
         assert!(matches!(
             plan.root.children[0].strategy,

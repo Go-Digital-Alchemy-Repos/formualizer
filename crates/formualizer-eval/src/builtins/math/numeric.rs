@@ -1995,6 +1995,11 @@ impl Function for MultinomialFn {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
+                    LiteralValue::Boolean(_) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                            ExcelError::new_value(),
+                        )));
+                    }
                     other => coerce_num(&other)?.trunc() as i64,
                 };
                 if n < 0 {
