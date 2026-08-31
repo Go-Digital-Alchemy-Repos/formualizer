@@ -53,6 +53,79 @@ use std::collections::HashMap;
  */
 const GENERATED_ARRAY_MAX_ROWS: i64 = 1_048_576;
 const GENERATED_ARRAY_MAX_COLS: i64 = 16_384;
+
+/// Sheet limits used to normalize an unbounded (whole-column / whole-row)
+/// reference bound before comparing declared lengths.
+const SHEET_MAX_ROWS: u32 = 1_048_576;
+const SHEET_MAX_COLS: u32 = 16_384;
+
+/// Declared `(rows, cols)` of an XLOOKUP array argument.
+///
+/// XLOOKUP's length rule is about what the formula DECLARES, not about what
+/// the data happens to occupy: Excel grades `XLOOKUP(v, A1:A3, B1:B4)`
+/// `#VALUE!` whether or not row 4 is blank, and grades `XLOOKUP(v, A1:A5,
+/// B1:B5)` fine whether or not the lookup column trails off into blanks.
+/// Bounded references already carry their declared extent in `dims()` (only
+/// open axes are used-region trimmed), but an unbounded axis is trimmed, so
+/// for those the declared reference is the only place the real length lives.
+///
+/// Node kind decides where to read from, and it is checked FIRST: on the Arena
+/// path `ArgumentHandle::as_reference` delegates to `reference_for_eval`, which
+/// EVALUATES `Function`/`BinaryOp` nodes, so it must never be reached for a
+/// computed argument. For anything that is not a bare `Reference` node — a
+/// computed array, a function call, an inline array literal — the materialized
+/// view's dims ARE the declared shape.
+///
+/// `declared_references()` filters through `reference_for_current_offset`, so a
+/// bare `Reference` node can still yield an empty vec when relocation fails
+/// under a shared-arena offset; anything other than exactly one reference falls
+/// back to view dims rather than erroring or indexing blindly.
+///
+/// `External`, `Table` and `NamedRange` carry no parser-level declared bounds
+/// and also fall back to view dims — which means a named whole-column range is
+/// compared on TRIMMED dims. That is a known, reported caveat.
+fn declared_axis_lengths(
+    handle: &ArgumentHandle<'_, '_>,
+    view_rows: usize,
+    view_cols: usize,
+) -> (usize, usize) {
+    use formualizer_parse::parser::{ASTNodeType, ReferenceType};
+
+    let view = (view_rows, view_cols);
+    if !matches!(handle.ast().node_type, ASTNodeType::Reference { .. }) {
+        return view;
+    }
+    let declared = handle.declared_references();
+    if declared.len() != 1 {
+        return view;
+    }
+    let span = |start: Option<u32>, end: Option<u32>, limit: u32| -> usize {
+        let start = start.unwrap_or(1).max(1);
+        let end = end.unwrap_or(limit).max(1);
+        (end.saturating_sub(start) as usize) + 1
+    };
+    match &declared[0] {
+        ReferenceType::Cell { .. } | ReferenceType::Cell3D { .. } => (1, 1),
+        ReferenceType::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        }
+        | ReferenceType::Range3D {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => (
+            span(*start_row, *end_row, SHEET_MAX_ROWS),
+            span(*start_col, *end_col, SHEET_MAX_COLS),
+        ),
+        ReferenceType::External(_) | ReferenceType::Table(_) | ReferenceType::NamedRange(_) => view,
+    }
+}
 const GENERATED_ARRAY_MAX_CELLS: i64 = 1 << 24;
 
 /// Returns `Some(#NUM!)` when a `rows x cols` generated array exceeds the
@@ -317,6 +390,30 @@ impl Function for XLookupFn {
 
         let (lookup_rows, lookup_cols) = lookup_view.dims();
         let (ret_rows, ret_cols) = ret_view.dims();
+
+        // Excel grades an XLOOKUP whose lookup_array and return_array have
+        // unequal DECLARED lengths along the lookup axis as `#VALUE!`
+        // unconditionally — before any search, and `if_not_found` does not
+        // rescue it. See `declared_axis_lengths` for why declared (not
+        // used-region-trimmed) dimensions are the ones that decide.
+        let declared_lookup = declared_axis_lengths(&args[1], lookup_rows, lookup_cols);
+        let declared_ret = declared_axis_lengths(&args[2], ret_rows, ret_cols);
+        // Orientation comes from the DECLARED lookup shape: a declared single
+        // column is vertical, a declared single row is horizontal. A declared
+        // 2-D lookup array is not this guard's business — it falls through to
+        // the existing `#VALUE!` path below.
+        let declared_mismatch = if declared_lookup.1 == 1 {
+            declared_lookup.0 != declared_ret.0
+        } else if declared_lookup.0 == 1 {
+            declared_lookup.1 != declared_ret.1
+        } else {
+            false
+        };
+        if declared_mismatch {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Value),
+            )));
+        }
 
         // XLOOKUP requires a 1-D lookup array (single row or single column).
         // If the lookup range is completely empty (used-region trimmed to 0),

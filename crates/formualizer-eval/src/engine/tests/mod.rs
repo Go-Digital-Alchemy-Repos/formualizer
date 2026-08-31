@@ -202,4 +202,5 @@ mod short_circuit_dispatch;
 mod approximate_lookup_ignored_entries;
 mod format_channel_t1;
 mod temporal_lookup_semantics;
+mod xlookup_declared_length_guard;
 mod xlookup_excel_parity;
