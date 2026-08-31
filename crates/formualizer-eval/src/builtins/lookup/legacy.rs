@@ -228,6 +228,15 @@ impl Function for LookupFn {
 
         // --- Retrieve result ---
         if has_result_vector {
+            // ES-033: when `result_vector` is a plain single-reference vector,
+            // Excel does NOT index into its materialized contents — it reduces
+            // the reference to a (start cell, orientation) pair and READS THE
+            // SHEET at `start + match_idx`, legally running past the declared
+            // end. Every other shape keeps the positional path below.
+            if let Some(anchor) = declared_result_anchor(&args[2]) {
+                let val = sheet_read_result(ctx, anchor, match_idx)?;
+                return Ok(CalcValue::Scalar(materialise_empty(val)));
+            }
             let result_data = materialise_range(&args[2], ctx)?;
             let (r_rows, r_cols) = dims(&result_data);
             let result_vec = flatten_1d_vec(&result_data, r_rows, r_cols);
@@ -265,6 +274,116 @@ impl Function for LookupFn {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Sheet limits, used both to normalize an unbounded (whole-column /
+/// whole-row) declared bound and to bound-check a synthesized read target.
+const SHEET_MAX_ROWS: u32 = 1_048_576;
+const SHEET_MAX_COLS: u32 = 16_384;
+
+/// The declared anchor of a LOOKUP `result_vector` that participates in the
+/// ES-033 sheet-read law: `(sheet, start_row, start_col, declared_rows)`.
+///
+/// `None` means "not covered by the law" and the caller MUST keep the legacy
+/// positional path byte-for-byte. That covers every unmeasured degree of
+/// freedom: a non-`Reference` node (array literal, computed array, function
+/// call), a `declared_references()` result that is not exactly one reference,
+/// `Cell3D`/`Range3D` (no single sheet field), `External`/`Table`/
+/// `NamedRange` (no parser-level declared bounds), and a declared 2-D range
+/// (Excel's behavior there is UNMEASURED, so today's row-major flatten stays).
+///
+/// Node kind is checked FIRST and `declared_references()` is the only reader:
+/// `ArgumentHandle::as_reference_or_eval` EVALUATES `Function`/`BinaryOp`
+/// nodes on the Arena path, so it must never be reached for a computed
+/// argument. Open bounds normalize exactly as `dynamic.rs`'s
+/// `declared_axis_lengths` does (`start.unwrap_or(1).max(1)`,
+/// `end.unwrap_or(limit)`).
+///
+/// Orientation is derived by the caller from `declared_rows`: HORIZONTAL iff
+/// `declared_rows == 1` (a bare `Cell` normalizes to 1x1 and is therefore
+/// horizontal — an inference from the measured 1x1-Range probe).
+fn declared_result_anchor(
+    handle: &ArgumentHandle<'_, '_>,
+) -> Option<(Option<String>, u32, u32, u32)> {
+    use formualizer_parse::parser::{ASTNodeType, ReferenceType};
+
+    if !matches!(handle.ast().node_type, ASTNodeType::Reference { .. }) {
+        return None;
+    }
+    let declared = handle.declared_references();
+    if declared.len() != 1 {
+        return None;
+    }
+    match &declared[0] {
+        ReferenceType::Cell {
+            sheet, row, col, ..
+        } => Some((sheet.clone(), *row, *col, 1)),
+        ReferenceType::Range {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => {
+            let sr = start_row.unwrap_or(1).max(1);
+            let sc = start_col.unwrap_or(1).max(1);
+            let er = end_row.unwrap_or(SHEET_MAX_ROWS).max(1);
+            let ec = end_col.unwrap_or(SHEET_MAX_COLS).max(1);
+            let declared_rows = er.saturating_sub(sr) + 1;
+            let declared_cols = ec.saturating_sub(sc) + 1;
+            if declared_rows > 1 && declared_cols > 1 {
+                // Declared 2-D: unmeasured DOF, keep the positional path.
+                return None;
+            }
+            Some((sheet.clone(), sr, sc, declared_rows))
+        }
+        _ => None,
+    }
+}
+
+/// Read the ES-033 sheet target: `start + offset` along the declared
+/// orientation, resolved as a 1x1 reference.
+///
+/// PANIC GUARD (binding): `resolve_shared_ref`'s Cell arm builds a
+/// `RelativeCoord::new`, which ASSERTS on row > 1,048,575 / col > 16,383
+/// (0-based). Every arithmetic failure and every out-of-sheet target is
+/// short-circuited to `Empty` BEFORE any `ReferenceType` is constructed. The
+/// caller wraps the result in `materialise_empty`, so Empty displays as 0 —
+/// the measured Excel behavior for both an empty target and a past-edge one.
+///
+/// `match_idx` is ALREADY the 0-based offset (`approx_match_ascending`
+/// returns `Some(lo - 1)`); it is NOT decremented again here.
+fn sheet_read_result<'b>(
+    ctx: &dyn FunctionContext<'b>,
+    anchor: (Option<String>, u32, u32, u32),
+    match_idx: usize,
+) -> Result<LiteralValue, ExcelError> {
+    use formualizer_parse::parser::ReferenceType;
+
+    let (sheet, start_row, start_col, declared_rows) = anchor;
+    let Ok(offset) = u32::try_from(match_idx) else {
+        return Ok(LiteralValue::Empty);
+    };
+    let horizontal = declared_rows == 1;
+    let target = if horizontal {
+        start_col.checked_add(offset).map(|col| (start_row, col))
+    } else {
+        start_row.checked_add(offset).map(|row| (row, start_col))
+    };
+    let Some((target_row, target_col)) = target else {
+        return Ok(LiteralValue::Empty);
+    };
+    if target_row == 0
+        || target_col == 0
+        || target_row > SHEET_MAX_ROWS
+        || target_col > SHEET_MAX_COLS
+    {
+        return Ok(LiteralValue::Empty);
+    }
+    let reference = ReferenceType::cell(sheet, target_row, target_col);
+    let view = ctx.resolve_range_view(&reference, ctx.current_sheet())?;
+    Ok(view.as_1x1().unwrap_or(LiteralValue::Empty))
+}
 
 /// Materialise a range argument into a 2-D Vec grid.
 fn materialise_range<'a, 'b>(
