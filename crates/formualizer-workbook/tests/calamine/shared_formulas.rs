@@ -1,4 +1,4 @@
-use formualizer_common::RangeAddress;
+use formualizer_common::{ExcelErrorKind, RangeAddress};
 use formualizer_eval::engine::ingest::EngineLoadStream;
 use formualizer_eval::engine::{
     Engine, EvalConfig, EvaluationTarget, FormulaIngestReport, FormulaParsePolicy, FormulaPlaneMode,
@@ -501,6 +501,37 @@ fn cached_malformed_formula_xlsx() -> Vec<u8> {
     })
 }
 
+fn cached_formula_text_xlsx(formula: &str) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    book.get_sheet_by_name_mut("Sheet1")
+        .unwrap()
+        .get_cell_mut("A1")
+        .set_formula("1+1");
+    let mut original = Vec::new();
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut original).unwrap();
+    rewrite_sheet_xml(original, |xml| {
+        let replacement = format!("<f>{formula}</f><v>99</v>");
+        let xml = xml.replace("<f>1+1</f><v/>", &replacement);
+        assert!(xml.contains(&replacement));
+        xml
+    })
+}
+
+fn cached_empty_formula_xlsx(tag: &str, cached: &str) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_by_name_mut("Sheet1").unwrap();
+    sheet.get_cell_mut("B2").set_formula("1+1");
+    sheet.get_cell_mut("C2").set_formula("B2*3");
+    let mut original = Vec::new();
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut original).unwrap();
+    rewrite_sheet_xml(original, |xml| {
+        let replacement = format!("<f{tag}/><v>{cached}</v>");
+        let xml = xml.replace("<f>1+1</f><v/>", &replacement);
+        assert!(xml.contains(&replacement));
+        xml
+    })
+}
+
 fn malformed_shared_attribute_xlsx(attribute: &str) -> Vec<u8> {
     let mut book = umya_spreadsheet::new_file();
     book.get_sheet_by_name_mut("Sheet1")
@@ -536,6 +567,15 @@ fn assert_shared_load(mut adapter: CalamineAdapter) {
             LiteralValue::Number(expected)
         );
     }
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(50.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 2),
+        Some(LiteralValue::Number(51.0)),
+        "shared follower must recalculate after its input changes"
+    );
     let stats = adapter.load_stats().unwrap();
     assert_eq!(stats.formula_cells_observed, Some(6));
     assert_eq!(stats.formula_cells_handed_to_engine, Some(6));
@@ -564,6 +604,79 @@ fn cached_formula_values_remain_suppressed_when_parse_policy_keeps_cached_value(
         let stats = adapter.load_stats().unwrap();
         assert_eq!(stats.formula_cells_observed, Some(1));
         assert_eq!(stats.value_cells_observed, Some(0));
+    }
+}
+
+#[test]
+fn cached_empty_normal_formulas_load_as_values_and_feed_dependents() {
+    for tag in ["", " t=\"dataTable\" ref=\"B2:C2\""] {
+        for deferred in [false, true] {
+            let config = EvalConfig {
+                formula_parse_policy: FormulaParsePolicy::CoerceToError,
+                defer_graph_building: deferred,
+                ..EvalConfig::default()
+            };
+            let mut engine =
+                Engine::new(formualizer_eval::test_workbook::TestWorkbook::new(), config);
+            let mut adapter =
+                CalamineAdapter::open_bytes(cached_empty_formula_xlsx(tag, "20")).unwrap();
+            adapter.stream_into_engine(&mut engine).unwrap();
+            if deferred {
+                engine.build_graph_all().unwrap();
+            }
+            engine.evaluate_all().unwrap();
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 2, 2),
+                Some(LiteralValue::Number(20.0)),
+                "tag={tag:?} deferred={deferred}"
+            );
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 2, 3),
+                Some(LiteralValue::Number(60.0)),
+                "tag={tag:?} deferred={deferred}"
+            );
+            let stats = adapter.load_stats().unwrap();
+            assert_eq!(stats.formula_cells_observed, Some(1));
+            assert_eq!(stats.value_cells_observed, Some(1));
+        }
+    }
+}
+
+#[test]
+fn empty_formula_guard_does_not_suppress_invalid_formula_classes() {
+    for (tag, cached) in [("", ""), (" t=\"array\" ref=\"B2:B2\"", "20")] {
+        let mut engine = Engine::new(
+            formualizer_eval::test_workbook::TestWorkbook::new(),
+            EvalConfig {
+                formula_parse_policy: FormulaParsePolicy::CoerceToError,
+                ..EvalConfig::default()
+            },
+        );
+        let mut adapter =
+            CalamineAdapter::open_bytes(cached_empty_formula_xlsx(tag, cached)).unwrap();
+        adapter.stream_into_engine(&mut engine).unwrap();
+        engine.evaluate_all().unwrap();
+        assert!(matches!(
+            engine.get_cell_value("Sheet1", 2, 2),
+            Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Error
+        ));
+    }
+
+    for formula in [" ", "1+"] {
+        let mut engine = Engine::new(
+            formualizer_eval::test_workbook::TestWorkbook::new(),
+            EvalConfig {
+                formula_parse_policy: FormulaParsePolicy::CoerceToError,
+                ..EvalConfig::default()
+            },
+        );
+        let mut adapter = CalamineAdapter::open_bytes(cached_formula_text_xlsx(formula)).unwrap();
+        adapter.stream_into_engine(&mut engine).unwrap();
+        engine.evaluate_all().unwrap();
+        assert!(matches!(
+            engine.get_cell_value("Sheet1", 1, 1),
+            Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Error
+        ));
     }
 }
 

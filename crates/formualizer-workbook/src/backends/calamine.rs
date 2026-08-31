@@ -514,8 +514,24 @@ impl CalamineAdapter {
                 continue;
             }
 
-            let has_formula = record.formula.is_some();
-            if let Some(metadata) = record.formula {
+            // Calamine exposes a bodyless ordinary `<f/>` as a normal formula
+            // with empty text. Match the eager reader by retaining its usable
+            // cached value, while leaving shared/array formulas and malformed
+            // non-empty formula text on the configured parse-policy path.
+            let cached_empty_normal = matches!(
+                record.formula.as_ref(),
+                Some(XlsxFormulaMetadata::Normal { formula }) if formula.is_empty()
+            ) && !array_formula_metadata
+                .anchors
+                .contains_key(&(row0 + 1, col0 + 1))
+                && data_ref_to_literal(&record.value, engine.config.date_system).is_some();
+            let formula = if cached_empty_normal {
+                None
+            } else {
+                record.formula
+            };
+            let has_formula = formula.is_some();
+            if let Some(metadata) = formula {
                 let authorship = array_formula_metadata
                     .anchors
                     .get(&(row0 + 1, col0 + 1))
