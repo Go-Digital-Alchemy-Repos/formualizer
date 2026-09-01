@@ -344,7 +344,15 @@ impl Function for TextFn {
             }
             _ => 0.0,
         };
-        let out = if fmt.contains('%') {
+        let parsed_class = formualizer_common::numfmt::NumberFormat::parse(&fmt);
+        let out = if matches!(
+            parsed_class.class(),
+            formualizer_common::numfmt::FormatClass::Number { .. }
+                | formualizer_common::numfmt::FormatClass::Percent { .. }
+        ) {
+            super::number_format::format_number(num, &fmt)
+                .unwrap_or_else(|| legacy_format_number(num, &fmt))
+        } else if fmt.contains('%') {
             format_percent(num)
         } else if fmt.contains('#') && fmt.contains(',') {
             // Handle formats like #,##0 or #,##0.00
@@ -375,6 +383,24 @@ impl Function for TextFn {
             }
         };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)))
+    }
+}
+
+fn legacy_format_number(num: f64, fmt: &str) -> String {
+    if fmt.contains('%') {
+        format_percent(num)
+    } else if fmt.contains('#') && fmt.contains(',') {
+        format_with_thousands(num, fmt)
+    } else if fmt.contains("0.00") {
+        format!("{num:.2}")
+    } else if fmt.contains('0') {
+        if fmt.contains(".00") {
+            format!("{num:.2}")
+        } else {
+            format_number_basic(num)
+        }
+    } else {
+        num.to_string()
     }
 }
 

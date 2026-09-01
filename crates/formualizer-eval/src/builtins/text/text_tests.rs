@@ -459,6 +459,87 @@ mod tests {
     }
 
     #[test]
+    fn text_ot076_excel_numeric_format_oracle() {
+        use crate::engine::DateSystem;
+
+        let cases = [
+            (r##"=TEXT(0.09,"0.00%")"##, "9.00%"),
+            (r##"=TEXT(0.095,"0.00%")"##, "9.50%"),
+            (r##"=TEXT(0.0975,"0.00%")"##, "9.75%"),
+            (r##"=TEXT(0.13,"0.00%")"##, "13.00%"),
+            (r##"=TEXT(0.7,"0.00%")"##, "70.00%"),
+            (r##"=TEXT(1,"0.00%")"##, "100.00%"),
+            (r##"=TEXT(0.09,"0.00%"&" ")"##, "9.00% "),
+            (
+                r##"="S&P 500 with "&TEXT(0.09,"0.00%"&" ")&"Cap""##,
+                "S&P 500 with 9.00% Cap",
+            ),
+            (r##"=TEXT(0.09754,"0.00%")"##, "9.75%"),
+            (r##"=TEXT(0.09756,"0.00%")"##, "9.76%"),
+            (r##"=TEXT(-0.0975,"0.00%")"##, "-9.75%"),
+            (r##"=TEXT(0,"0.00%")"##, "0.00%"),
+            (r##"=TEXT(0.09,"0.000")"##, "0.090"),
+            (r##"=TEXT(1.23456,"0.000")"##, "1.235"),
+            (r##"=TEXT(7,"0000")"##, "0007"),
+            (r##"=TEXT(12345.6,"#,##0.00")"##, "12,345.60"),
+            (
+                r##"=TEXT(0.09,"0.00% "&CHAR(34)&"Cap"&CHAR(34))"##,
+                "9.00% Cap",
+            ),
+            (
+                r##"=TEXT(0.09,CHAR(34)&"Cap "&CHAR(34)&"0.00%")"##,
+                "Cap 9.00%",
+            ),
+            (r##"=TEXT(0.09,"0.00\%")"##, "0.09%"),
+            (
+                r##"=TEXT(-1234.5,"#,##0.00;[Red](#,##0.00)")"##,
+                "(1,234.50)",
+            ),
+            (
+                r##"=TEXT(0,"0.00;[Red]-0.00;"&CHAR(34)&"zero"&CHAR(34))"##,
+                "zero",
+            ),
+            (r##"=TEXT(DATE(2024,2,29),"yyyy-mm-dd")"##, "2024-02-29"),
+            (r##"=TEXT(1.225,"0.00")"##, "1.23"),
+            (r##"=TEXT(0,"#")"##, ""),
+            (
+                r##"=TEXT(0.004,"0.00;[Red]-0.00;"&CHAR(34)&"zero"&CHAR(34))"##,
+                "0.00",
+            ),
+            (r##"=TEXT(7,"0"&CHAR(34)&";units"&CHAR(34))"##, "7;units"),
+            (r##"=TEXT(12200000,"0.0,,")"##, "12.2"),
+            (r##"=TEXT(999.999,"#,##0.00")"##, "1,000.00"),
+            (r##"=TEXT(0.09,"0.00"&CHAR(34)&"%"&CHAR(34))"##, "0.09%"),
+        ];
+
+        for (formula, expected) in cases {
+            assert_eq!(
+                eval_text_formula(DateSystem::Excel1900, formula),
+                LiteralValue::Text(expected.into()),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_ot076_unsupported_formats_hold_legacy_results() {
+        use crate::engine::DateSystem;
+
+        let cases = [
+            (r##"=TEXT(TIME(13,5,0),"h:mm AM/PM")"##, "h:01 AM/PM"),
+            (r##"=TEXT(12345,"0.00E+00")"##, "12345.00"),
+            (r##"=TEXT(1.25,"# ?/?")"##, "1.25"),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                eval_text_formula(DateSystem::Excel1900, formula),
+                LiteralValue::Text(expected.into()),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
     fn text_formats_typed_date_with_uppercase_unpadded_tokens() {
         use chrono::NaiveDate;
 
