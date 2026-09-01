@@ -129,6 +129,47 @@ fn temporal_constructor_annotation_reaches_native_egress() {
 }
 
 #[test]
+fn ot077_edate_eomonth_annotations_reach_native_egress() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=EDATE(DATE(2024,12,1),3)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 1, parse("=EOMONTH(DATE(2024,12,1),0)").unwrap())
+        .unwrap();
+    // S021's producer shape: an EOMONTH chained through arithmetic.
+    engine
+        .set_cell_formula("Sheet1", 3, 1, parse("=EOMONTH(DATE(2024,12,1),1)+0").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    for row in 1..=3 {
+        assert_eq!(
+            engine.effective_format_id("Sheet1", row, 1),
+            Some(FormatId::DATE),
+            "row {row}"
+        );
+    }
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Date(
+            NaiveDate::from_ymd_opt(2025, 3, 1).unwrap()
+        ))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 1),
+        Some(LiteralValue::Date(
+            NaiveDate::from_ymd_opt(2024, 12, 31).unwrap()
+        ))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 1),
+        Some(LiteralValue::Date(
+            NaiveDate::from_ymd_opt(2025, 1, 31).unwrap()
+        ))
+    );
+}
+
+#[test]
 fn selection_functions_preserve_the_selected_scalar_format() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     engine

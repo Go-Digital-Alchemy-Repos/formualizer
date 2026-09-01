@@ -76,6 +76,13 @@ pub struct EdateFn;
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for EdateFn {
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(crate::format::FormatId::DATE)
+    }
+
     func_caps!(PURE);
 
     fn name(&self) -> &'static str {
@@ -173,6 +180,13 @@ pub struct EomonthFn;
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for EomonthFn {
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(crate::format::FormatId::DATE)
+    }
+
     func_caps!(PURE);
 
     fn name(&self) -> &'static str {
