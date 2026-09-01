@@ -336,14 +336,9 @@ fn render_section(
         // region anyway.
         return Err(Fallback::Invalid);
     }
-    let fixed = if section.max_fraction_digits == 0 {
-        decimal_view_integer(rounded)?
-    } else {
-        format!("{:.*}", section.max_fraction_digits, rounded)
-    };
-    let (raw_integer, raw_fraction) = fixed.split_once('.').unwrap_or((&fixed, ""));
+    let (raw_integer, raw_fraction) = decimal_view_parts(rounded, section.max_fraction_digits)?;
 
-    let mut integer = raw_integer.to_string();
+    let mut integer = raw_integer;
     if integer == "0" && section.min_integer_digits == 0 {
         integer.clear();
     }
@@ -354,7 +349,7 @@ fn render_section(
         integer = group_thousands(&integer);
     }
 
-    let mut fraction = raw_fraction.to_string();
+    let mut fraction = raw_fraction;
     while fraction.len() > section.min_fraction_digits && fraction.ends_with('0') {
         fraction.pop();
     }
@@ -373,7 +368,7 @@ fn render_section(
     ))
 }
 
-fn decimal_view_integer(value: f64) -> Result<String, Fallback> {
+fn decimal_view_parts(value: f64, fraction_digits: usize) -> Result<(String, String), Fallback> {
     let rendered = value.to_string();
     let (mantissa, exponent) = if let Some((mantissa, exponent)) = rendered.split_once(['e', 'E']) {
         (
@@ -386,25 +381,46 @@ fn decimal_view_integer(value: f64) -> Result<String, Fallback> {
     let integer_digits = mantissa
         .split_once('.')
         .map_or(mantissa.len(), |(integer, _)| integer.len()) as i64;
-    let mut digits: String = mantissa.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let digits: String = mantissa.chars().filter(|ch| ch.is_ascii_digit()).collect();
     let decimal_position = integer_digits + exponent;
 
-    if decimal_position <= 0 {
-        return Ok("0".into());
+    let integer = if decimal_position <= 0 {
+        "0".into()
+    } else {
+        let decimal_position = decimal_position as usize;
+        if decimal_position < digits.len() {
+            digits[..decimal_position].into()
+        } else {
+            digits.clone() + &"0".repeat(decimal_position - digits.len())
+        }
+    };
+
+    let mut fraction = String::with_capacity(fraction_digits);
+    for offset in 0..fraction_digits {
+        let position = decimal_position + offset as i64;
+        if position < 0 {
+            fraction.push('0');
+        } else {
+            fraction.push(
+                digits
+                    .as_bytes()
+                    .get(position as usize)
+                    .copied()
+                    .unwrap_or(b'0') as char,
+            );
+        }
     }
-    let decimal_position = decimal_position as usize;
-    if decimal_position < digits.len() {
-        if digits[decimal_position..]
+
+    let rendered_end = decimal_position + fraction_digits as i64;
+    if rendered_end < digits.len() as i64
+        && digits[rendered_end.max(0) as usize..]
             .bytes()
             .any(|digit| digit != b'0')
-        {
-            return Err(Fallback::Unsupported);
-        }
-        digits.truncate(decimal_position);
-    } else if decimal_position > digits.len() {
-        digits.push_str(&"0".repeat(decimal_position - digits.len()));
+    {
+        return Err(Fallback::Unsupported);
     }
-    Ok(digits)
+
+    Ok((integer, fraction))
 }
 
 fn group_thousands(integer: &str) -> String {
@@ -535,6 +551,16 @@ mod tests {
     #[test]
     fn ot081_t4d_expands_the_decimal_view_at_1e200() {
         assert_eq!(format_number(1e200, "0"), Ok(decimal_power(200)));
+    }
+
+    #[test]
+    fn ot081_fractional_formats_expand_the_large_decimal_view() {
+        let expected = decimal_power(100) + ".00";
+        assert_eq!(format_number(1e100, "0.00"), Ok(expected.clone()));
+        assert_eq!(
+            format_number(-1e100, "0.00"),
+            Ok("-".to_string() + &expected)
+        );
     }
 
     #[test]
