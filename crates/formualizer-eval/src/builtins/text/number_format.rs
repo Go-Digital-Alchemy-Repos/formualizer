@@ -4,6 +4,7 @@
 //! syntax returns `None` so `TEXT` can preserve its previous behavior.
 
 use crate::builtins::utils::round_to_precision;
+use formualizer_common::numfmt::{FormatClass, NumberFormat};
 
 const MAX_PLACEHOLDERS: usize = 30;
 
@@ -31,6 +32,12 @@ struct Section {
 
 pub(super) fn format_number(value: f64, code: &str) -> Option<String> {
     if !value.is_finite() {
+        return None;
+    }
+    if !matches!(
+        NumberFormat::parse(code).class(),
+        FormatClass::Number { .. } | FormatClass::Percent { .. }
+    ) {
         return None;
     }
     let raw_sections = split_sections(code)?;
