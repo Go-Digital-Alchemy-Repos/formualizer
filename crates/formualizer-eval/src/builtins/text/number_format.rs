@@ -135,7 +135,6 @@ fn parse_section(code: &str) -> Option<Section> {
             ',' => units.push(Unit::Comma),
             '%' => units.push(Unit::Percent),
             '?' | '@' | '*' | '_' => return None,
-            other if other.is_ascii_alphabetic() => return None,
             other => units.push(Unit::Literal(other)),
         }
     }
