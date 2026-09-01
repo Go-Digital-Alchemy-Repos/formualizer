@@ -1,20 +1,16 @@
 //! Bounded Excel numeric format renderer for `TEXT`.
 //!
 //! This deliberately implements only the measured oracle surface (OT-076
-//! ES-035 plus the OT-080 defect probes). Syntax outside that surface returns
-//! [`Fallback::Unsupported`] so `TEXT` can preserve its previous behavior;
-//! [`Fallback::Invalid`] is a measured Excel `#VALUE!`.
+//! ES-035 plus the OT-080 and OT-081 defect probes). Syntax outside that
+//! surface returns [`Fallback::Unsupported`] so `TEXT` can preserve its
+//! previous behavior; [`Fallback::Invalid`] is a measured Excel `#VALUE!`.
 
 use crate::builtins::math::numeric::excel_round;
 use formualizer_common::numfmt::{FormatClass, NumberFormat};
 
-const MAX_PLACEHOLDERS: usize = 30;
-
 /// `TEXT` returns `#VALUE!` once its rendered result grows past this length.
-/// Every OT-080 huge-magnitude probe (1.7E+306 and up, 307+ digits) measured
-/// `#VALUE!` in Excel; the exact cut-over between 255 characters and those
-/// magnitudes is not oracle-pinned, so 255 (Excel's string-result limit for
-/// the function) is the inferred wall.
+/// OT-081 pinned the boundary: a 255-character result renders and a
+/// 256-character result returns `#VALUE!`.
 const MAX_RENDERED_CHARS: usize = 255;
 
 /// Why the bounded renderer declined to produce text.
@@ -200,9 +196,11 @@ fn parse_section(code: &str) -> Result<Section, Fallback> {
     if temporal_code {
         return Err(Fallback::Invalid);
     }
-    if placeholder_indices.len() > MAX_PLACEHOLDERS {
-        return Err(Fallback::Unsupported);
-    }
+    // Placeholder count has no separate cap on the measured surface. OT-081
+    // T4m renders forty zero placeholders, while T4l's three hundred
+    // placeholders return #VALUE! because the result exceeds 255 characters.
+    // Parse every placeholder here and let the final rendered-length check
+    // decide validity, so an overlong result is Invalid rather than Unsupported.
 
     let first = placeholder_indices[0];
     let last = *placeholder_indices.last().unwrap();
@@ -338,7 +336,11 @@ fn render_section(
         // region anyway.
         return Err(Fallback::Invalid);
     }
-    let fixed = format!("{:.*}", section.max_fraction_digits, rounded);
+    let fixed = if section.max_fraction_digits == 0 {
+        decimal_view_integer(rounded)?
+    } else {
+        format!("{:.*}", section.max_fraction_digits, rounded)
+    };
     let (raw_integer, raw_fraction) = fixed.split_once('.').unwrap_or((&fixed, ""));
 
     let mut integer = raw_integer.to_string();
@@ -369,6 +371,40 @@ fn render_section(
         decimal,
         section.suffix
     ))
+}
+
+fn decimal_view_integer(value: f64) -> Result<String, Fallback> {
+    let rendered = value.to_string();
+    let (mantissa, exponent) = if let Some((mantissa, exponent)) = rendered.split_once(['e', 'E']) {
+        (
+            mantissa,
+            exponent.parse::<i64>().map_err(|_| Fallback::Unsupported)?,
+        )
+    } else {
+        (rendered.as_str(), 0_i64)
+    };
+    let integer_digits = mantissa
+        .split_once('.')
+        .map_or(mantissa.len(), |(integer, _)| integer.len()) as i64;
+    let mut digits: String = mantissa.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let decimal_position = integer_digits + exponent;
+
+    if decimal_position <= 0 {
+        return Ok("0".into());
+    }
+    let decimal_position = decimal_position as usize;
+    if decimal_position < digits.len() {
+        if digits[decimal_position..]
+            .bytes()
+            .any(|digit| digit != b'0')
+        {
+            return Err(Fallback::Unsupported);
+        }
+        digits.truncate(decimal_position);
+    } else if decimal_position > digits.len() {
+        digits.push_str(&"0".repeat(decimal_position - digits.len()));
+    }
+    Ok(digits)
 }
 
 fn group_thousands(integer: &str) -> String {
@@ -427,17 +463,14 @@ mod tests {
         }
     }
 
-    /// Engine wall, INFERRED (not oracle-pinned): the rendered result may run
-    /// to 255 characters and errors at 256. The measured `#VALUE!` region
-    /// starts at 1.7E+306 (307+ digits); the follow-up probes that would pin
-    /// the cut-over are `=TEXT(1E+255,"0")` (the double below 1E+255 has 255
-    /// digits) and `=TEXT(1E+256,"0")` (256 digits).
+    /// OT-081 Excel oracle: the decimal-view result may run to 255 characters
+    /// and returns `#VALUE!` at 256.
     #[test]
-    fn ot080_rendered_length_wall_is_255_characters() {
-        let at_wall = format_number(1e255, "0").expect("255 digits render");
+    fn ot081_rendered_length_wall_is_255_characters() {
+        let at_wall = format_number(1e254, "0").expect("255 digits render");
         assert_eq!(at_wall.len(), 255);
-        assert!(at_wall.chars().all(|ch| ch.is_ascii_digit()), "{at_wall}");
-        assert_eq!(format_number(1e256, "0"), Err(Fallback::Invalid));
+        assert_eq!(at_wall, decimal_power(254));
+        assert_eq!(format_number(1e255, "0"), Err(Fallback::Invalid));
         assert_eq!(
             format_number(1e20, "0.00"),
             Ok("100000000000000000000.00".into())
@@ -485,5 +518,72 @@ mod tests {
                 "format_number({value}, {code:?})"
             );
         }
+    }
+
+    /// OT-081 Excel oracle (Excel for Mac 16.105.3, saved-XML readback,
+    /// 2026-09-01): integer rendering expands the 15-significant-digit
+    /// decimal view, not the exact binary64 value.
+    fn decimal_power(exponent: usize) -> String {
+        "1".to_string() + &"0".repeat(exponent)
+    }
+
+    #[test]
+    fn ot081_t4c_expands_the_decimal_view_at_1e100() {
+        assert_eq!(format_number(1e100, "0"), Ok(decimal_power(100)));
+    }
+
+    #[test]
+    fn ot081_t4d_expands_the_decimal_view_at_1e200() {
+        assert_eq!(format_number(1e200, "0"), Ok(decimal_power(200)));
+    }
+
+    #[test]
+    fn ot081_t4h_allows_a_255_character_decimal_view() {
+        assert_eq!(format_number(1e254, "0"), Ok(decimal_power(254)));
+    }
+
+    #[test]
+    fn ot081_t4i_rejects_a_256_character_decimal_view() {
+        assert_eq!(format_number(1e255, "0"), Err(Fallback::Invalid));
+    }
+
+    #[test]
+    fn ot081_sub_1e15_exact_integer_control_is_unchanged() {
+        assert_eq!(
+            format_number(999_999_999_999_999_f64, "0"),
+            Ok("999999999999999".into())
+        );
+    }
+
+    #[test]
+    fn ot081_negative_decimal_view_mirrors_the_positive_path() {
+        assert_eq!(
+            format_number(-1e100, "0"),
+            Ok("-".to_string() + &decimal_power(100))
+        );
+    }
+
+    #[test]
+    fn ot081_negative_exact_integer_control_is_unchanged() {
+        assert_eq!(
+            format_number(-999_999_999_999_999_f64, "0"),
+            Ok("-999999999999999".into())
+        );
+    }
+
+    /// OT-081 Excel oracle: placeholder count has no independent 30-character
+    /// cap. The rendered result succeeds through 255 characters and returns
+    /// `#VALUE!` above that wall.
+    #[test]
+    fn ot081_t4m_allows_40_zero_placeholders() {
+        assert_eq!(
+            format_number(1.0, &"0".repeat(40)),
+            Ok("0".repeat(39) + "1")
+        );
+    }
+
+    #[test]
+    fn ot081_t4l_rejects_a_300_character_render() {
+        assert_eq!(format_number(1.0, &"0".repeat(300)), Err(Fallback::Invalid));
     }
 }
