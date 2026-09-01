@@ -540,6 +540,82 @@ mod tests {
         }
     }
 
+    /// OT-080 Excel oracle, tier 1 (Excel for Mac 16.105.3 build
+    /// 16.105.26020123, `en_US`, saved-XML readback, 2026-09-01): every
+    /// huge-magnitude probe is `#VALUE!`. The accepted OT-076 wheel returned
+    /// `inf`, `-inf`, `inf%`, or a 300-digit expansion for these.
+    #[test]
+    fn text_ot080_huge_magnitudes_are_value_errors() {
+        use crate::engine::DateSystem;
+
+        for formula in [
+            r##"=TEXT(1E+307,"0.00")"##,
+            r##"=TEXT(-1E+307,"0.00")"##,
+            r##"=TEXT(1E+307,"#,##0.00")"##,
+            r##"=TEXT(1E+307,"0")"##,
+            r##"=TEXT(9.9E+306,"0.00")"##,
+            r##"=TEXT(1.7E+306,"0.00")"##,
+            r##"=TEXT(1E+307,"0.00%")"##,
+        ] {
+            assert_value_error(eval_text_formula(DateSystem::Excel1900, formula));
+        }
+    }
+
+    /// OT-080 Excel oracle, tier 2: an unquoted `m` beside numeric placeholders
+    /// is a temporal code and yields `#VALUE!`; a bare `m` is the unpadded
+    /// month; quoted and backslash-escaped `m` stay literal; `mm` pads.
+    #[test]
+    fn text_ot080_month_code_oracle() {
+        use crate::engine::DateSystem;
+
+        for formula in [
+            r##"=TEXT(1,"0m")"##,
+            r##"=TEXT(45000,"0.00m")"##,
+            r##"=TEXT(5,"0 mm")"##,
+        ] {
+            assert_value_error(eval_text_formula(DateSystem::Excel1900, formula));
+        }
+        let cases = [
+            (r##"=TEXT(45000,"m")"##, "3"),
+            (r##"=TEXT(1,"0""m""")"##, "1m"),
+            (r##"=TEXT(1,"0\m")"##, "1m"),
+            (r##"=TEXT(45000,"mm")"##, "03"),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                eval_text_formula(DateSystem::Excel1900, formula),
+                LiteralValue::Text(expected.into()),
+                "{formula}"
+            );
+        }
+    }
+
+    /// OT-080 Excel oracle, tier 3: `TEXT` rounds the 15-significant-digit
+    /// decimal view half away from zero. `1.005` and `0.145` sit below the
+    /// binary64 midpoint yet round up in Excel; the accepted OT-076 wheel
+    /// returned `1.00` and `0.14`.
+    #[test]
+    fn text_ot080_midpoint_display_rounding_oracle() {
+        use crate::engine::DateSystem;
+
+        let cases = [
+            (r##"=TEXT(1.005,"0.00")"##, "1.01"),
+            (r##"=TEXT(0.145,"0.00")"##, "0.15"),
+            (r##"=TEXT(2.675,"0.00")"##, "2.68"),
+            (r##"=TEXT(44821.875,"0.00")"##, "44821.88"),
+            (r##"=TEXT(8.835,"0.00")"##, "8.84"),
+            (r##"=TEXT(1.5,"0")"##, "2"),
+            (r##"=TEXT(2.5,"0")"##, "3"),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                eval_text_formula(DateSystem::Excel1900, formula),
+                LiteralValue::Text(expected.into()),
+                "{formula}"
+            );
+        }
+    }
+
     #[test]
     fn text_formats_typed_date_with_uppercase_unpadded_tokens() {
         use chrono::NaiveDate;

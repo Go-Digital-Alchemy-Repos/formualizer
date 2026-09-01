@@ -344,9 +344,14 @@ enum DecimalRoundingMode {
 }
 
 /// Excel ROUND first treats a binary64 value as its 15-significant-digit
-/// decimal rendering, then rounds that decimal half away from zero.
-fn excel_round(number: f64, requested_digits: i32) -> f64 {
-    excel_round_with_mode(number, requested_digits, DecimalRoundingMode::HalfAwayFromZero)
+/// decimal rendering, then rounds that decimal half away from zero. `TEXT`
+/// display rounding shares this rule (OT-080 oracle, 2026-09-01).
+pub(crate) fn excel_round(number: f64, requested_digits: i32) -> f64 {
+    excel_round_with_mode(
+        number,
+        requested_digits,
+        DecimalRoundingMode::HalfAwayFromZero,
+    )
 }
 
 /// Shared decimal-view rounding for the ROUND family. Excel applies the same

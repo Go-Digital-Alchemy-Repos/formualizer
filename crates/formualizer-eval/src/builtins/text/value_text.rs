@@ -350,8 +350,15 @@ impl Function for TextFn {
             formualizer_common::numfmt::FormatClass::Number { .. }
                 | formualizer_common::numfmt::FormatClass::Percent { .. }
         ) {
-            super::number_format::format_number(num, &fmt)
-                .unwrap_or_else(|| legacy_format_number(num, &fmt))
+            match super::number_format::format_number(num, &fmt) {
+                Ok(text) => text,
+                Err(super::number_format::Fallback::Invalid) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new_value(),
+                    )));
+                }
+                Err(super::number_format::Fallback::Unsupported) => legacy_format_number(num, &fmt),
+            }
         } else if fmt.contains('%') {
             format_percent(num)
         } else if fmt.contains('#') && fmt.contains(',') {
@@ -369,7 +376,11 @@ impl Function for TextFn {
             // Date-token parsing is intentionally limited here; conversion still
             // follows the workbook's shared Excel serial semantics.
             let lower = fmt.to_ascii_lowercase();
-            if lower.contains("yyyy") || lower.contains("dd") || lower.contains("mm") {
+            if lower.contains("yyyy")
+                || lower.contains("dd")
+                || lower.contains("mm")
+                || lower == "m"
+            {
                 match format_serial_date(ctx.date_system(), num, &fmt) {
                     Ok(text) => text,
                     Err(_) => {
@@ -497,6 +508,11 @@ fn format_serial_date(
     // Keep this compatibility form explicit so `M/D/YYYY` remains byte-exact.
     if fmt.eq_ignore_ascii_case("m/d/yyyy") {
         return Ok(format!("{}/{}/{:04}", parts.month, parts.day, parts.year));
+    }
+    // A bare `m` is the unpadded month code, not minutes and not a literal
+    // (OT-080 oracle: `TEXT(45000,"m")` is `3`).
+    if fmt.eq_ignore_ascii_case("m") {
+        return Ok(parts.month.to_string());
     }
 
     if let Some(total_minutes) = rounded_minutes {
