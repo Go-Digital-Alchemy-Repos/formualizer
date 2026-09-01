@@ -291,7 +291,7 @@ impl Function for TruncFn {
                 ExcelError::new_value(),
             )));
         }
-        let mut n = match args[0].value()?.into_literal() {
+        let n = match args[0].value()?.into_literal() {
             LiteralValue::Error(e) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
@@ -307,14 +307,8 @@ impl Function for TruncFn {
         } else {
             0
         };
-        if digits >= 0 {
-            let f = 10f64.powi(digits);
-            n = (n * f).trunc() / f;
-        } else {
-            let f = 10f64.powi(-digits);
-            n = (n / f).trunc() * f;
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(n)))
+        let out = excel_round_with_mode(n, digits, DecimalRoundingMode::TowardZero);
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
 }
 
@@ -339,9 +333,27 @@ fn normalize_decimal_digits(digits: &mut Vec<u8>, exponent: &mut i64) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecimalRoundingMode {
+    /// ROUND / MROUND: half away from zero on the decimal view (ES-028).
+    HalfAwayFromZero,
+    /// ROUNDDOWN / TRUNC: toward zero on the decimal view.
+    TowardZero,
+    /// ROUNDUP: away from zero on the decimal view.
+    AwayFromZero,
+}
+
 /// Excel ROUND first treats a binary64 value as its 15-significant-digit
 /// decimal rendering, then rounds that decimal half away from zero.
 fn excel_round(number: f64, requested_digits: i32) -> f64 {
+    excel_round_with_mode(number, requested_digits, DecimalRoundingMode::HalfAwayFromZero)
+}
+
+/// Shared decimal-view rounding for the ROUND family. Excel applies the same
+/// 15-significant-digit decimal view to ROUNDUP, ROUNDDOWN, and TRUNC as to
+/// ROUND, differing only in the carry rule at the requested position
+/// (GOD-214/OT-078 oracle, Excel for Mac 16.105.3, 2026-09-01).
+fn excel_round_with_mode(number: f64, requested_digits: i32, mode: DecimalRoundingMode) -> f64 {
     if !number.is_finite() || number == 0.0 {
         return number;
     }
@@ -379,21 +391,32 @@ fn excel_round(number: f64, requested_digits: i32) -> f64 {
 
     let unit_exponent = -(requested_digits as i64);
     if exponent < unit_exponent {
-        let discarded = (unit_exponent - exponent) as usize;
-        if discarded > digits.len() {
-            return if negative { -0.0 } else { 0.0 };
-        }
-        if discarded == digits.len() {
-            if digits[0] < 5 {
+        // The digit vector is normalized (nonzero leading and trailing
+        // digits), so any discarded suffix contains a nonzero digit and
+        // AwayFromZero always carries.
+        let discarded = unit_exponent - exponent;
+        if discarded >= digits.len() as i64 {
+            let carry = match mode {
+                DecimalRoundingMode::HalfAwayFromZero => {
+                    discarded == digits.len() as i64 && digits[0] >= 5
+                }
+                DecimalRoundingMode::TowardZero => false,
+                DecimalRoundingMode::AwayFromZero => true,
+            };
+            if !carry {
                 return if negative { -0.0 } else { 0.0 };
             }
             digits.clear();
             digits.push(1);
         } else {
-            let retained = digits.len() - discarded;
-            let round_up = digits[retained] >= 5;
+            let retained = digits.len() - discarded as usize;
+            let carry = match mode {
+                DecimalRoundingMode::HalfAwayFromZero => digits[retained] >= 5,
+                DecimalRoundingMode::TowardZero => false,
+                DecimalRoundingMode::AwayFromZero => true,
+            };
             digits.truncate(retained);
-            if round_up {
+            if carry {
                 increment_decimal_digits(&mut digits);
             }
         }
@@ -551,12 +574,7 @@ impl Function for RoundDownFn {
             }
             other => coerce_num(&other)? as i32,
         };
-        let f = 10f64.powi(digits.abs());
-        let out = if digits >= 0 {
-            (n * f).trunc() / f
-        } else {
-            (n / f).trunc() * f
-        };
+        let out = excel_round_with_mode(n, digits, DecimalRoundingMode::TowardZero);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
 }
@@ -630,14 +648,15 @@ impl Function for RoundUpFn {
             }
             other => coerce_num(&other)? as i32,
         };
-        let f = 10f64.powi(digits.abs());
-        let mut scaled = if digits >= 0 { n * f } else { n / f };
-        if scaled > 0.0 {
-            scaled = scaled.ceil();
-        } else {
-            scaled = scaled.floor();
+        let out = excel_round_with_mode(n, digits, DecimalRoundingMode::AwayFromZero);
+        if n.is_finite() && !out.is_finite() {
+            // The away-from-zero carry can leave the representable range
+            // (e.g. ROUNDUP(1.23, -400)); fail closed like Excel's overflow
+            // errors rather than returning a non-finite number.
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_num(),
+            )));
         }
-        let out = if digits >= 0 { scaled / f } else { scaled * f };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
 }
@@ -2355,7 +2374,11 @@ impl Function for MroundFn {
 
         let m = multiple.abs();
         let scaled = number.abs() / m;
-        let rounded = (scaled + 0.5 + 1e-12).floor();
+        // Excel rounds the 15-digit decimal view of the quotient half away
+        // from zero, with no epsilon widening: MROUND(1.3, 0.2) = 1.4 because
+        // 1.3/0.2 renders as 6.5, while MROUND(12.4999999999995, 5) = 10
+        // because 2.4999999999999 stays below the half (GOD-214/OT-078).
+        let rounded = excel_round(scaled, 0);
         let out = rounded * m * number.signum();
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
@@ -3952,6 +3975,135 @@ mod tests_numeric {
             .into_literal(),
             LiteralValue::Number(-1.01)
         );
+    }
+
+    // GOD-214 / OT-078: measured Excel oracle vectors for the ROUND siblings
+    // (Excel for Mac 16.105.3, 2026-09-01, workbook-XML cached values;
+    // research/reports/ot078_excel_rounding_oracle_results_2026-09-01.md in the
+    // bake-off repo). Excel applies the same 15-significant-digit decimal view
+    // as ROUND (ES-028) to ROUNDUP, ROUNDDOWN, and TRUNC, and MROUND rounds the
+    // decimal-viewed quotient half away from zero with no epsilon widening.
+    fn eval_two_arg(
+        fun: std::sync::Arc<dyn Function>,
+        name: &str,
+        n: LiteralValue,
+        d: LiteralValue,
+    ) -> LiteralValue {
+        let wb = TestWorkbook::new().with_function(fun);
+        let ctx = interp(&wb);
+        let f = ctx.context.get_function("", name).unwrap();
+        let a = lit(n);
+        let b = lit(d);
+        f.dispatch(
+            &[ArgumentHandle::new(&a, &ctx), ArgumentHandle::new(&b, &ctx)],
+            &ctx.function_context(None),
+        )
+        .unwrap()
+        .into_literal()
+    }
+
+    #[test]
+    fn rounddown_excel_oracle_vectors() {
+        let vectors: &[(f64, i64, f64)] = &[
+            (368649.99999999994, 0, 368650.0),    // P1
+            (15285.999999999998, 0, 15286.0),     // P2
+            (35.99999999999999, 0, 36.0),         // P5
+            (7100.469999999999, 2, 7100.47),      // P8
+            (529266.0599999999, 2, 529266.06),    // P9
+            (-7100.469999999999, 2, -7100.47),    // P10b
+            (-368649.99999999994, 0, -368650.0),  // P10c
+            (1.23, -400, 0.0),                    // P15b: no 10^400 overflow
+        ];
+        for (n, d, expected) in vectors {
+            assert_eq!(
+                eval_two_arg(
+                    std::sync::Arc::new(RoundDownFn),
+                    "ROUNDDOWN",
+                    LiteralValue::Number(*n),
+                    LiteralValue::Int(*d),
+                ),
+                LiteralValue::Number(*expected),
+                "ROUNDDOWN({n:?}, {d})"
+            );
+        }
+    }
+
+    #[test]
+    fn roundup_excel_oracle_vectors() {
+        let vectors: &[(f64, i64, f64)] = &[
+            (8078659.000000001, 0, 8078659.0),    // P3
+            (26.000000000000004, 0, 26.0),        // P4
+            (68345.24, 2, 68345.24),              // P7
+            (-68345.24, 2, -68345.24),            // P10a
+            (1.23, 400, 1.23),                    // P15a: identity, no overflow
+        ];
+        for (n, d, expected) in vectors {
+            assert_eq!(
+                eval_two_arg(
+                    std::sync::Arc::new(RoundUpFn),
+                    "ROUNDUP",
+                    LiteralValue::Number(*n),
+                    LiteralValue::Int(*d),
+                ),
+                LiteralValue::Number(*expected),
+                "ROUNDUP({n:?}, {d})"
+            );
+        }
+        // Unmeasured in Excel (would overflow the decimal carry to 1e400):
+        // a finite input whose rounded-up magnitude is not representable
+        // fails closed as #NUM! rather than returning a non-finite number.
+        match eval_two_arg(
+            std::sync::Arc::new(RoundUpFn),
+            "ROUNDUP",
+            LiteralValue::Number(1.23),
+            LiteralValue::Int(-400),
+        ) {
+            LiteralValue::Error(e) => assert_eq!(e, "#NUM!"),
+            other => panic!("expected #NUM! for ROUNDUP(1.23,-400), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trunc_excel_oracle_vectors() {
+        let vectors: &[(f64, i64, f64)] = &[
+            (28.999999999999996, 0, 29.0), // P14a (= 0.29*100)
+            (35.99999999999999, 0, 36.0),  // P14b
+        ];
+        for (n, d, expected) in vectors {
+            assert_eq!(
+                eval_two_arg(
+                    std::sync::Arc::new(TruncFn),
+                    "TRUNC",
+                    LiteralValue::Number(*n),
+                    LiteralValue::Int(*d),
+                ),
+                LiteralValue::Number(*expected),
+                "TRUNC({n:?}, {d})"
+            );
+        }
+    }
+
+    #[test]
+    fn mround_excel_oracle_vectors() {
+        let vectors: &[(f64, f64, f64)] = &[
+            (12.4999999999995, 5.0, 10.0),   // P11a: near-half stays down
+            (0.4999999999995, 1.0, 0.0),     // P11b
+            (1.24999999999994, 0.5, 1.0),    // P11c
+            (2.5, 1.0, 3.0),                 // P12a: exact tie away from zero
+            (-2.5, -1.0, -3.0),              // P12b
+        ];
+        for (n, m, expected) in vectors {
+            assert_eq!(
+                eval_two_arg(
+                    std::sync::Arc::new(MroundFn),
+                    "MROUND",
+                    LiteralValue::Number(*n),
+                    LiteralValue::Number(*m),
+                ),
+                LiteralValue::Number(*expected),
+                "MROUND({n:?}, {m:?})"
+            );
+        }
     }
 
     // MOD
