@@ -62,12 +62,14 @@ __all__ = [
     "Workbook",
     "WorkbookConfig",
     "WorkbookMode",
+    "excel_token_for_kind",
     "load_workbook",
     "load_workbook_bytes",
     "parse",
     "parse_formula",
     "recalculate_file",
     "tokenize",
+    "EXCEL_ERROR_TOKENS",
     "DependencyStateUnavailableError",
     "ExcelEvaluationError",
     "FormualizerHostError",
@@ -672,6 +674,21 @@ class LiteralValue:
         s.set_value(1, 2, v2)
     ```
     """
+    @property
+    def excel_token(self) -> typing.Optional[builtins.str]:
+        r"""
+        The Excel cell token for this value, when it is an error kind Excel
+        actually has: `#NULL!`, `#REF!`, `#NAME?`, `#VALUE!`, `#DIV/0!`,
+        `#N/A`, `#NUM!`, `#SPILL!`, `#CALC!`.
+        
+        `None` in **both** of these cases, which callers must not conflate:
+        
+        * the value is not an error at all (a number, text, a blank, …);
+        * the value *is* an error, but of an engine-internal kind with no
+          Excel cell token (`Error`, `NImpl`, `Circ`, `Cancelled`).
+        
+        Use `is_error` to tell the two apart.
+        """
     @property
     def is_int(self) -> builtins.bool:
         r"""
@@ -2075,6 +2092,31 @@ class WorkbookMode(enum.Enum):
     def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
 
+def excel_token_for_kind(kind: builtins.str) -> typing.Optional[builtins.str]:
+    r"""
+    Resolve a Python-surface error-kind name to its Excel cell token.
+    
+    `kind` is the CamelCase spelling the binding uses in error dicts
+    (`{"type": "Error", "kind": "Div"}`), matched case-insensitively. The
+    historical aliases `LiteralValue.error` accepts on input are accepted here
+    too: `"Div0"` for `Div` and `"NA"` for `Na`.
+    
+    Returns the token (`"#DIV/0!"`, …) for the nine kinds Excel really has, and
+    `None` for the engine-internal kinds `Error`, `NImpl`, `Circ` and
+    `Cancelled`.
+    
+    Raises `ValueError` for a string that is not a known kind. A driver typo
+    must fail loudly rather than silently resolve to a default token.
+    
+    Example:
+    ```python
+        import formualizer as fz
+    
+        fz.excel_token_for_kind("Div")   # "#DIV/0!"
+        fz.excel_token_for_kind("circ")  # None
+    ```
+    """
+
 def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = None, *, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
     r"""
     Load an XLSX workbook from a filesystem path.
@@ -2195,6 +2237,17 @@ class SheetPortError(Exception): ...
 class SheetPortManifestError(SheetPortError): ...
 class SheetPortConstraintError(SheetPortError): ...
 class SheetPortWorkbookError(SheetPortError): ...
+
+# GOD-230: module members registered at runtime (`m.add` / `m.setattr`), which
+# pyo3-stub-gen's inventory does not see.
+#
+# `__build__` is the wheel's provenance stamp: `commit` is the 40-hex fork
+# commit it was built from (None when the build could not read a checkout) and
+# `dirty` says whether that tree had uncommitted changes (None when unknown).
+__build__: dict[str, typing.Any]
+# Every engine error kind mapped to its Excel cell token, or None for the
+# engine-internal kinds Excel has no token for.
+EXCEL_ERROR_TOKENS: dict[builtins.str, builtins.str | None]
 
 # Backwards compatible Py* aliases
 #

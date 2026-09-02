@@ -103,7 +103,7 @@ fn typed_literal_json(value: &LiteralValue) -> serde_json::Value {
                 }),
             };
             serde_json::json!({
-                "type": "Error", "kind": format!("{:?}", error.kind),
+                "type": "Error", "kind": error.kind.kind_name(),
                 "message": error.message, "context": context,
                 "extra": extra,
             })
@@ -1844,6 +1844,12 @@ mod tests {
         assert!(resolved.enable_changelog);
         assert!(resolved.eval.defer_graph_building);
         assert_eq!(resolved.eval.formula_plane_mode, FormulaPlaneMode::Off);
+        // GOD-230: the binding default reaches workbooks built without an
+        // explicit eval config too.
+        assert_eq!(
+            resolved.eval.cycle.detection,
+            formualizer::eval::engine::CycleDetection::Runtime
+        );
     }
 
     #[cfg(not(target_os = "emscripten"))]

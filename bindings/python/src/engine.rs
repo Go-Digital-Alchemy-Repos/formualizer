@@ -40,6 +40,19 @@ pub(crate) fn apply_binding_eval_defaults(config: &mut EvalConfig) {
     if cfg!(target_os = "emscripten") {
         config.enable_parallel = false;
     }
+
+    // GOD-230 / CL-004 / CL-067: the *binding* defaults to runtime cycle
+    // detection, deliberately diverging from `EvalConfig::default()`, which is
+    // still `CycleDetection::Static` for engine-internal compatibility.
+    //
+    // Static detection stamps every *statically* circular SCC with `#CIRC`,
+    // including phantom SCCs whose live edges are acyclic (an IF that never
+    // takes the branch closing the loop). Real workbooks are full of those, so
+    // a static-detection host reports circularity where Excel reports a value.
+    // Runtime detection only rules on cycles that are actually witnessed, which
+    // is what any host comparing against Excel wants. Every binding path that
+    // builds a default EvalConfig goes through this seam.
+    config.cycle.detection = CycleDetection::Runtime;
 }
 
 pub(crate) fn binding_default_eval_config() -> EvalConfig {
@@ -518,14 +531,34 @@ mod tests {
     use crate::engine::merge_python_eval_config;
 
     #[test]
-    fn defaults_match_engine_cycle_defaults() {
+    fn binding_default_is_runtime_cycle_detection() {
+        // GOD-230 / CL-004 / CL-067. The binding default is runtime detection.
         let cfg = PyEvaluationConfig::new();
-        // Engine default is detection=static, policy=error.
-        assert_eq!(cfg.get_cycle_detection(), "static");
+        assert_eq!(cfg.get_cycle_detection(), "runtime");
         assert_eq!(cfg.get_cycle_policy(), "error");
         // Knob getters read Excel defaults even when not iterating.
         assert_eq!(cfg.get_iterate_max_iterations(), 100);
         assert!((cfg.get_iterate_max_change() - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn binding_default_deliberately_differs_from_engine_default() {
+        // Pin the engine default separately, so a future change to
+        // `EvalConfig::default()` is visible here instead of being masked by
+        // the binding override.
+        assert_eq!(EvalConfig::default().cycle.detection, CycleDetection::Static);
+        assert_eq!(EvalConfig::default().cycle.policy, CyclePolicy::Error);
+
+        let binding = binding_default_eval_config();
+        assert_eq!(binding.cycle.detection, CycleDetection::Runtime);
+        // The divergence is exactly one field: policy and the iterate knobs
+        // still come from the engine.
+        assert_eq!(binding.cycle.policy, EvalConfig::default().cycle.policy);
+        assert_ne!(
+            binding.cycle.detection,
+            EvalConfig::default().cycle.detection,
+            "the binding override is the point of this test"
+        );
     }
 
     #[test]

@@ -29,10 +29,17 @@ def test_public_reexports_match_native_module() -> None:
     }
 
     assert expected | exceptions <= set(native.__all__)
-    assert set(formualizer.__all__) == set(native.__all__) | {
+    # GOD-230 added pure-Python helpers that live in formualizer/__init__.py,
+    # so the public package's __all__ is a strict superset of the native one.
+    pure_python_exports = {
+        "QUALIFIED_WORKBOOK_SEED",
         "ReferenceLike",
+        "qualified_config",
+        "qualified_eval_config",
+        "set_qualified_clock",
         "visitor",
     }
+    assert set(formualizer.__all__) == set(native.__all__) | pure_python_exports
     for name in expected | exceptions:
         assert getattr(formualizer, name) is getattr(native, name)
 

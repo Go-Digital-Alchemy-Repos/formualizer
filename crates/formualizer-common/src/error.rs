@@ -82,6 +82,123 @@ impl ExcelErrorKind {
     pub fn parse(s: &str) -> Self {
         Self::try_parse(s).unwrap_or(Self::Error)
     }
+
+    /// Every variant of `ExcelErrorKind`, in declaration order.
+    ///
+    /// `ExcelErrorKind` is `#[non_exhaustive]`, so downstream crates cannot
+    /// write an exhaustive match over it. `ALL` is the supported way to
+    /// enumerate the kinds (bindings build their error tables from it).
+    ///
+    /// Adding a variant without extending `ALL` is a **compile error**: see
+    /// [`ExcelErrorKind::all_variants_are_listed`], a private exhaustive match
+    /// in this crate that the compiler forces to be updated in lockstep.
+    pub const ALL: &'static [ExcelErrorKind] = &[
+        Self::Null,
+        Self::Ref,
+        Self::Name,
+        Self::Value,
+        Self::Div,
+        Self::Na,
+        Self::Num,
+        Self::Error,
+        Self::NImpl,
+        Self::Spill,
+        Self::Calc,
+        Self::Circ,
+        Self::Cancelled,
+    ];
+
+    /// Compile-time guard for [`ExcelErrorKind::ALL`].
+    ///
+    /// This is an exhaustive match written *inside* the defining crate, where
+    /// `#[non_exhaustive]` does not apply. Adding a variant to the enum makes
+    /// this match non-exhaustive and therefore fails the build, which is the
+    /// point: whoever adds the variant is forced to come here, add it to
+    /// `ALL`, and decide its `excel_token`.
+    ///
+    /// The returned index is the variant's position in `ALL`; the unit test
+    /// `all_lists_every_variant_in_order` asserts the two agree.
+    const fn all_index(self) -> usize {
+        match self {
+            Self::Null => 0,
+            Self::Ref => 1,
+            Self::Name => 2,
+            Self::Value => 3,
+            Self::Div => 4,
+            Self::Na => 5,
+            Self::Num => 6,
+            Self::Error => 7,
+            Self::NImpl => 8,
+            Self::Spill => 9,
+            Self::Calc => 10,
+            Self::Circ => 11,
+            Self::Cancelled => 12,
+        }
+    }
+
+    /// Alias kept for documentation links; see [`ExcelErrorKind::all_index`].
+    #[doc(hidden)]
+    pub const fn all_variants_are_listed(self) -> usize {
+        self.all_index()
+    }
+
+    /// The CamelCase variant name, spelled exactly as the Python binding
+    /// surface spells it (`"Div"`, `"Na"`, `"NImpl"`, …).
+    ///
+    /// This is the same string the bindings historically produced with
+    /// `format!("{:?}", kind)`, promoted to a real API so that the
+    /// `{"type": "Error", "kind": ...}` dict spelling cannot drift.
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Null => "Null",
+            Self::Ref => "Ref",
+            Self::Name => "Name",
+            Self::Value => "Value",
+            Self::Div => "Div",
+            Self::Na => "Na",
+            Self::Num => "Num",
+            Self::Error => "Error",
+            Self::NImpl => "NImpl",
+            Self::Spill => "Spill",
+            Self::Calc => "Calc",
+            Self::Circ => "Circ",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// The literal token Excel writes into a cell for this error kind, or
+    /// `None` for kinds that exist only inside this engine.
+    ///
+    /// `Some(..)` for the nine real Excel cell errors: `#NULL!`, `#REF!`,
+    /// `#NAME?`, `#VALUE!`, `#DIV/0!`, `#N/A`, `#NUM!`, `#SPILL!`, `#CALC!`.
+    ///
+    /// `None` for `Error`, `NImpl`, `Circ` and `Cancelled`. Excel has no cell
+    /// token for any of these — `#ERROR!` and `#N/IMPL!` are this engine's
+    /// diagnostics, a circular reference is reported by Excel out-of-band
+    /// (the cell holds `0`, not a `#CIRC!` token), and `Cancelled` is a host
+    /// cancellation signal. `Display` still renders a `#…!` string for them
+    /// so logs stay readable; that string is deliberately *not* an Excel
+    /// token and must not be compared against a real workbook.
+    ///
+    /// Written as an exhaustive match on purpose — there is no `_ =>` arm, so
+    /// a new variant cannot silently inherit a wrong answer.
+    pub const fn excel_token(&self) -> Option<&'static str> {
+        match self {
+            Self::Null => Some("#NULL!"),
+            Self::Ref => Some("#REF!"),
+            Self::Name => Some("#NAME?"),
+            Self::Value => Some("#VALUE!"),
+            Self::Div => Some("#DIV/0!"),
+            Self::Na => Some("#N/A"),
+            Self::Num => Some("#NUM!"),
+            Self::Spill => Some("#SPILL!"),
+            Self::Calc => Some("#CALC!"),
+            Self::Error => None,
+            Self::NImpl => None,
+            Self::Circ => None,
+            Self::Cancelled => None,
+        }
+    }
 }
 
 /// Generic, lightweight metadata that *any* error may carry.
@@ -457,6 +574,75 @@ mod tests {
         let err = ExcelError::from_error_string("#BOGUS!");
         assert_eq!(err.kind, ExcelErrorKind::Error);
         assert!(err.message.unwrap_or_default().contains("#BOGUS!"));
+    }
+
+    #[test]
+    fn all_lists_every_variant_in_order() {
+        // 13 variants today. If this number changes, the enum gained or lost a
+        // kind and every table below has to be revisited deliberately.
+        assert_eq!(ExcelErrorKind::ALL.len(), 13);
+        for (index, kind) in ExcelErrorKind::ALL.iter().enumerate() {
+            assert_eq!(
+                kind.all_index(),
+                index,
+                "{kind:?} is out of position in ExcelErrorKind::ALL"
+            );
+        }
+    }
+
+    #[test]
+    fn all_round_trips_through_display_and_parse() {
+        for kind in ExcelErrorKind::ALL {
+            let rendered = kind.to_string();
+            assert!(
+                rendered.starts_with('#'),
+                "{kind:?} renders as {rendered:?}"
+            );
+            assert_eq!(
+                ExcelErrorKind::try_parse(&rendered),
+                Some(*kind),
+                "{kind:?} does not round-trip through Display/try_parse"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_name_matches_the_debug_spelling_the_bindings_expose() {
+        for kind in ExcelErrorKind::ALL {
+            assert_eq!(kind.kind_name(), format!("{kind:?}"));
+        }
+    }
+
+    #[test]
+    fn excel_token_table_is_exact() {
+        let expected: &[(ExcelErrorKind, &str, Option<&str>)] = &[
+            (ExcelErrorKind::Null, "Null", Some("#NULL!")),
+            (ExcelErrorKind::Ref, "Ref", Some("#REF!")),
+            (ExcelErrorKind::Name, "Name", Some("#NAME?")),
+            (ExcelErrorKind::Value, "Value", Some("#VALUE!")),
+            (ExcelErrorKind::Div, "Div", Some("#DIV/0!")),
+            (ExcelErrorKind::Na, "Na", Some("#N/A")),
+            (ExcelErrorKind::Num, "Num", Some("#NUM!")),
+            (ExcelErrorKind::Error, "Error", None),
+            (ExcelErrorKind::NImpl, "NImpl", None),
+            (ExcelErrorKind::Spill, "Spill", Some("#SPILL!")),
+            (ExcelErrorKind::Calc, "Calc", Some("#CALC!")),
+            (ExcelErrorKind::Circ, "Circ", None),
+            (ExcelErrorKind::Cancelled, "Cancelled", None),
+        ];
+        assert_eq!(expected.len(), ExcelErrorKind::ALL.len());
+        for (index, (kind, name, token)) in expected.iter().enumerate() {
+            assert_eq!(ExcelErrorKind::ALL[index], *kind);
+            assert_eq!(kind.kind_name(), *name);
+            assert_eq!(kind.excel_token(), *token, "token for {kind:?}");
+        }
+        assert_eq!(
+            ExcelErrorKind::ALL
+                .iter()
+                .filter(|k| k.excel_token().is_some())
+                .count(),
+            9
+        );
     }
 
     #[test]

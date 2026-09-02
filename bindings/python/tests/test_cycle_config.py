@@ -7,7 +7,9 @@ import formualizer as fz
 
 def test_cycle_defaults():
     cfg = fz.EvaluationConfig()
-    assert cfg.cycle_detection == "static"
+    # GOD-230 (CL-004 / CL-067): the binding default is runtime detection, which
+    # deliberately differs from the engine's own `EvalConfig::default()`.
+    assert cfg.cycle_detection == "runtime"
     assert cfg.cycle_policy == "error"
     # Knob getters read Excel defaults even when not iterating.
     assert cfg.iterate_max_iterations == 100
@@ -71,3 +73,11 @@ def test_iterative_calculation_end_to_end():
 
     assert wb.get_value("S", 1, 2) == pytest.approx(40.0 / 3.0, abs=0.01)
     assert wb.get_value("S", 1, 3) == pytest.approx(50.0 / 3.0, abs=0.01)
+
+
+def test_static_detection_is_still_selectable():
+    # The GOD-230 default flip is a default, not a removal: hosts that want the
+    # old every-static-SCC-is-#CIRC behaviour can still ask for it.
+    cfg = fz.EvaluationConfig()
+    cfg.cycle_detection = "static"
+    assert cfg.cycle_detection == "static"

@@ -237,6 +237,38 @@ fn recalculate_file(py: Python<'_>, path: &str, output: Option<&str>) -> PyResul
 }
 
 /// The main formualizer Python module
+/// Provenance of this compiled extension module (GOD-230).
+///
+/// Returns `{"commit": str | None, "dirty": bool | None}`:
+///
+/// * `commit` — the 40-hex fork commit `build.rs` read from the source tree at
+///   compile time, or `None` when git was unavailable or the source was not a
+///   checkout. Never fabricated.
+/// * `dirty` — whether that tree had uncommitted changes, or `None` when it
+///   could not be determined.
+///
+/// Deliberately carries no timestamp: an embedded build time would make two
+/// builds of the same source differ byte-for-byte, and wheel reproducibility
+/// is a measured gate.
+fn build_stamp(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let out = pyo3::types::PyDict::new(py);
+
+    let commit = env!("FORMUALIZER_BUILD_COMMIT");
+    if commit == "unknown" {
+        out.set_item("commit", py.None())?;
+    } else {
+        out.set_item("commit", commit)?;
+    }
+
+    match env!("FORMUALIZER_BUILD_DIRTY") {
+        "true" => out.set_item("dirty", true)?,
+        "false" => out.set_item("dirty", false)?,
+        _ => out.set_item("dirty", py.None())?,
+    }
+
+    Ok(out.into_any().unbind())
+}
+
 #[pymodule]
 fn formualizer_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register all submodules
@@ -259,6 +291,11 @@ fn formualizer_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_workbook, m)?)?;
     m.add_function(wrap_pyfunction!(load_workbook_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(recalculate_file, m)?)?;
+
+    // Build provenance (GOD-230). `setattr`, not `add`: a dunder does not
+    // belong in the module's `__all__`, and the public package re-exports it
+    // explicitly.
+    m.setattr("__build__", build_stamp(m.py())?)?;
 
     // Backward-compatible aliases for older names which started with `Py...`.
     // These are not the preferred API, but keeping them avoids breaking existing callers.

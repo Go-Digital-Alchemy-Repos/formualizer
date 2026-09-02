@@ -9,6 +9,8 @@ description = "PyO3 bindings for the Formualizer spreadsheet engine"
 readme = "README.md"
 repository = "https://github.com/PSU3D0/formualizer"
 documentation = "https://pypi.org/project/formualizer/"
+# GOD-230: build.rs stamps the fork commit into the wheel (see build.rs).
+build = "build.rs"
 keywords = ["spreadsheet", "excel", "formula", "python", "parser"]
 categories = ["api-bindings", "mathematics"]
 [lib]

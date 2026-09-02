@@ -7,7 +7,7 @@ use pyo3::types::{
     PyAny, PyBool, PyDate, PyDateTime, PyDelta, PyDict, PyFloat, PyInt, PyList, PyString, PyTime,
 };
 #[cfg(not(target_os = "emscripten"))]
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
 type PyObject = pyo3::Py<pyo3::PyAny>;
 
@@ -210,6 +210,41 @@ impl PyLiteralValue {
                 extra: ExcelErrorExtra::None,
             }),
         })
+    }
+
+    /// Wrap any Python value the engine understands as a `LiteralValue`.
+    ///
+    /// Accepts the same shapes the engine's setters accept: numbers, strings,
+    /// booleans, dates/times/timedeltas, nested sequences, and the error dicts
+    /// the engine hands back (`{"type": "Error", "kind": "Div"}`).
+    ///
+    /// This is the bridge from a *read* value to the `LiteralValue` API:
+    /// `Workbook.get_value` returns plain Python objects, so a caller who
+    /// wants `excel_token` on an evaluated cell round-trips it through here.
+    #[staticmethod]
+    pub fn from_object(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(PyLiteralValue {
+            inner: py_to_literal(value)?,
+        })
+    }
+
+    /// The Excel cell token for this value, when it is an error kind Excel
+    /// actually has: `#NULL!`, `#REF!`, `#NAME?`, `#VALUE!`, `#DIV/0!`,
+    /// `#N/A`, `#NUM!`, `#SPILL!`, `#CALC!`.
+    ///
+    /// `None` in **both** of these cases, which callers must not conflate:
+    ///
+    /// * the value is not an error at all (a number, text, a blank, …);
+    /// * the value *is* an error, but of an engine-internal kind with no
+    ///   Excel cell token (`Error`, `NImpl`, `Circ`, `Cancelled`).
+    ///
+    /// Use `is_error` to tell the two apart.
+    #[getter]
+    pub fn excel_token(&self) -> Option<String> {
+        match &self.inner {
+            LiteralValue::Error(err) => err.kind.excel_token().map(str::to_string),
+            _ => None,
+        }
     }
 
     /// Check if value is an Int
@@ -496,7 +531,7 @@ pub(crate) fn literal_to_py(py: Python<'_>, value: &LiteralValue) -> PyResult<Py
         LiteralValue::Error(err) => {
             let dict = PyDict::new(py);
             dict.set_item("type", "Error")?;
-            dict.set_item("kind", format!("{:?}", err.kind))?;
+            dict.set_item("kind", err.kind.kind_name())?;
             if let Some(msg) = &err.message {
                 dict.set_item("message", msg)?;
             }
@@ -890,8 +925,166 @@ pub(crate) fn py_to_literal(value: &Bound<'_, PyAny>) -> PyResult<LiteralValue> 
     ))
 }
 
+/// Resolve a Python-surface error-kind name to its Excel cell token.
+///
+/// `kind` is the CamelCase spelling the binding uses in error dicts
+/// (`{"type": "Error", "kind": "Div"}`), matched case-insensitively. The
+/// historical aliases `LiteralValue.error` accepts on input are accepted here
+/// too: `"Div0"` for `Div` and `"NA"` for `Na`.
+///
+/// Returns the token (`"#DIV/0!"`, …) for the nine kinds Excel really has, and
+/// `None` for the engine-internal kinds `Error`, `NImpl`, `Circ` and
+/// `Cancelled`.
+///
+/// Raises `ValueError` for a string that is not a known kind. A driver typo
+/// must fail loudly rather than silently resolve to a default token.
+///
+/// Example:
+/// ```python
+///     import formualizer as fz
+///
+///     fz.excel_token_for_kind("Div")   # "#DIV/0!"
+///     fz.excel_token_for_kind("circ")  # None
+/// ```
+#[cfg_attr(
+    not(target_os = "emscripten"),
+    gen_stub_pyfunction(module = "formualizer.formualizer_py")
+)]
+#[pyfunction]
+pub fn excel_token_for_kind(kind: &str) -> PyResult<Option<String>> {
+    let wanted = kind.trim().to_ascii_lowercase();
+    // Aliases that `LiteralValue.error` already accepts on input.
+    let wanted = match wanted.as_str() {
+        "div0" => "div".to_string(),
+        _ => wanted,
+    };
+    for candidate in ExcelErrorKind::ALL {
+        if candidate.kind_name().to_ascii_lowercase() == wanted {
+            return Ok(candidate.excel_token().map(str::to_string));
+        }
+    }
+    Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+        "Unknown error kind: {kind}. Known kinds: {}.",
+        ExcelErrorKind::ALL
+            .iter()
+            .map(|k| k.kind_name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// Build the `EXCEL_ERROR_TOKENS` mapping from `ExcelErrorKind::ALL`.
+fn excel_error_tokens<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let table = PyDict::new(py);
+    for kind in ExcelErrorKind::ALL {
+        table.set_item(kind.kind_name(), kind.excel_token())?;
+    }
+    Ok(table)
+}
+
 /// Register the value module with Python
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLiteralValue>()?;
+    m.add_function(pyo3::wrap_pyfunction!(excel_token_for_kind, m)?)?;
+    // One entry per engine error kind; the value is `None` for kinds with no
+    // Excel cell token. Drivers should read this table rather than hard-coding
+    // a token map that can drift from the engine.
+    m.add("EXCEL_ERROR_TOKENS", excel_error_tokens(m.py())?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact (kind_name, excel_token) table the Python surface exposes as
+    /// `EXCEL_ERROR_TOKENS`. Adding an engine kind fails this test as well as
+    /// the build (see `ExcelErrorKind::all_index`), so the table can never
+    /// silently lose an entry. Keep in sync with
+    /// `bindings/python/tests/test_excel_token.py`.
+    const EXPECTED: &[(&str, Option<&str>)] = &[
+        ("Null", Some("#NULL!")),
+        ("Ref", Some("#REF!")),
+        ("Name", Some("#NAME?")),
+        ("Value", Some("#VALUE!")),
+        ("Div", Some("#DIV/0!")),
+        ("Na", Some("#N/A")),
+        ("Num", Some("#NUM!")),
+        ("Error", None),
+        ("NImpl", None),
+        ("Spill", Some("#SPILL!")),
+        ("Calc", Some("#CALC!")),
+        ("Circ", None),
+        ("Cancelled", None),
+    ];
+
+    #[test]
+    fn excel_error_token_table_is_exact() {
+        assert_eq!(ExcelErrorKind::ALL.len(), 13);
+        assert_eq!(EXPECTED.len(), ExcelErrorKind::ALL.len());
+        for (kind, (name, token)) in ExcelErrorKind::ALL.iter().zip(EXPECTED) {
+            assert_eq!(kind.kind_name(), *name);
+            assert_eq!(kind.excel_token(), *token, "token for {kind:?}");
+        }
+        assert_eq!(EXPECTED.iter().filter(|(_, t)| t.is_some()).count(), 9);
+        assert_eq!(EXPECTED.iter().filter(|(_, t)| t.is_none()).count(), 4);
+    }
+
+    #[test]
+    fn excel_token_for_kind_is_case_insensitive_and_accepts_div0_alias() {
+        assert_eq!(
+            excel_token_for_kind("Div").unwrap().as_deref(),
+            Some("#DIV/0!")
+        );
+        assert_eq!(
+            excel_token_for_kind("div").unwrap().as_deref(),
+            Some("#DIV/0!")
+        );
+        assert_eq!(
+            excel_token_for_kind("DIV0").unwrap().as_deref(),
+            Some("#DIV/0!")
+        );
+        assert_eq!(
+            excel_token_for_kind(" nimpl ").unwrap().as_deref(),
+            None,
+            "NImpl is a real kind with no Excel token"
+        );
+        assert!(excel_token_for_kind("Bogus").is_err());
+        assert!(
+            excel_token_for_kind("#DIV/0!").is_err(),
+            "the function takes kind names, not tokens"
+        );
+    }
+
+    #[test]
+    fn literal_value_excel_token_distinguishes_nothing_from_tokenless() {
+        use formualizer::common::error::ExcelErrorExtra;
+
+        let div = PyLiteralValue {
+            inner: LiteralValue::Error(ExcelError {
+                kind: ExcelErrorKind::Div,
+                message: None,
+                context: None,
+                extra: ExcelErrorExtra::None,
+            }),
+        };
+        assert_eq!(div.excel_token().as_deref(), Some("#DIV/0!"));
+
+        let circ = PyLiteralValue {
+            inner: LiteralValue::Error(ExcelError {
+                kind: ExcelErrorKind::Circ,
+                message: None,
+                context: None,
+                extra: ExcelErrorExtra::None,
+            }),
+        };
+        assert_eq!(circ.excel_token(), None);
+        assert!(circ.is_error());
+
+        let number = PyLiteralValue {
+            inner: LiteralValue::Number(1.0),
+        };
+        assert_eq!(number.excel_token(), None);
+        assert!(!number.is_error());
+    }
 }
