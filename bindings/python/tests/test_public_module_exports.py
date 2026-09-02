@@ -31,8 +31,13 @@ def test_public_reexports_match_native_module() -> None:
     assert expected | exceptions <= set(native.__all__)
     # GOD-230 added pure-Python helpers that live in formualizer/__init__.py,
     # so the public package's __all__ is a strict superset of the native one.
+    # The error-token surface is registered on the native module but is also
+    # re-exported by name from the package, so it belongs in this union
+    # whichever module's __all__ happens to carry it.
     pure_python_exports = {
+        "EXCEL_ERROR_TOKENS",
         "QUALIFIED_WORKBOOK_SEED",
+        "excel_token_for_kind",
         "ReferenceLike",
         "qualified_config",
         "qualified_eval_config",
