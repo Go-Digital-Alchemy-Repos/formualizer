@@ -217,13 +217,19 @@ fn date_typed_arithmetic_uses_the_1904_workbook_system() {
 
 #[test]
 fn known_comparison_and_criteria_divergences_remain_pinned() {
-    // Formualizer currently type-orders text below numbers here; LO returns FALSE.
-    // The comparison-coercion divergence is tracked separately from #289.
+    // GOD-228 / ES-044 closed this divergence. Excel ranks types
+    // `number < text < boolean` in every relational operator and never coerces
+    // across a rank boundary, so a text operand is always greater than a
+    // numeric one and `"1/1/03"<37623` is FALSE — which is also what LO
+    // returns. Measured 2026-09-02, Excel 16.105.3, receipt
+    // `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`
+    // row `n16` (`"5"<4` FALSE). Before GOD-228 this pinned TRUE, produced by
+    // a lexicographic fallback comparing "1/1/03" against "37623".
     assert_expected(
         DateSystem::Excel1900,
         "=\"1/1/03\"<37623",
-        "oracle: lo-verified divergence",
-        Expected::Boolean(true),
+        "oracle: lo-verified",
+        Expected::Boolean(false),
     );
 
     // Formualizer does not date-coerce COUNTIF criteria here; LO returns 1.

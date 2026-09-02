@@ -483,15 +483,120 @@ mod tests {
             LiteralValue::Boolean(true)
         );
 
-        // Mixed type comparisons
+        // Mixed type comparisons. Excel ranks types (number < text < boolean)
+        // and never coerces across a rank boundary; see the god228 fixture
+        // below for the full measured table.
         assert_eq!(
             evaluate_formula("=\"5\"=5", &wb).unwrap(),
-            LiteralValue::Boolean(true)
-        );
+            LiteralValue::Boolean(false)
+        ); // GOD-228 receipt row `n14`: text never equals a number
         assert_eq!(
             evaluate_formula("=TRUE=1", &wb).unwrap(),
-            LiteralValue::Boolean(true)
-        );
+            LiteralValue::Boolean(false)
+        ); // GOD-228 receipt row `n04`: boolean outranks number
+    }
+
+    /// GOD-228 / ES-044 / CL-065: Excel's relational type rank,
+    /// `number < text < boolean`, applied identically by all six operators.
+    ///
+    /// All 34 rows are copied verbatim from the Excel oracle receipt
+    /// `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`
+    /// (sha256
+    /// `76e3fbb0dd34158332425be795a0cd553459cc6e263b4c5c59a886d89360c2da`),
+    /// measured in Microsoft Excel for Mac 16.105.3, `en_US`, 2026-09-02. The
+    /// tuple is `(receipt row id, formula, Excel's value)`; no expected value
+    /// here was inferred, derived or copied from the engine.
+    ///
+    /// Rows `n17`-`n20` reference `$Z$1`, a blank cell. `TestWorkbook`'s
+    /// resolver returns `#REF!` for a key that is absent from its map, so the
+    /// cell is written explicitly as `LiteralValue::Empty` — that is the same
+    /// value the real engine's resolver hands `Interpreter::compare` for a
+    /// never-written in-bounds cell.
+    #[test]
+    fn test_god228_boolean_ordering_type_rank() {
+        let wb = create_workbook()
+            // Z1: blank. Column 26, row 1.
+            .with_cell("Sheet1", 1, 26, LiteralValue::Empty);
+
+        let cases: [(&str, &str, bool); 34] = [
+            ("n01", "=TRUE<=1", false),
+            ("n02", "=TRUE>=1", true),
+            ("n03", "=TRUE<>1", true),
+            ("n04", "=TRUE=1", false),
+            ("n05", "=1<TRUE", true),
+            ("n06", "=1<=TRUE", true),
+            ("n07", "=TRUE>FALSE", true),
+            ("n08", "=FALSE>TRUE", false),
+            ("n09", "=TRUE>=FALSE", true),
+            ("n10", "=\"a\"<TRUE", true),
+            ("n11", "=\"Z\"<FALSE", true),
+            ("n12", "=TRUE>\"z\"", true),
+            ("n13", "=\"TRUE\"=TRUE", false),
+            ("n14", "=\"5\"=5", false),
+            ("n15", "=\"5\">4", true),
+            ("n16", "=\"5\"<4", false),
+            ("n17", "=$Z$1=FALSE", true),
+            ("n18", "=$Z$1<TRUE", true),
+            ("n19", "=$Z$1=0", true),
+            ("n20", "=$Z$1=\"\"", true),
+            ("n21", "=FALSE=0", false),
+            ("n22", "=0<>FALSE", true),
+            ("n23", "=FALSE<\"a\"", false),
+            ("n24", "=TRUE<=\"a\"", false),
+            ("f01", "=FALSE>0", true),
+            ("f02", "=TRUE>0", true),
+            ("f03", "=FALSE>1", true),
+            ("f04", "=TRUE>1", true),
+            ("f05", "=FALSE=0", false),
+            ("f06", "=FALSE<0", false),
+            ("f07", "=TRUE<1", false),
+            ("f08", "=TRUE<0", false),
+            ("f09", "=\"a\">1", true),
+            ("f10", "=FALSE>\"a\"", true),
+        ];
+
+        for (id, formula, expected) in cases {
+            assert_eq!(
+                evaluate_formula(formula, &wb).unwrap(),
+                LiteralValue::Boolean(expected),
+                "receipt row {id}: {formula}"
+            );
+        }
+    }
+
+    /// GOD-228: behaviours the 34-row receipt does not cover, pinned here so a
+    /// later change cannot move them silently. These are *derived* from the
+    /// measured rank rule, not measured in Excel.
+    #[test]
+    fn test_god228_rank_corollaries_not_in_receipt() {
+        let wb = create_workbook()
+            .with_cell("Sheet1", 1, 26, LiteralValue::Empty)
+            .with_cell("Sheet1", 2, 26, LiteralValue::Empty);
+
+        let cases: [(&str, bool); 10] = [
+            // Blank versus blank: equal, on every operator.
+            ("=$Z$1=$Z$2", true),
+            ("=$Z$1<>$Z$2", false),
+            ("=$Z$1<=$Z$2", true),
+            ("=$Z$1>=$Z$2", true),
+            ("=$Z$1<$Z$2", false),
+            // Blank adopts the other operand's type, so it is not ranked.
+            ("=$Z$1<\"a\"", true),
+            ("=$Z$1>TRUE", false),
+            // Numeric text stays text on the remaining operators.
+            ("=\"5\"<>5", true),
+            ("=\"5\">=4", true),
+            // Int/Int still compares numerically (no fast-path arm covers it).
+            ("=2>1", true),
+        ];
+
+        for (formula, expected) in cases {
+            assert_eq!(
+                evaluate_formula(formula, &wb).unwrap(),
+                LiteralValue::Boolean(expected),
+                "{formula}"
+            );
+        }
     }
 
     #[test]

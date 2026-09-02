@@ -2407,6 +2407,8 @@ impl<'a> Interpreter<'a> {
             (v, Array(arr)) => self.broadcast_apply(v, Array(arr), |a, b| self.compare(op, a, b)),
             (l, r) => {
                 let res = match (l, r) {
+                    // Same-rank fast paths. These agree with `cmp_ranked` below
+                    // and exist only to avoid the rank/`Empty` dance.
                     (Number(a), Number(b)) => self.cmp_f64(a, b, op),
                     (Int(a), Number(b)) => self.cmp_f64(a as f64, b, op),
                     (Number(a), Int(b)) => self.cmp_f64(a, b as f64, op),
@@ -2414,30 +2416,75 @@ impl<'a> Interpreter<'a> {
                         self.cmp_f64(if a { 1.0 } else { 0.0 }, if b { 1.0 } else { 0.0 }, op)
                     }
                     (Text(a), Text(b)) => self.cmp_text(&a, &b, op),
-                    (a, b) => {
-                        // fallback to numeric coercion or text compare
-                        let an = crate::coercion::to_number_lenient_with_locale(
-                            &a,
-                            &self.context.locale(),
-                        )
-                        .ok();
-                        let bn = crate::coercion::to_number_lenient_with_locale(
-                            &b,
-                            &self.context.locale(),
-                        )
-                        .ok();
-                        if let (Some(a), Some(b)) = (an, bn) {
-                            self.cmp_f64(a, b, op)
-                        } else {
-                            self.cmp_text(
-                                &crate::coercion::to_text_invariant(&a),
-                                &crate::coercion::to_text_invariant(&b),
-                                op,
-                            )
-                        }
-                    }
+                    (a, b) => self.cmp_ranked(a, b, op),
                 };
                 Ok(LiteralValue::Boolean(res))
+            }
+        }
+    }
+
+    /// Mixed-type relational comparison (GOD-228 / ES-044 / CL-065).
+    ///
+    /// Excel does not coerce across types in `<`, `<=`, `>`, `>=`, `=`, `<>`.
+    /// It applies a pure type rank, identical for all six operators:
+    ///
+    /// ```text
+    /// number  <  text  <  boolean
+    /// ```
+    ///
+    /// Only when both operands share a rank are they compared within the type.
+    /// Measured in desktop Excel 16.105.3 (en_US, 2026-09-02); receipt
+    /// `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`
+    /// (sha256 `76e3fbb0dd34158332425be795a0cd553459cc6e263b4c5c59a886d89360c2da`).
+    /// Consequences of the rank: `TRUE=1` is FALSE, `1<TRUE` is TRUE,
+    /// `"5"=5` is FALSE (numeric text never coerces), `"5">4` is TRUE,
+    /// `"TRUE"=TRUE` is FALSE, and `"Z"<FALSE` is TRUE.
+    ///
+    /// Errors never reach here: `compare` short-circuits them above.
+    fn cmp_ranked(&self, l: LiteralValue, r: LiteralValue, op: &str) -> bool {
+        use LiteralValue::*;
+
+        // A never-written cell is polymorphic rather than ranked: it adopts the
+        // other operand's type and behaves as that type's zero value, so
+        // `Z1=0`, `Z1=""`, `Z1=FALSE` and `Z1<TRUE` are all TRUE (receipt rows
+        // n17-n20).
+        let (l, r) = match (l, r) {
+            (Empty, Empty) => (Number(0.0), Number(0.0)),
+            (Empty, r) => (empty_as_zero_of(&r), r),
+            (l, Empty) => {
+                let e = empty_as_zero_of(&l);
+                (l, e)
+            }
+            (l, r) => (l, r),
+        };
+
+        let (lr, rr) = (excel_type_rank(&l), excel_type_rank(&r));
+        if lr != rr {
+            return self.cmp_f64(lr as f64, rr as f64, op);
+        }
+
+        match (l, r) {
+            (Text(a), Text(b)) => self.cmp_text(&a, &b, op),
+            (Boolean(a), Boolean(b)) => {
+                self.cmp_f64(if a { 1.0 } else { 0.0 }, if b { 1.0 } else { 0.0 }, op)
+            }
+            // Same rank, number class: Int/Number and the date/time/duration
+            // serial-bearing variants. Text is never parsed here.
+            (a, b) => {
+                let an = crate::coercion::to_number_strict(&a).ok();
+                let bn = crate::coercion::to_number_strict(&b).ok();
+                if let (Some(a), Some(b)) = (an, bn) {
+                    self.cmp_f64(a, b, op)
+                } else {
+                    // Only `Pending` (and any future non-numeric, non-text,
+                    // non-boolean variant) lands here; keep the legacy text
+                    // fallback so those pairs behave as before.
+                    self.cmp_text(
+                        &crate::coercion::to_text_invariant(&a),
+                        &crate::coercion::to_text_invariant(&b),
+                        op,
+                    )
+                }
             }
         }
     }
@@ -2469,6 +2516,32 @@ impl<'a> Interpreter<'a> {
                 _ => unreachable!(),
             },
         )
+    }
+}
+
+/// Excel's relational type rank (GOD-228 / ES-044): `number < text < boolean`.
+///
+/// The number class covers `Int`, `Number` and the serial-bearing temporal
+/// variants (`Date`, `DateTime`, `Time`, `Duration`), because on a sheet a date
+/// cell *is* a number. `Empty` is deliberately not ranked here — it is
+/// polymorphic and must be resolved against the other operand before ranking
+/// (see `Interpreter::cmp_ranked`). `Error` never reaches ranking.
+fn excel_type_rank(v: &LiteralValue) -> u8 {
+    match v {
+        LiteralValue::Text(_) => 1,
+        LiteralValue::Boolean(_) => 2,
+        _ => 0,
+    }
+}
+
+/// The zero value of `other`'s type, used to give a blank operand the type of
+/// whatever it is compared against: `0` against a number, `""` against text,
+/// `FALSE` against a boolean.
+fn empty_as_zero_of(other: &LiteralValue) -> LiteralValue {
+    match other {
+        LiteralValue::Text(_) => LiteralValue::Text(String::new()),
+        LiteralValue::Boolean(_) => LiteralValue::Boolean(false),
+        _ => LiteralValue::Number(0.0),
     }
 }
 
