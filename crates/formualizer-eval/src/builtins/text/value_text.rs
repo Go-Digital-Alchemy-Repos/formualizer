@@ -373,6 +373,20 @@ impl Function for TextFn {
                 format_number_basic(num)
             }
         } else {
+            // GOD-227: the bounded date/time tokenizer owns the measured
+            // surface; anything it reports `Unsupported` keeps the legacy
+            // substring rendering below, byte-for-byte.
+            match super::date_format::format_date(ctx.date_system(), num, &fmt) {
+                Ok(text) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(text)));
+                }
+                Err(super::date_format::Fallback::Invalid) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new_value(),
+                    )));
+                }
+                Err(super::date_format::Fallback::Unsupported) => {}
+            }
             // Date-token parsing is intentionally limited here; conversion still
             // follows the workbook's shared Excel serial semantics.
             let lower = fmt.to_ascii_lowercase();

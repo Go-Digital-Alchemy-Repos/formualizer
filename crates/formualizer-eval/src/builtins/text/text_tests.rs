@@ -527,7 +527,12 @@ mod tests {
         use crate::engine::DateSystem;
 
         let cases = [
-            (r##"=TEXT(TIME(13,5,0),"h:mm AM/PM")"##, "h:01 AM/PM"),
+            // GOD-227 oracle row `b_ot076_A23`
+            // (artifacts/private/god227/probe/excel-text-date-probe.json,
+            // Excel for Mac 16.105.3, en_US, 2026-09-02): `h:mm AM/PM` is now
+            // inside the measured date surface and renders `1:05 PM`. The
+            // string pinned here before was the pre-fix echo of the format.
+            (r##"=TEXT(TIME(13,5,0),"h:mm AM/PM")"##, "1:05 PM"),
             (r##"=TEXT(12345,"0.00E+00")"##, "12345.00"),
             (r##"=TEXT(1.25,"# ?/?")"##, "1.25"),
         ];
