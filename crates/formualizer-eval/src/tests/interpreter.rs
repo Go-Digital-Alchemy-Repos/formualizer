@@ -512,6 +512,18 @@ mod tests {
     /// cell is written explicitly as `LiteralValue::Empty` — that is the same
     /// value the real engine's resolver hands `Interpreter::compare` for a
     /// never-written in-bounds cell.
+    ///
+    /// SCOPE NOTE (GOD-228 review cycle 1, finding M2). The diagnosis
+    /// `research/reports/god228_boolean_ordering_diagnosis_2026-09-02.md` §3.1
+    /// recommended fixing the boolean half only and filing the numeric-text
+    /// half (`"5"=5`, `"5">4`, `"5"<4`) as separate work, because at the time
+    /// §3.1 was written there was no Excel oracle for numeric text. §3.3's
+    /// later measurement supplied exactly that oracle — receipt rows `n14`,
+    /// `n15` and `n16` above — so the round deliberately widened its boundary
+    /// and implemented both halves in one change rather than leaving the
+    /// engine coercing numeric text for a further round. The widening is
+    /// recorded here because the commit implements more than §3.1 asked for;
+    /// nothing about it is inferred, the three anchoring rows are measured.
     #[test]
     fn test_god228_boolean_ordering_type_rank() {
         let wb = create_workbook()
@@ -564,11 +576,16 @@ mod tests {
         }
     }
 
-    /// GOD-228: behaviours the 34-row receipt does not cover, pinned here so a
-    /// later change cannot move them silently. These are *derived* from the
-    /// measured rank rule, not measured in Excel.
+    /// GOD-228 review cycle 1, finding m1. PROVENANCE: these expectations are
+    /// *derived* from the ES-044 type rank (`number < text < boolean`) and the
+    /// blank-operand polymorphism rule measured in receipt rows `n17`-`n20`;
+    /// they are NOT themselves measured in desktop Excel, because the 34-row
+    /// receipt
+    /// `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`
+    /// contains no row for any of them. They are pinned so a later change
+    /// cannot move them silently. A later Excel probe should confirm them.
     #[test]
-    fn test_god228_rank_corollaries_not_in_receipt() {
+    fn test_god228_rank_corollaries_documented_not_excel_measured() {
         let wb = create_workbook()
             .with_cell("Sheet1", 1, 26, LiteralValue::Empty)
             .with_cell("Sheet1", 2, 26, LiteralValue::Empty);
@@ -588,6 +605,169 @@ mod tests {
             ("=\"5\">=4", true),
             // Int/Int still compares numerically (no fast-path arm covers it).
             ("=2>1", true),
+        ];
+
+        for (formula, expected) in cases {
+            assert_eq!(
+                evaluate_formula(formula, &wb).unwrap(),
+                LiteralValue::Boolean(expected),
+                "{formula}"
+            );
+        }
+    }
+
+    /// GOD-228 review cycle 1, finding M1. PROVENANCE: these expectations are
+    /// *derived* from the ES-044 type rank (`number < text < boolean`) plus
+    /// the decision, taken in this round, that a serial-bearing temporal value
+    /// belongs to the number class — on a sheet a date cell *is* a number. They
+    /// are NOT measured in desktop Excel: the 34-row receipt
+    /// `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`
+    /// (sha256
+    /// `76e3fbb0dd34158332425be795a0cd553459cc6e263b4c5c59a886d89360c2da`)
+    /// has no temporal row at all. A later Excel probe should confirm them.
+    ///
+    /// Four of these moved between the parent commit `c9abf377` and this
+    /// round's `79a3e990` (`DATE(2003,1,1)<TRUE` FALSE -> TRUE,
+    /// `DATE(2003,1,1)<=TRUE` FALSE -> TRUE, `DATE(2003,1,1)>TRUE` TRUE ->
+    /// FALSE, `TIME(12,0,0)<FALSE` FALSE -> TRUE), so the derived rank moves
+    /// observable behaviour and must not move again unnoticed. The
+    /// temporal-versus-number rows below were unchanged by the round and are
+    /// kept as regression guards.
+    ///
+    /// Two shapes are pinned deliberately. `DATE(...)`/`TIME(...)` return
+    /// `LiteralValue::Number` in this engine, so those rows exercise the
+    /// number-versus-boolean rank as a user would write it but do NOT reach
+    /// `excel_type_rank`'s temporal arms. The `A1`-`A4` rows hold
+    /// `LiteralValue::Date`, `Time`, `DateTime` and `Duration` cells directly,
+    /// which is the only way to exercise the `_ => 0` catch-all that puts the
+    /// temporal variants in the number class.
+    #[test]
+    fn test_god228_temporal_rank_documented_not_excel_measured() {
+        crate::builtins::load_builtins();
+
+        // Written as a user would: DATE()/TIME() yield plain numbers here.
+        let wb = create_workbook();
+        let formula_cases: [(&str, bool); 9] = [
+            // Moved by this round (parent c9abf377 gave the opposite value).
+            ("=DATE(2003,1,1)<TRUE", true),
+            ("=DATE(2003,1,1)<=TRUE", true),
+            ("=DATE(2003,1,1)>TRUE", false),
+            ("=TIME(12,0,0)<FALSE", true),
+            // Unchanged by this round; regression guards for the number class.
+            ("=DATE(2003,1,1)=37622", true),
+            ("=DATE(2003,1,1)<37623", true),
+            ("=DATE(2003,1,1)>37621", true),
+            ("=TIME(12,0,0)=0.5", true),
+            // Derived temporal-versus-text: rank 0 < rank 1, so a date serial
+            // is below any text on every operator.
+            ("=DATE(2003,1,1)<\"a\"", true),
+        ];
+        for (formula, expected) in formula_cases {
+            assert_eq!(
+                evaluate_formula(formula, &wb).unwrap(),
+                LiteralValue::Boolean(expected),
+                "{formula}"
+            );
+        }
+
+        // Genuine temporal `LiteralValue` variants, which is what
+        // `excel_type_rank`'s `_ => 0` catch-all actually classifies.
+        let wb_temporal = create_workbook()
+            .with_cell(
+                "Sheet1",
+                1,
+                1,
+                LiteralValue::Date(chrono::NaiveDate::from_ymd_opt(2003, 1, 1).unwrap()),
+            )
+            .with_cell(
+                "Sheet1",
+                2,
+                1,
+                LiteralValue::Time(chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap()),
+            )
+            .with_cell(
+                "Sheet1",
+                3,
+                1,
+                LiteralValue::DateTime(
+                    chrono::NaiveDate::from_ymd_opt(2003, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(12, 0, 0)
+                        .unwrap(),
+                ),
+            )
+            .with_cell(
+                "Sheet1",
+                4,
+                1,
+                LiteralValue::Duration(chrono::Duration::hours(12)),
+            );
+        let cell_cases: [(&str, bool); 17] = [
+            // A1 = Date, A2 = Time, A3 = DateTime, A4 = Duration.
+            // Temporal versus boolean: rank 0 < rank 2.
+            ("=A1<TRUE", true),
+            ("=A1<=TRUE", true),
+            ("=A1>TRUE", false),
+            ("=A1=TRUE", false),
+            ("=A2<FALSE", true),
+            ("=A3<TRUE", true),
+            ("=A4<TRUE", true),
+            // Temporal versus text: rank 0 < rank 1.
+            ("=A1<\"a\"", true),
+            ("=A1>\"a\"", false),
+            ("=A2<\"a\"", true),
+            ("=A3<\"a\"", true),
+            ("=A4<\"a\"", true),
+            // Same rank as a number: compared on the serial, as before.
+            ("=A1=37622", true),
+            ("=A1<37623", true),
+            ("=A1>37621", true),
+            ("=A2=0.5", true),
+            ("=A4=0.5", true),
+        ];
+        for (formula, expected) in cell_cases {
+            assert_eq!(
+                evaluate_formula(formula, &wb_temporal).unwrap(),
+                LiteralValue::Boolean(expected),
+                "{formula}"
+            );
+        }
+    }
+
+    /// GOD-228 review cycle 1, finding M2. PROVENANCE: these expectations are
+    /// *derived* from the measured type rank; the measured anchors for the
+    /// numeric-text half are receipt rows `n14` (`"5"=5` FALSE), `n15`
+    /// (`"5">4` TRUE) and `n16` (`"5"<4` FALSE) in
+    /// `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`. The
+    /// specific literal forms below — percent text, exponent text, signed text,
+    /// zero text, whitespace-padded text, decimal text — are NOT individually
+    /// Excel-measured. A later Excel probe should confirm them.
+    ///
+    /// Every one of these returned TRUE before this round (the old fallback ran
+    /// `to_number_lenient_with_locale` on both sides) and returns FALSE now, so
+    /// the numeric-text half of the change is far wider than its three measured
+    /// rows and is pinned here in full.
+    ///
+    /// The last row is the one place where `Empty` polymorphism and the
+    /// numeric-text change interact: a never-written cell adopts the other
+    /// operand's TEXT type and becomes `""`, so `blank="0"` is FALSE (and
+    /// `blank<"0"` is TRUE) rather than the numeric `0 = 0` TRUE the old
+    /// lenient fallback produced.
+    #[test]
+    fn test_god228_numeric_text_documented_not_excel_measured() {
+        let wb = create_workbook().with_cell("Sheet1", 1, 26, LiteralValue::Empty);
+
+        let cases: [(&str, bool); 9] = [
+            ("=\"90%\"=0.9", false),
+            ("=\"90%\"<1", false),
+            ("=\"1e3\"=1000", false),
+            ("=\"-5\"<0", false),
+            ("=\"0\"=0", false),
+            ("=\" 5 \"=5", false),
+            ("=\"1.5\"=1.5", false),
+            // Blank versus numeric text: `Empty` becomes `""`, not `0`.
+            ("=$Z$1=\"0\"", false),
+            ("=$Z$1<\"0\"", true),
         ];
 
         for (formula, expected) in cases {

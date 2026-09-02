@@ -220,11 +220,15 @@ fn known_comparison_and_criteria_divergences_remain_pinned() {
     // GOD-228 / ES-044 closed this divergence. Excel ranks types
     // `number < text < boolean` in every relational operator and never coerces
     // across a rank boundary, so a text operand is always greater than a
-    // numeric one and `"1/1/03"<37623` is FALSE — which is also what LO
-    // returns. Measured 2026-09-02, Excel 16.105.3, receipt
+    // numeric one. The expectation below is *derived* from that rank, not
+    // measured for this expression: the measured anchor for the numeric-text
+    // rule is row `n16` (`"5"<4` FALSE) of receipt
     // `artifacts/private/god228/probe/excel-boolean-ordering-probe.json`
-    // row `n16` (`"5"<4` FALSE). Before GOD-228 this pinned TRUE, produced by
-    // a lexicographic fallback comparing "1/1/03" against "37623".
+    // (Excel 16.105.3, en_US, 2026-09-02), which is a different expression;
+    // the receipt has no `"1/1/03"` row. Applying the rank to `"1/1/03"<37623`
+    // gives FALSE, which is also what LO returns. Before GOD-228 this pinned
+    // TRUE, produced by a lexicographic fallback comparing "1/1/03" against
+    // "37623".
     assert_expected(
         DateSystem::Excel1900,
         "=\"1/1/03\"<37623",
