@@ -634,13 +634,34 @@ mod tests {
     /// temporal-versus-number rows below were unchanged by the round and are
     /// kept as regression guards.
     ///
-    /// Two shapes are pinned deliberately. `DATE(...)`/`TIME(...)` return
-    /// `LiteralValue::Number` in this engine, so those rows exercise the
-    /// number-versus-boolean rank as a user would write it but do NOT reach
-    /// `excel_type_rank`'s temporal arms. The `A1`-`A4` rows hold
-    /// `LiteralValue::Date`, `Time`, `DateTime` and `Duration` cells directly,
-    /// which is the only way to exercise the `_ => 0` catch-all that puts the
-    /// temporal variants in the number class.
+    /// CORRECTED at GOD-228 review cycle 2 — read this before trusting the
+    /// coverage of this test. **Not one assertion below reaches
+    /// `excel_type_rank`'s temporal classification.** Two shapes are pinned
+    /// and both arrive at `compare` as `LiteralValue::Number`:
+    ///
+    ///  * `DATE(...)`/`TIME(...)` return `Number` in this engine, measured:
+    ///    `=DATE(2003,1,1)` -> `Number(37622.0)`, `=TIME(12,0,0)` ->
+    ///    `Number(0.5)`.
+    ///  * The `A1`-`A4` rows are *written* as `LiteralValue::Date`, `Time`,
+    ///    `DateTime` and `Duration`, but `TestWorkbook::resolve_range_view`
+    ///    (`src/test_workbook.rs:288-296`) wraps them in
+    ///    `RangeView::from_owned_rows`, whose `IngestBuilder`
+    ///    (`src/engine/range_view.rs:226-251`) — the real engine's Arrow
+    ///    ingest, not a test shim — flattens every temporal variant to a
+    ///    numeric serial first. Measured: `=A1` -> `Number(37622.0)`,
+    ///    `=A2` -> `Number(0.5)`, `=A3` -> `Number(37622.5)`,
+    ///    `=A4` -> `Number(0.5)`.
+    ///
+    /// So these 26 assertions pin the number-versus-boolean and
+    /// number-versus-text rank on operands a user can actually produce, which
+    /// is worth pinning, and nothing more. `excel_type_rank`'s `_ => 0` arm
+    /// is **unpinned**, and it also appears unreachable from formula
+    /// evaluation today: `rg "Ok\(LiteralValue::(Date|DateTime|Time|Duration)\("
+    /// crates/formualizer-eval/src/builtins/` returns zero hits, so no builtin
+    /// yields a temporal variant. Pinning that arm needs a direct unit test on
+    /// `cmp_ranked`/`excel_type_rank` rather than a formula-level one. Carried
+    /// forward as an open thread by the GOD-228 round report; do NOT read a
+    /// green run here as a guard on the temporal arm.
     #[test]
     fn test_god228_temporal_rank_documented_not_excel_measured() {
         crate::builtins::load_builtins();
@@ -743,9 +764,21 @@ mod tests {
     /// zero text, whitespace-padded text, decimal text — are NOT individually
     /// Excel-measured. A later Excel probe should confirm them.
     ///
-    /// Every one of these returned TRUE before this round (the old fallback ran
-    /// `to_number_lenient_with_locale` on both sides) and returns FALSE now, so
-    /// the numeric-text half of the change is far wider than its three measured
+    /// Scope note (review cycle 2, MINOR-2): diagnosis section 3.1 gave TWO
+    /// reasons to defer the numeric-text half — no Excel oracle, and "a far
+    /// larger corpus surface than 572 formulas". Section 3.3's later
+    /// measurement discharged the first. The second is discharged not here but
+    /// by the round's fleet gate, which grades every changed cell in a graded
+    /// rectangle against the captured-Coherent oracle instead of asserting
+    /// byte identity; see the GOD-228 round report, gate G2.
+    ///
+    /// CORRECTED at GOD-228 review cycle 2 (MINOR-1): *eight* of the nine rows
+    /// returned TRUE before this round (the old fallback ran
+    /// `to_number_lenient_with_locale` on both sides) and return FALSE now.
+    /// The ninth, `$Z$1<"0"`, moves the other way — FALSE at parent
+    /// `c9abf377`, TRUE here — because the old fallback compared `0` against
+    /// `0` while the new rule compares `""` against `"0"`. Either way the
+    /// numeric-text half of the change is far wider than its three measured
     /// rows and is pinned here in full.
     ///
     /// The last row is the one place where `Empty` polymorphism and the
