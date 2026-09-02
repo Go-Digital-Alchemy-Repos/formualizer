@@ -248,6 +248,13 @@ fn render(
                 | Token::ElapsedHours
         )
     });
+    // Distinct from `has_clock`: this asks whether the *displayed* resolution is
+    // minutes, so rounding to it may carry into the next calendar day. An
+    // `AM/PM` marker reads the clock but displays no minute field of its own,
+    // so it must not drag a value like 46247.9997 over the day boundary.
+    let rounds_to_minute = tokens
+        .iter()
+        .any(|t| matches!(t, Token::Hour(_) | Token::Minute(_) | Token::ElapsedHours));
 
     // Rounding to the displayed resolution can carry into the next calendar
     // day; the displayed date must follow it (pinned pre-GOD-227 behaviour).
@@ -260,13 +267,17 @@ fn render(
         } else {
             (value, total)
         }
-    } else {
+    } else if rounds_to_minute {
         let minutes = (value.fract() * 1_440.0).round() as i64;
         if minutes == 1_440 {
             (value.trunc() + 1.0, 0)
         } else {
             (value, minutes * 60)
         }
+    } else {
+        // `AM/PM` is the only clock token: read the time of day unrounded
+        // (truncated to whole seconds) and leave the date alone.
+        (value, (value.fract() * 86_400.0).trunc() as i64)
     };
 
     let parts = try_serial_to_display_date_parts_for(system, display_serial)
@@ -493,9 +504,10 @@ mod tests {
 
     /// GOD-227 review cycle 1, finding M1. PROVENANCE: these expectations come
     /// from Microsoft's documented number-format grammar and the 1904 epoch
-    /// definition (the 1904 date system's serial 0 is 1904-01-01, a Friday),
-    /// NOT from the GOD-227 Excel receipt, which contains no 1904 rows. A later
-    /// Excel probe should confirm them.
+    /// definition (the 1904 date system's serial 0 is 1904-01-01, a Friday);
+    /// they are documented rather than Excel-measured, except where an
+    /// assertion cites a receipt row id, since the GOD-227 Excel receipt
+    /// contains no 1904 rows. A later Excel probe should confirm them.
     #[test]
     fn god227_review1_documented_not_excel_measured_weekday_is_epoch_aware() {
         let cases = [
@@ -514,14 +526,18 @@ mod tests {
         }
         // The 1900 table is unmoved: serial 0 stays a Saturday.
         assert_eq!(render_1900("dddd", 0.0), Ok("Saturday".into()));
+        // Same calendar day as receipt row `b_dddd@46247.5`, but not that row:
+        // the receipt measures serial 46247.5, this asserts the whole serial.
         assert_eq!(render_1900("dddd", 46247.0), Ok("Thursday".into()));
     }
 
     /// GOD-227 review cycle 1, finding M2. PROVENANCE: these expectations come
     /// from Microsoft's documented number-format grammar (the `AM/PM` marker
     /// reads the value's time of day whether or not an `h`/`m`/`s` field is
-    /// also present), NOT from the GOD-227 Excel receipt, which measures
-    /// `AM/PM` only alongside `h:mm`. A later Excel probe should confirm them.
+    /// also present); they are documented rather than Excel-measured, except
+    /// where an assertion cites a receipt row id, since the GOD-227 Excel
+    /// receipt measures `AM/PM` only alongside `h:mm`. A later Excel probe
+    /// should confirm them.
     #[test]
     fn god227_review1_documented_not_excel_measured_ampm_without_clock_field() {
         // 46247.5 is 2026-08-13 12:00, a Thursday: noon is PM.
@@ -530,15 +546,41 @@ mod tests {
         assert_eq!(render_1900("AM/PM", 46247.25), Ok("AM".into()));
         assert_eq!(render_1900("am/pm", 46247.75), Ok("PM".into()));
         // The measured `h:mm AM/PM` rows are untouched by the widened rule.
+        // Receipt row id `b_h:mm AM/PM@46247.5` (excel_value "12:00 PM").
         assert_eq!(render_1900("h:mm AM/PM", 46247.5), Ok("12:00 PM".into()));
+        // GOD-227 review cycle 2, finding MAJOR-1 regression guard. An `AM/PM`
+        // marker reads the clock but does not put the displayed resolution at
+        // minutes, so it must never round the value up into the next calendar
+        // day. 46247.9997 is 2026-08-13 23:59:34, still a Thursday, still PM.
+        assert_eq!(
+            render_1900("dddd AM/PM", 46247.9997),
+            Ok("Thursday PM".into())
+        );
+        assert_eq!(render_1900("dddd", 46247.9997), Ok("Thursday".into()));
+        // The marker flips at noon and carries no day at any hour.
+        for (hour, marker) in [(0, "AM"), (11, "AM"), (12, "PM"), (23, "PM")] {
+            let serial = 46247.0 + f64::from(hour) / 24.0;
+            assert_eq!(
+                render_1900("dddd AM/PM", serial),
+                Ok(format!("Thursday {marker}")),
+                "hour {hour}"
+            );
+            assert_eq!(
+                render_1900("AM/PM", serial),
+                Ok(marker.into()),
+                "hour {hour}"
+            );
+        }
     }
 
     /// GOD-227 review cycle 1, finding M3. PROVENANCE: these expectations come
     /// from Microsoft's documented number-format grammar (the month-versus-
     /// minute rule applies to `m` and `mm` only; `mmm`/`mmmm`/`mmmmm` are
-    /// always month names, since Excel has no three-letter minute form), NOT
-    /// from the GOD-227 Excel receipt, which never places a long `m` run next
-    /// to an hour or seconds field. A later Excel probe should confirm them.
+    /// always month names, since Excel has no three-letter minute form); they
+    /// are documented rather than Excel-measured, except where an assertion
+    /// cites a receipt row id, since the GOD-227 Excel receipt never places a
+    /// long `m` run next to an hour or seconds field. A later Excel probe
+    /// should confirm them.
     #[test]
     fn god227_review1_documented_not_excel_measured_long_m_run_is_always_month() {
         let cases = [
@@ -554,6 +596,7 @@ mod tests {
             assert_eq!(render_1900(code, 46247.5), Ok(expected.into()), "{code}");
         }
         // Short runs keep the measured adjacency rule: still minutes.
+        // Receipt row id `b_h:mm@46247.5` (excel_value "12:00").
         assert_eq!(render_1900("h:mm", 46247.5), Ok("12:00".into()));
         assert_eq!(render_1900("h m", 46247.5), Ok("12 0".into()));
         assert_eq!(render_1900("m:ss", 46247.5), Ok("0:00".into()));
@@ -562,9 +605,10 @@ mod tests {
     /// GOD-227 review cycle 1, finding M4. PROVENANCE: these expectations come
     /// from Microsoft's documented number-format grammar (`[h]` counts elapsed
     /// hours of the same value the rest of the format renders, so a carry out
-    /// of the displayed resolution reaches it too), NOT from the GOD-227 Excel
-    /// receipt, whose only `[h]` row is `[h]:mm` at 46247.5 where no carry
-    /// occurs. A later Excel probe should confirm them.
+    /// of the displayed resolution reaches it too); they are documented rather
+    /// than Excel-measured, except where an assertion cites a receipt row id,
+    /// since the GOD-227 Excel receipt's only `[h]` row is `[h]:mm` at 46247.5,
+    /// where no carry occurs. A later Excel probe should confirm them.
     #[test]
     fn god227_review1_documented_not_excel_measured_elapsed_hours_follow_rounding() {
         // 0.9999999 rounds up to a whole day at minute resolution, so the
@@ -575,6 +619,7 @@ mod tests {
         assert_eq!(render_1900("[h]:mm:ss", 0.9999999), Ok("24:00:00".into()));
         // No carry: the measured receipt row is unchanged, and so are values
         // that do not round up.
+        // Receipt row id `b_[h]:mm@46247.5` (excel_value "1109940:00").
         assert_eq!(render_1900("[h]:mm", 46247.5), Ok("1109940:00".into()));
         assert_eq!(render_1900("[h]:mm", 0.5), Ok("12:00".into()));
     }
