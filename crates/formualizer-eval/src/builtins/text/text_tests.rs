@@ -522,17 +522,29 @@ mod tests {
         }
     }
 
+    /// GOD-227 oracle row `b_ot076_A23`
+    /// (artifacts/private/god227/probe/excel-text-date-probe.json, Excel for
+    /// Mac 16.105.3, en_US, 2026-09-02): `h:mm AM/PM` moved out of the legacy
+    /// echo and into the measured date surface, so it now renders `1:05 PM`.
+    /// The string pinned before GOD-227 was the pre-fix echo of the format.
+    #[test]
+    fn text_god227_am_pm_time_is_measured_not_legacy_echo() {
+        use crate::engine::DateSystem;
+
+        assert_eq!(
+            eval_text_formula(
+                DateSystem::Excel1900,
+                r##"=TEXT(TIME(13,5,0),"h:mm AM/PM")"##
+            ),
+            LiteralValue::Text("1:05 PM".into()),
+        );
+    }
+
     #[test]
     fn text_ot076_unsupported_formats_hold_legacy_results() {
         use crate::engine::DateSystem;
 
         let cases = [
-            // GOD-227 oracle row `b_ot076_A23`
-            // (artifacts/private/god227/probe/excel-text-date-probe.json,
-            // Excel for Mac 16.105.3, en_US, 2026-09-02): `h:mm AM/PM` is now
-            // inside the measured date surface and renders `1:05 PM`. The
-            // string pinned here before was the pre-fix echo of the format.
-            (r##"=TEXT(TIME(13,5,0),"h:mm AM/PM")"##, "1:05 PM"),
             (r##"=TEXT(12345,"0.00E+00")"##, "12345.00"),
             (r##"=TEXT(1.25,"# ?/?")"##, "1.25"),
         ];

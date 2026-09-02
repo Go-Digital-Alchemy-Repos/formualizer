@@ -11,9 +11,10 @@
 //! case-insensitively — `m`/`mm`/`mmm`/`mmmm`/`mmmmm`, `d`/`dd`/`ddd`/`dddd`,
 //! `yy`/`yyyy`, `h`/`hh`, `s`/`ss` — plus the `AM/PM` marker (either spelling,
 //! any case mix; the receipt shows the output is always fixed-case `AM`/`PM`)
-//! and elapsed hours `[h]`. Every other character is a verbatim literal. `m`
-//! is minutes when its run is adjacent to an hour token before it or an `s`
-//! token after it (allowing intervening non-letter literals), month otherwise.
+//! and elapsed hours `[h]`. Every other character is a verbatim literal. An
+//! `m` run of one or two letters is minutes when it is adjacent to an hour
+//! token before it or an `s` token after it (allowing intervening non-letter
+//! literals), month otherwise; a run of three or more is always a month name.
 //!
 //! Month and day names are hard-coded **en_US**. That is the locale receipt
 //! banked with the oracle (`locale.macos_locale = "en_US"`,
@@ -56,8 +57,10 @@ const MONTHS_ABBREV: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// Indexed by `serial mod 7`, where Excel's serial 1 (1900-01-01) is a Sunday
-/// and therefore serial 0 is a Saturday.
+/// Indexed by `serial mod 7` under the 1900 system, where Excel's serial 1
+/// (1900-01-01) is a Sunday and therefore serial 0 is a Saturday. The 1904
+/// system reaches the same table through a +6 shift (its serial 0,
+/// 1904-01-01, is a Friday); see `weekday_offset` in `render`.
 const DAYS_FULL: [&str; 7] = [
     "Saturday",
     "Sunday",
@@ -194,12 +197,20 @@ fn matches_ampm(chars: &[char], i: usize) -> bool {
 /// `m` is minutes when it sits directly after an hour token or directly before
 /// a seconds token, ignoring intervening non-letter literals. Adjacency, not
 /// position.
+///
+/// The minutes rule applies only to `m` and `mm`. A run of three or more `m`
+/// is always a month name (`mmm`/`mmmm`/`mmmmm`), whatever it sits next to:
+/// Excel has no three-letter minute form, so `h mmm` is `12 Aug`, not `12 00`.
 fn resolve_month_or_minute(tokens: &mut [Token]) {
     for index in 0..tokens.len() {
         let width = match tokens[index] {
             Token::MonthOrMinute(width) => width,
             _ => continue,
         };
+        if width > 2 {
+            tokens[index] = Token::Month(width);
+            continue;
+        }
         let preceded_by_hour = tokens[..index]
             .iter()
             .rev()
@@ -224,9 +235,19 @@ fn render(
 ) -> Result<String, Fallback> {
     let has_ampm = tokens.iter().any(|t| matches!(t, Token::AmPm));
     let has_seconds = tokens.iter().any(|t| matches!(t, Token::Second(_)));
-    let has_clock = tokens
-        .iter()
-        .any(|t| matches!(t, Token::Hour(_) | Token::Minute(_) | Token::Second(_)));
+    // Every token that reads the clock, not just h/m/s: an `AM/PM` marker or an
+    // elapsed-hours field alone still needs `total_seconds` (and, for `[h]`, the
+    // rounded `display_serial`) computed from the value's fractional day.
+    let has_clock = tokens.iter().any(|t| {
+        matches!(
+            t,
+            Token::Hour(_)
+                | Token::Minute(_)
+                | Token::Second(_)
+                | Token::AmPm
+                | Token::ElapsedHours
+        )
+    });
 
     // Rounding to the displayed resolution can carry into the next calendar
     // day; the displayed date must follow it (pinned pre-GOD-227 behaviour).
@@ -262,7 +283,14 @@ fn render(
     } else {
         hour24
     };
-    let weekday = (((display_serial.trunc() as i64) % 7) + 7) % 7;
+    // `DAYS_*` are indexed from the Excel-1900 epoch, whose serial 0 is a
+    // Saturday. Under the 1904 system serial 0 is 1904-01-01, a Friday, so the
+    // same table is reached with a +6 shift.
+    let weekday_offset: i64 = match system {
+        crate::engine::DateSystem::Excel1900 => 0,
+        crate::engine::DateSystem::Excel1904 => 6,
+    };
+    let weekday = ((((display_serial.trunc() as i64) + weekday_offset) % 7) + 7) % 7;
     let month_index = (parts.month.clamp(1, 12) - 1) as usize;
 
     let mut out = String::with_capacity(tokens.len() * 2);
@@ -292,9 +320,11 @@ fn render(
             Token::Second(1) => out.push_str(&second.to_string()),
             Token::Second(_) => out.push_str(&format!("{second:02}")),
             Token::ElapsedHours => {
-                // Elapsed hours are the whole serial in hours, unaffected by
-                // any AM/PM marker.
-                out.push_str(&format!("{}", (value * 24.0).floor() as i64));
+                // Elapsed hours are the whole serial in hours, unaffected by any
+                // AM/PM marker. They read `display_serial`, not the raw value, so
+                // a carry out of the displayed resolution reaches `[h]` too:
+                // `TEXT(0.9999999,"[h]:mm")` is `24:00`, not `23:00`.
+                out.push_str(&format!("{}", (display_serial * 24.0).floor() as i64));
             }
             Token::AmPm => out.push_str(if hour24 < 12 { "AM" } else { "PM" }),
             Token::MonthOrMinute(_) => unreachable!("resolved during tokenization"),
@@ -459,6 +489,94 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    /// GOD-227 review cycle 1, finding M1. PROVENANCE: these expectations come
+    /// from Microsoft's documented number-format grammar and the 1904 epoch
+    /// definition (the 1904 date system's serial 0 is 1904-01-01, a Friday),
+    /// NOT from the GOD-227 Excel receipt, which contains no 1904 rows. A later
+    /// Excel probe should confirm them.
+    #[test]
+    fn god227_review1_documented_not_excel_measured_weekday_is_epoch_aware() {
+        let cases = [
+            ("dddd", 0.0, "Friday"),
+            ("ddd", 0.0, "Fri"),
+            ("dddd", 1.0, "Saturday"),
+            ("dddd", 46247.0, "Wednesday"),
+            ("ddd", 46247.0, "Wed"),
+        ];
+        for (code, serial, expected) in cases {
+            assert_eq!(
+                format_date(DateSystem::Excel1904, serial, code),
+                Ok(expected.into()),
+                "1904 {code}@{serial}"
+            );
+        }
+        // The 1900 table is unmoved: serial 0 stays a Saturday.
+        assert_eq!(render_1900("dddd", 0.0), Ok("Saturday".into()));
+        assert_eq!(render_1900("dddd", 46247.0), Ok("Thursday".into()));
+    }
+
+    /// GOD-227 review cycle 1, finding M2. PROVENANCE: these expectations come
+    /// from Microsoft's documented number-format grammar (the `AM/PM` marker
+    /// reads the value's time of day whether or not an `h`/`m`/`s` field is
+    /// also present), NOT from the GOD-227 Excel receipt, which measures
+    /// `AM/PM` only alongside `h:mm`. A later Excel probe should confirm them.
+    #[test]
+    fn god227_review1_documented_not_excel_measured_ampm_without_clock_field() {
+        // 46247.5 is 2026-08-13 12:00, a Thursday: noon is PM.
+        assert_eq!(render_1900("dddd AM/PM", 46247.5), Ok("Thursday PM".into()));
+        assert_eq!(render_1900("AM/PM", 46247.5), Ok("PM".into()));
+        assert_eq!(render_1900("AM/PM", 46247.25), Ok("AM".into()));
+        assert_eq!(render_1900("am/pm", 46247.75), Ok("PM".into()));
+        // The measured `h:mm AM/PM` rows are untouched by the widened rule.
+        assert_eq!(render_1900("h:mm AM/PM", 46247.5), Ok("12:00 PM".into()));
+    }
+
+    /// GOD-227 review cycle 1, finding M3. PROVENANCE: these expectations come
+    /// from Microsoft's documented number-format grammar (the month-versus-
+    /// minute rule applies to `m` and `mm` only; `mmm`/`mmmm`/`mmmmm` are
+    /// always month names, since Excel has no three-letter minute form), NOT
+    /// from the GOD-227 Excel receipt, which never places a long `m` run next
+    /// to an hour or seconds field. A later Excel probe should confirm them.
+    #[test]
+    fn god227_review1_documented_not_excel_measured_long_m_run_is_always_month() {
+        let cases = [
+            ("h mmm", "12 Aug"),
+            ("h mmmm", "12 August"),
+            ("h mmmmm", "12 A"),
+            ("mmm:ss", "Aug:00"),
+            ("mmmm ss", "August 00"),
+            ("hh mmm ss", "12 Aug 00"),
+            ("[h] mmm", "1109940 Aug"),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(render_1900(code, 46247.5), Ok(expected.into()), "{code}");
+        }
+        // Short runs keep the measured adjacency rule: still minutes.
+        assert_eq!(render_1900("h:mm", 46247.5), Ok("12:00".into()));
+        assert_eq!(render_1900("h m", 46247.5), Ok("12 0".into()));
+        assert_eq!(render_1900("m:ss", 46247.5), Ok("0:00".into()));
+    }
+
+    /// GOD-227 review cycle 1, finding M4. PROVENANCE: these expectations come
+    /// from Microsoft's documented number-format grammar (`[h]` counts elapsed
+    /// hours of the same value the rest of the format renders, so a carry out
+    /// of the displayed resolution reaches it too), NOT from the GOD-227 Excel
+    /// receipt, whose only `[h]` row is `[h]:mm` at 46247.5 where no carry
+    /// occurs. A later Excel probe should confirm them.
+    #[test]
+    fn god227_review1_documented_not_excel_measured_elapsed_hours_follow_rounding() {
+        // 0.9999999 rounds up to a whole day at minute resolution, so the
+        // elapsed-hours field must carry with it.
+        assert_eq!(render_1900("[h]:mm", 0.9999999), Ok("24:00".into()));
+        assert_eq!(render_1900("[h]", 0.9999999), Ok("24".into()));
+        // At second resolution the same value also rounds to a whole day.
+        assert_eq!(render_1900("[h]:mm:ss", 0.9999999), Ok("24:00:00".into()));
+        // No carry: the measured receipt row is unchanged, and so are values
+        // that do not round up.
+        assert_eq!(render_1900("[h]:mm", 46247.5), Ok("1109940:00".into()));
+        assert_eq!(render_1900("[h]:mm", 0.5), Ok("12:00".into()));
     }
 
     /// Serials Excel cannot display are the measured `#VALUE!` wall; the
