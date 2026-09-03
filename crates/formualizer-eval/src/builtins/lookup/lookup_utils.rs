@@ -3,7 +3,7 @@
 
 use crate::engine::{DateSystem, range_view::RangeView};
 use arrow_array::Array;
-use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
+use formualizer_common::{ExcelError, LiteralValue};
 
 /// Coerce a value to f64 with Excel-like rules for numeric comparisons:
 /// - Number / Int: numeric
@@ -223,92 +223,6 @@ impl<'a> SearchedVector<'a> {
             cmp_for_lookup(self.get(i - 1), self.get(i), self.date_system).is_some_and(|c| c >= 0)
         })
     }
-}
-
-/// Detect ascending sort (strict or equal allowed) for slice according to cmp_for_lookup.
-pub fn is_sorted_ascending(values: &[LiteralValue], date_system: DateSystem) -> bool {
-    values
-        .windows(2)
-        .all(|w| cmp_for_lookup(&w[0], &w[1], date_system).is_some_and(|c| c <= 0))
-}
-
-/// Detect descending sort (strict or equal allowed).
-pub fn is_sorted_descending(values: &[LiteralValue], date_system: DateSystem) -> bool {
-    values
-        .windows(2)
-        .all(|w| cmp_for_lookup(&w[0], &w[1], date_system).is_some_and(|c| c >= 0))
-}
-
-/// Approximate mode selection (ascending):
-/// match_mode 1 -> largest <= needle
-/// match_mode -1 -> smallest >= needle (Excel MATCH uses -1 for descending; we adapt for XLOOKUP semantics)
-pub fn approximate_select_ascending(
-    values: &[LiteralValue],
-    needle: &LiteralValue,
-    mode: i32,
-    date_system: DateSystem,
-) -> Option<usize> {
-    if values.is_empty() {
-        return None;
-    }
-    let needle_num = value_to_f64_lenient(needle, date_system);
-    match mode {
-        -1 => {
-            // exact or next smaller (our XLOOKUP -1 semantics) -> largest <= needle
-            let mut best: Option<usize> = None;
-            for (i, v) in values.iter().enumerate() {
-                if cmp_for_lookup(v, needle, date_system)
-                    .map(|c| c == 0)
-                    .unwrap_or(false)
-                {
-                    return Some(i);
-                }
-                if let (Some(nn), Some(vv)) = (needle_num, value_to_f64_lenient(v, date_system))
-                    && vv <= nn
-                    && best.is_none_or(|b| {
-                        value_to_f64_lenient(&values[b], date_system).unwrap_or(f64::NEG_INFINITY)
-                            < vv
-                    })
-                {
-                    best = Some(i);
-                }
-            }
-            best
-        }
-        1 => {
-            // exact or next larger -> smallest >= needle
-            let mut best: Option<usize> = None;
-            for (i, v) in values.iter().enumerate() {
-                if cmp_for_lookup(v, needle, date_system)
-                    .map(|c| c == 0)
-                    .unwrap_or(false)
-                {
-                    return Some(i);
-                }
-                if let (Some(nn), Some(vv)) = (needle_num, value_to_f64_lenient(v, date_system))
-                    && vv >= nn
-                    && best.is_none_or(|b| {
-                        value_to_f64_lenient(&values[b], date_system).unwrap_or(f64::INFINITY) > vv
-                    })
-                {
-                    best = Some(i);
-                }
-            }
-            best
-        }
-        _ => None,
-    }
-}
-
-/// Validate ascending sort for approximate selection; return #N/A if unsorted.
-pub fn guard_sorted_ascending(
-    values: &[LiteralValue],
-    date_system: DateSystem,
-) -> Result<(), ExcelError> {
-    if !is_sorted_ascending(values, date_system) {
-        return Err(ExcelError::new(ExcelErrorKind::Na));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]

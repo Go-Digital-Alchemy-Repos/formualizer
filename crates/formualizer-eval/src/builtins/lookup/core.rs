@@ -2,14 +2,22 @@
 //!
 //! Implementation notes:
 //! - MATCH supports match_type: 0 exact, 1 approximate (largest <= lookup), -1 approximate (smallest >= lookup)
-//! - Approximate modes assume data sorted ascending (1) or descending (-1).
-//! - Unsorted-data behavior differs by function and is deliberate: MATCH performs a lightweight
-//!   ascending-order check and returns #N/A when the data is not ordered, while VLOOKUP/HLOOKUP
-//!   bisect without a sortedness guard and can therefore return a row Excel would also return
-//!   incorrectly. Excel documents approximate results on unsorted data as "may not be correct"
-//!   rather than an error, so the unguarded path matches Excel; LibreOffice instead returns #N/A.
-//!   See issue #283 before changing either behavior.
-//! - Binary search used for approximate modes for efficiency; linear scan for exact or when data has fewer than 8 searchable elements to avoid overhead.
+//! - Approximate modes are documented by Microsoft as requiring sorted data, but Excel
+//!   does not check.
+//! - GOD-234: measured against desktop Excel 16.105.3 (oracle receipt
+//!   `artifacts/private/god234/round/receipts/god234_match_oracle_receipt.json`, 67 rows,
+//!   all controls green). Real Excel's approximate MATCH performs NO sortedness check at
+//!   all: it runs an unguarded binary search that stops on equality (walking out to the
+//!   far end of the contiguous run of equal entries, per issue #326) and, when the
+//!   search terminates without an equal hit, answers with the last index the search proved
+//!   below the key (above it, for match_type -1), or #N/A when there is none. The #N/A this
+//!   implementation used to return for unsorted input was LibreOffice behaviour, not Excel
+//!   behaviour; the earlier note here citing issue #283 was wrong on that point.
+//! - The same search backs MATCH (both the reference and the array-literal path),
+//!   VLOOKUP and HLOOKUP, because Excel's answers across those functions on the same
+//!   unsorted data are mutually consistent (measured).
+//! - Binary search is used for approximate modes at every vector length; there is no
+//!   separate small-vector linear scan, because on unsorted data the two disagree.
 //! - VLOOKUP/HLOOKUP wrap MATCH logic; VLOOKUP: vertical first column; HLOOKUP: horizontal first row.
 //! - Error propagation: if the lookup value or any entry in an approximate lookup vector is an error, that error propagates.
 //! - Type coercion: current simple: numbers vs numeric text coerced; text comparison case-insensitive? Excel is case-insensitive for MATCH (without wildcards). We implement case-insensitive for now.
@@ -47,6 +55,13 @@ fn binary_search_match(
 
 /// Same search, but over an already-projected vector and returning an index
 /// into that projection.
+///
+/// This is Excel's measured approximate-lookup search (GOD-234): an unguarded
+/// binary search over the projection, stopping on equality (then walking to the
+/// far end of the contiguous run of equal entries) and otherwise falling back to
+/// the last index the search proved below the key (above it, for `mode == -1`). It is deliberately run at every vector length and for both
+/// `MATCH` argument shapes, so that one algorithm answers every approximate
+/// lookup; on unsorted data a second algorithm would disagree with it.
 fn binary_search_searched(
     searched: &SearchedVector<'_>,
     needle: &LiteralValue,
@@ -56,42 +71,44 @@ fn binary_search_searched(
     if mode == 0 || searched.is_empty() {
         return None;
     }
-    // Only ascending binary search currently (mode 1); descending path kept linear for now.
-    if mode == 1 {
-        // largest <= needle
-        let mut lo = 0usize;
-        let mut hi = searched.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match cmp_for_lookup(searched.get(mid), needle, date_system) {
-                Some(c) => {
-                    if c > 0 {
-                        hi = mid;
-                    } else {
-                        lo = mid + 1;
-                    }
+    let mut lo: isize = 0;
+    let mut hi: isize = searched.len() as isize - 1;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let c = cmp_for_lookup(searched.get(mid as usize), needle, date_system)
+            .expect("SearchedVector contains only entries comparable with the lookup value");
+        if c == 0 {
+            // Equality stops the bisection, but not before walking to the end
+            // of the *contiguous* run of equal entries: forward for mode 1,
+            // backward for mode -1. Measured (issue #326, Excel 16.105.3):
+            // MATCH(7, {1,5,7,7,7,9}, 1) = 5 and MATCH(7, {9,7,7,7,5}, -1) = 2.
+            // The walk is deliberately contiguous and deliberately linear: on
+            // unsorted data equal entries need not be adjacent, so neither a
+            // bisection nor a galloping scan over the run is sound.
+            let mut end = mid as usize;
+            let step: isize = if mode == 1 { 1 } else { -1 };
+            loop {
+                let next = end as isize + step;
+                if next < 0 || next >= searched.len() as isize {
+                    break;
                 }
-                None => unreachable!(
-                    "SearchedVector contains only entries comparable with the lookup value"
-                ),
-            }
-        }
-        if lo == 0 { None } else { Some(lo - 1) }
-    } else {
-        // -1 mode handled via linear fallback since semantics differ (smallest >=)
-        let mut best: Option<usize> = None;
-        for i in 0..searched.len() {
-            if let Some(c) = cmp_for_lookup(searched.get(i), needle, date_system) {
-                if c == 0 {
-                    return Some(i);
-                }
-                if c >= 0 && best.is_none_or(|b| i > b) {
-                    best = Some(i);
+                match cmp_for_lookup(searched.get(next as usize), needle, date_system) {
+                    Some(0) => end = next as usize,
+                    _ => break,
                 }
             }
+            return Some(end);
         }
-        best
+        // mode 1 walks right while the probe is below the key; mode -1 walks
+        // right while the probe is above it (a descending vector).
+        let go_right = if mode == 1 { c < 0 } else { c > 0 };
+        if go_right {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
     }
+    if hi >= 0 { Some(hi as usize) } else { None }
 }
 
 #[derive(Debug)]
@@ -105,7 +122,9 @@ pub struct MatchFn;
 /// - `match_type=0` performs exact matching and supports `*`, `?`, and `~` wildcards for text.
 /// - `match_type=1` looks for the largest value less than or equal to the lookup value.
 /// - `match_type=-1` looks for the smallest value greater than or equal to the lookup value.
-/// - Approximate modes require sorted data. MATCH detects unsorted input and returns `#N/A`; see the module notes for how VLOOKUP/HLOOKUP differ.
+/// - Approximate modes are documented as requiring sorted data, but Excel does not check:
+/// the search is an unguarded binary search with an equality early exit, and unsorted data
+/// yields whatever that search lands on rather than `#N/A` (measured, GOD-234).
 /// - If no match is found, returns `#N/A`.
 ///
 /// # Examples
@@ -136,8 +155,8 @@ pub struct MatchFn;
 ///   - XLOOKUP
 ///   - VLOOKUP
 /// faq:
-///   - q: "Why does MATCH with match_type 1 or -1 return #N/A on unsorted data?"
-///     a: "Approximate modes assume ordered lookup data; this implementation treats detected unsorted inputs as no valid match and returns #N/A."
+///   - q: "What does MATCH with match_type 1 or -1 do on unsorted data?"
+///     a: "The same thing Excel does: an unguarded binary search with an equality early exit. There is no sortedness check, so the answer is whatever that search lands on -- which may be a position, or #N/A if the search never proved any entry below (above, for -1) the lookup value."
 ///   - q: "When are wildcards interpreted in MATCH?"
 ///     a: "Wildcard patterns (*, ?, ~ escapes) are only applied in exact mode (match_type=0) for text lookup values."
 /// ```
@@ -302,67 +321,20 @@ impl Function for MatchFn {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
 
-                    // Project out the entries an approximate search ignores
-                    // (blanks and entries outside the needle's value class)
-                    // before both the sortedness guard and the search itself.
-                    let searched =
-                        match SearchedVector::new(&values, &lookup_value, ctx.date_system()) {
-                            Ok(searched) => searched,
+                    // Identical code path to the array-literal arm below: project
+                    // out the entries an approximate search ignores (blanks and
+                    // entries outside the needle's value class), then run the one
+                    // measured search. Excel gives a reference range and the same
+                    // data as an array literal identical answers (GOD-234).
+                    let idx =
+                        match binary_search_match(&values, &lookup_value, mt, ctx.date_system()) {
+                            Ok(idx) => idx,
                             Err(error) => {
                                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                                     error,
                                 )));
                             }
                         };
-
-                    // Lightweight unsorted detection for approximate modes
-                    let is_sorted = if mt == 1 {
-                        searched.is_sorted_ascending()
-                    } else if mt == -1 {
-                        searched.is_sorted_descending()
-                    } else {
-                        true
-                    };
-                    if !is_sorted {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Na),
-                        )));
-                    }
-                    let idx = if searched.len() < 8 {
-                        // linear small
-                        let mut best: Option<usize> = None;
-                        for i in 0..searched.len() {
-                            if let Some(c) =
-                                cmp_for_lookup(searched.get(i), &lookup_value, ctx.date_system())
-                            {
-                                // compare candidate to needle
-                                if mt == 1 {
-                                    // v <= needle
-                                    if (c == 0 || c == -1) && (best.is_none() || i > best.unwrap())
-                                    {
-                                        best = Some(i);
-                                    }
-                                } else {
-                                    // -1, v >= needle. Excel returns the *first*
-                                    // entry of an exact-match run on a descending
-                                    // range, but the *last* entry that still
-                                    // qualifies when the needle falls between two
-                                    // values. This mirrors the >= 8 path.
-                                    if c == 0 {
-                                        best = Some(i);
-                                        break;
-                                    }
-                                    if c == 1 && (best.is_none() || i > best.unwrap()) {
-                                        best = Some(i);
-                                    }
-                                }
-                            }
-                        }
-                        best
-                    } else {
-                        binary_search_searched(&searched, &lookup_value, mt, ctx.date_system())
-                    };
-                    let idx = idx.map(|i| searched.original_position(i));
                     match idx {
                         Some(i) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
                             (i + 1) as i64,
@@ -1056,7 +1028,11 @@ mod tests {
             .into_literal();
         assert!(matches!(v_desc2, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Na));
 
-        // Unsorted detection: 10, 30, 20, 40, 50 (not sorted ascending)
+        // Unsorted input: 10, 30, 20, 40, 50. GOD-234 removed the sortedness
+        // guard, so the unguarded bisection runs and lands on A3 (probe A3=20 <
+        // 30 -> right, probe A4=40 > 30 -> left, terminate with hi = A3). These
+        // two expectations are derived from the measured algorithm, not from a
+        // measured Excel row for this particular vector.
         let wb3 = TestWorkbook::new()
             .with_function(Arc::new(MatchFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
@@ -1080,8 +1056,8 @@ mod tests {
             .dispatch(&args_unsorted, &ctx3.function_context(None))
             .unwrap()
             .into_literal();
-        assert!(matches!(v_unsorted, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Na));
-        // Unsorted detection descending: 50, 30, 40, 20, 10
+        assert_eq!(v_unsorted, LiteralValue::Int(3));
+        // Unsorted descending input: 50, 30, 40, 20, 10 -> same, lands on A3.
         let wb4 = TestWorkbook::new()
             .with_function(Arc::new(MatchFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(50))
@@ -1106,7 +1082,7 @@ mod tests {
             .dispatch(&args_unsorted_desc, &ctx4.function_context(None))
             .unwrap()
             .into_literal();
-        assert!(matches!(v_unsorted_desc, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Na));
+        assert_eq!(v_unsorted_desc, LiteralValue::Int(3));
     }
 
     #[test]

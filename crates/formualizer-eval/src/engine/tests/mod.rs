@@ -23,6 +23,7 @@ mod evaluation_resource_ledger;
 mod evaluation_resource_observability;
 mod graph_basic;
 mod graph_internal_helpers;
+mod god234_approximate_match_unsorted;
 mod issue_326_error_skip_oracle;
 mod layer_evaluation;
 mod load_fast_mappings;
