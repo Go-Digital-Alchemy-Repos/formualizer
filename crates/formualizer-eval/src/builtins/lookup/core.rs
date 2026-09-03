@@ -285,6 +285,40 @@ impl Function for MatchFn {
                             match_type = n;
                         }
                     }
+                    // RESIDUAL, DELIBERATELY UNCHANGED: two variant classes
+                    // still fall through here and keep the approximate
+                    // default (match_type = 1.0). Neither has been MEASURED
+                    // against Excel, so this round did not move them --
+                    // behaviour only moves on measurement.
+                    //
+                    //  1. LiteralValue::Array with more than one element.
+                    //     A 1x1 array is unwrapped upstream, so
+                    //     `=MATCH(5,B2:G2,{0})` already reaches the Number
+                    //     arm. `{0,0}` and `{0,1}` arrive here and yield 1
+                    //     (approximate). The measured pair `{0}` -> 3 and
+                    //     `{1,0}` -> 5 together IMPLY a first-element rule,
+                    //     under which `{0,0}` should be exact (3), not 1.
+                    //     Oracle row `m-s5-arr10` (`{1,0}`) agrees today only
+                    //     BY ACCIDENT: the default is 1 and the array's first
+                    //     element happens to be 1. Open thread OT-125.
+                    //
+                    //  2. Temporal literals. `Time(00:00:00)` and
+                    //     `Duration(0)` have serial 0.0 and should therefore
+                    //     mean EXACT; `Duration(-12h)` has serial -0.5 and
+                    //     should mean -1. All three currently yield the
+                    //     approximate default. Not reachable from a formula
+                    //     literal -- only via `set_cell_value` or the CSV
+                    //     backend. Open thread OT-126.
+                    //
+                    // `crate::coercion::to_number_lenient` already encodes the
+                    // measured law for Boolean / Empty / numeric-Text and is
+                    // the likely landing place for both classes once they are
+                    // measured; swapping it in NOW would change behaviour on
+                    // inputs no oracle has measured.
+                    //
+                    // WARNING: a silent default-to-approximate catch-all is
+                    // the exact shape of the OT-118 defect this commit fixed.
+                    // Anything added to this arm needs an oracle row first.
                     _ => {}
                 }
             }
