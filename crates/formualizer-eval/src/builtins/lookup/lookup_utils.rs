@@ -141,9 +141,12 @@ pub fn equals_maybe_wildcard(
 /// The legacy approximate lookups (`MATCH` with `match_type` 1/-1,
 /// `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE) consider only entries in the
 /// needle's comparable value set. A blank cell, or an incomparable entry such
-/// as a text header sitting above a column of numbers, is skipped: it is neither
-/// out-of-order data nor a matchable position. Errors are handled separately
-/// and propagate rather than being classified as skippable.
+/// as a text header sitting above a column of numbers, is skipped: it is not
+/// a matchable position. An ERROR entry is skipped on the same terms -- it is
+/// not comparable with the needle, so it falls out here -- and is deliberately
+/// NOT propagated: measured, Excel 16.105.3, GOD-234 addendum rows
+/// `x-err-above-mt1` (`MATCH(8, {1,3,#DIV/0!,7,9}, 1)` = 4) and `x-err-hlookup`
+/// (`HLOOKUP(8, .., 1, TRUE)` = 7).
 pub fn is_searchable_for_approximate(
     value: &LiteralValue,
     needle: &LiteralValue,

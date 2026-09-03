@@ -7,15 +7,27 @@
 //! `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE) searches only the entries
 //! belonging to the needle's value class. Blank cells and entries of another
 //! class -- a text header above a numeric column, a stray number inside a
-//! text column -- are skipped. They neither make the vector look unsorted nor
-//! occupy a matchable position, and the returned index is still the position
-//! in the *original* range, not in the compacted one.
+//! text column -- are skipped: they do not occupy a matchable position, and the
+//! returned index is still the position in the *original* range, not in the
+//! compacted one.
 //!
 //! Error cells are skipped on exactly the same terms (issue #326, oracle rows
-//! reproduced in `issue_326_error_skip_oracle.rs`): they are projected out of
-//! the search, cannot be returned, never break sortedness, and are not
-//! propagated even when a bisection probe lands on one. A range with nothing
-//! searchable left yields #N/A.
+//! reproduced in `issue_326_error_skip_oracle.rs`; re-measured in the GOD-234
+//! addendum, rows `x-err-above-mt1` = 4 and `x-err-hlookup` = 7 over
+//! `{1, 3, #DIV/0!, 7, 9}`): they are projected out of the search, cannot be
+//! returned, and are not propagated even when a bisection probe lands on one.
+//! A range with nothing searchable left yields #N/A.
+//!
+//! NOTE (GOD-234): this file predates the measurement of Excel's approximate
+//! search and its wording used to justify the projection by saying skipped
+//! entries "must not make the vector look unsorted". THERE IS NO SORTEDNESS
+//! GUARD, and there never was one in Excel. Approximate MATCH runs an unguarded
+//! binary search that has no notion of sorted input at all -- measured, Excel
+//! 16.105.3, receipt
+//! `artifacts/private/god234/round/receipts/god234_match_oracle_receipt.json`,
+//! and reproduced in `god234_approximate_match_unsorted.rs`. The projection
+//! earns its keep purely because a skipped entry must not be *returnable* and
+//! must not consume a probe; whether the remainder looks sorted is irrelevant.
 
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -243,9 +255,18 @@ fn blank_tail_does_not_make_a_descending_range_unsorted() {
     );
 }
 
-/// Control: genuinely unsorted data is still `#N/A`. Ignoring blanks must not
-/// weaken the sortedness guard.
-/// Excel: `=MATCH(2,M1:M5,1)` => `#N/A`.
+/// Control: genuinely unsorted data is still `#N/A` here -- but NOT because of
+/// any sortedness guard. There is none (GOD-234). This is simply where Excel's
+/// unguarded binary search lands: over column M = [3, 1, 5, 2, 4] the first
+/// probe is the 0-based mid 2, a[2] = 5 > 2, so match_type 1 goes left with
+/// hi = 1; then mid = 0, a[0] = 3 > 2, hi = -1; the loop ends with hi < 0, so
+/// nothing was ever proved below the key and the answer is #N/A.
+///
+/// Excel: `=MATCH(2,M1:M5,1)` => `#N/A`. This is the same vector and the same
+/// formula as the measured oracle row `num-unsorted-2-mt1` (`=MATCH(2,B5:F5,1)`
+/// over [3, 1, 5, 2, 4]) in
+/// `artifacts/private/god234/round/receipts/god234_match_oracle_receipt.json`,
+/// Excel 16.105.3.
 #[test]
 fn genuinely_unsorted_data_is_still_na() {
     let mut engine = build_engine();
