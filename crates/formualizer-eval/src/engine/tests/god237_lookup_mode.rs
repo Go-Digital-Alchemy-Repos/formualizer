@@ -1070,7 +1070,7 @@ fn god237_lookup_has_no_mode_argument() {
 ///   artifacts/private/god237/round/receipts/god237_lookup_mode_oracle_receipt.json
 ///   sha256 ed7be728cc270ed17db6d6687af1d09575163c748831033eb53e7adf0908571d
 #[test]
-#[ignore = "GOD-237 open thread OT-120: an unreducible REFERENCE in MATCH's mode slot is #REF! in Excel; this engine reduces it"]
+#[ignore = "GOD-237 open thread OT-121: an unreducible REFERENCE in MATCH's mode slot is #REF! in Excel; this engine reduces it"]
 fn god237_known_divergence_unreducible_reference_in_match_mode_slot_is_ref() {
     let mut e = fixture();
     let mut fails = 0u32;
@@ -1136,7 +1136,7 @@ fn god237_known_divergence_unreducible_reference_in_match_mode_slot_is_ref() {
 ///   artifacts/private/god237/round/receipts/god237_lookup_mode_oracle_receipt.json
 ///   sha256 ed7be728cc270ed17db6d6687af1d09575163c748831033eb53e7adf0908571d
 #[test]
-#[ignore = "GOD-237 open thread OT-121: Excel array-broadcasts a multi-cell range in VLOOKUP/HLOOKUP's 4th argument and spills; this engine does not"]
+#[ignore = "GOD-237 open thread OT-122: Excel array-broadcasts a multi-cell range in VLOOKUP/HLOOKUP's 4th argument and spills; this engine does not"]
 fn god237_known_divergence_vlookup_hlookup_mode_range_broadcasts() {
     let mut e = fixture();
     let mut fails = 0u32;
@@ -1185,7 +1185,7 @@ fn god237_known_divergence_vlookup_hlookup_mode_range_broadcasts() {
 ///   artifacts/private/god237/round/receipts/god237_lookup_mode_oracle_receipt.json
 ///   sha256 ed7be728cc270ed17db6d6687af1d09575163c748831033eb53e7adf0908571d
 #[test]
-#[ignore = "GOD-237 open thread OT-122: LOOKUP with a present-but-empty result vector is #VALUE! in Excel; this engine answers 0"]
+#[ignore = "GOD-237 open thread OT-123: LOOKUP with a present-but-empty result vector is #VALUE! in Excel; this engine answers 0"]
 fn god237_known_divergence_lookup_present_but_empty_result_vector() {
     let mut e = fixture();
     let mut fails = 0u32;
@@ -1226,7 +1226,7 @@ fn god237_known_divergence_lookup_present_but_empty_result_vector() {
 ///   artifacts/private/god237/round/receipts/god237_lookup_mode_oracle_receipt.json
 ///   sha256 ed7be728cc270ed17db6d6687af1d09575163c748831033eb53e7adf0908571d
 #[test]
-#[ignore = "GOD-237 open thread OT-123: Excel collates numbers<text<FALSE<TRUE on MATCH's approximate arm; this engine projects out-of-class entries"]
+#[ignore = "GOD-237 open thread OT-124: Excel collates numbers<text<FALSE<TRUE on MATCH's approximate arm; this engine projects out-of-class entries"]
 fn god237_known_divergence_cross_class_collation_on_the_approximate_arm() {
     let mut e = fixture();
     let mut fails = 0u32;
