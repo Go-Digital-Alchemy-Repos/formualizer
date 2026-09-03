@@ -1588,30 +1588,34 @@ fn god234_addendum_known_divergence_match_type_minus_one() {
     );
 }
 
-/// KNOWN DIVERGENCE (out of scope, measured): `match_type` given as a BOOLEAN
-/// or as a reference to a BLANK cell.
+/// RESOLVED in GOD-237 (was a GOD-234 known divergence, OT-118): `match_type`
+/// given as a BOOLEAN or as a reference to a BLANK cell.
 ///
 /// Excel coerces `match_type` by sign, and takes both `FALSE` and a blank
 /// reference as **0** (exact). Over the ascending vector `{1,3,5,5,5,9}` with
-/// key 5 that is position **3**; this engine answers **5**, because
-/// `MatchFn::eval` matches only `Number` / `Int` / `Text` when reading the third
-/// argument and silently leaves `match_type` at its default 1 for a `Boolean`
-/// or an `Empty`. `TRUE` is right only by accident (it also lands on 1).
+/// key 5 that is position **3**; this engine used to answer **5**, because
+/// `MatchFn::eval` matched only `Number` / `Int` / `Text` when reading the third
+/// argument and silently left `match_type` at its default 1 for a `Boolean`
+/// or an `Empty`. `TRUE` was right only by accident (it also lands on 1).
 ///
-/// Measured, Excel 16.105.3, addendum rows `x-mt-false` and `x-mt-blankref`.
+/// GOD-237 re-measured the whole lookup-mode law over 222 rows on desktop Excel
+/// and landed the fix (`Boolean` and `Empty` arms in `MatchFn::eval`), so this
+/// test now PASSES. Its expectations are unchanged -- they are still Excel's.
+///
+/// GOD-234 addendum rows `x-mt-false` and `x-mt-blankref`; the same law is
+/// re-measured as GOD-237 rows `p-god234-x-mt-false` and
+/// `p-god234-x-mt-blankref` (and 12 siblings) in
+/// `god237_lookup_mode.rs`. GOD-237 oracle receipt:
+///   artifacts/private/god237/round/receipts/god237_lookup_mode_oracle_receipt.json
+///   sha256 ed7be728cc270ed17db6d6687af1d09575163c748831033eb53e7adf0908571d
+///
 /// The related rows the engine DOES reproduce -- `x-mt-true`, `x-mt-str0`,
 /// `x-mt-str1`, `x-mt-strx` (`#VALUE!`), `x-mt-0p5`, `x-mt-1p5`, `x-mt-2` and
 /// `x-mt-empty` -- are asserted in the passing test above; note especially that
 /// a third argument that is present but EMPTY (`=MATCH(5,B26:G26,)`) behaves as
 /// match_type 0 while a fully ABSENT third argument behaves as 1. Two different
-/// defaults, and the engine already gets that pair right.
-///
-/// This is a two-line fix in `MatchFn::eval` (accept `Boolean` and `Empty`) but
-/// it MOVES ENGINE BEHAVIOUR, and GOD-234's blast-radius census and two-engine
-/// graded differential were run against a build without it. It is therefore
-/// held out of this round and recorded as an open thread.
+/// defaults, and the engine already got that pair right.
 #[test]
-#[ignore = "GOD-234 open thread: match_type coercion of Boolean / blank reference is unimplemented; behaviour change held out of this round"]
 fn god234_addendum_known_divergence_match_type_boolean_and_blank() {
     let mut e = addendum_fixture();
     let mut fails = 0u32;
@@ -1630,8 +1634,8 @@ fn god234_addendum_known_divergence_match_type_boolean_and_blank() {
     );
     assert_eq!(
         fails, 0,
-        "{fails} match_type-coercion row(s) still diverge -- expected while the \
-         open thread is open; do NOT edit the expectations above"
+        "{fails} match_type-coercion row(s) diverge -- OT-118 is FIXED as of \
+         GOD-237; do NOT edit the expectations above"
     );
 }
 

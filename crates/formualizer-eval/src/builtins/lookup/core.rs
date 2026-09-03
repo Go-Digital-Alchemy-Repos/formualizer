@@ -267,9 +267,19 @@ impl Function for MatchFn {
                 if let LiteralValue::Error(e) = mt_val {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                 }
+                // GOD-237: Excel coerces MATCH's third argument as a NUMBER,
+                // then takes it by SIGN. TRUE is 1 (approximate), FALSE is 0
+                // (exact), and a reference to a BLANK cell is 0 (exact) --
+                // measured, desktop Excel 16.105.3, oracle receipt
+                // artifacts/private/god237/round/receipts/god237_lookup_mode_oracle_receipt.json
+                // sha256 ed7be728cc270ed17db6d6687af1d09575163c748831033eb53e7adf0908571d,
+                // rows m-{s5,s6,u5,u6}-{false,refblank,reffalse} and
+                // p-god234-x-mt-{false,blankref}.
                 match mt_val {
                     LiteralValue::Number(n) => match_type = n,
                     LiteralValue::Int(i) => match_type = i as f64,
+                    LiteralValue::Boolean(b) => match_type = if b { 1.0 } else { 0.0 },
+                    LiteralValue::Empty => match_type = 0.0,
                     LiteralValue::Text(s) => {
                         if let Ok(n) = s.parse::<f64>() {
                             match_type = n;
