@@ -499,3 +499,79 @@ fn three_dimensional_span_inside_static_scc_records_live_member_edges() {
     assert_eq!(v, LiteralValue::Number(3.0));
     assert_eq!(edges(&collector), FxHashSet::from_iter([(0, 1), (0, 2)]));
 }
+
+/* ─────────── record_rect branch parity (GOD-242 / CL-051) ─────────── */
+
+/// `record_rect` intersects the rect with the SCC membership on whichever
+/// side is smaller: it probes `index` per cell for a rect smaller than the
+/// membership, and scans `members` otherwise. Both branches must record the
+/// identical edge set with identical `selected`/`mechanisms` flags — including
+/// the `EDGE_NON_IF_LAZY` classification carried by `pending_rects` — so that
+/// the cost fix cannot move an edge.
+#[test]
+fn record_rect_small_rect_and_member_scan_record_identical_edges() {
+    let mut engine = new_engine();
+    engine.add_sheet("Other").unwrap();
+    for row in 1..=6u32 {
+        for col in 1..=4u32 {
+            set_num(&mut engine, "Sheet1", row, col, (row * 10 + col) as f64);
+        }
+    }
+    engine.evaluate_all().unwrap();
+
+    // Membership: a block on Sheet1 plus one off-sheet member that no rect on
+    // Sheet1 may ever record.
+    let mut members: Vec<CellRef> = Vec::new();
+    for row in 1..=6u32 {
+        for col in 1..=4u32 {
+            members.push(cell(&engine, "Sheet1", row, col));
+        }
+    }
+    members.push(cell(&engine, "Other", 2, 2));
+    let sheet1 = engine.sheet_id("Sheet1").expect("sheet exists");
+
+    let records = |by_index: bool, lazy_rect: bool, rect: (u32, u32, u32, u32)| {
+        let collector = LiveEdgeCollector::new(&members);
+        collector.set_current(0);
+        if lazy_rect {
+            // A pending non-IF-lazy scope covering part of the rect, so the
+            // two branches have to agree on the per-cell EDGE_NON_IF_LAZY bit
+            // and not merely on the edge set.
+            collector.begin_selected_non_if_lazy_arm();
+            collector.record_selected_non_if_lazy_rect(sheet1, 0, 0, 2, 1, true);
+        }
+        collector.record_rect_forced_branch(by_index, sheet1, rect.0, rect.1, rect.2, rect.3);
+        let mut out: Vec<(u32, u32, bool, u8)> = collector
+            .take_edge_records()
+            .into_iter()
+            .map(|e| (e.from, e.to, e.selected, e.mechanisms))
+            .collect();
+        out.sort_unstable();
+        out
+    };
+
+    // Rects covering: a single cell, a one-row strip (the 3-D span shape), a
+    // block straddling the lazy scope, the whole membership, and a rect that
+    // runs off the membership on both axes.
+    for rect in [
+        (0u32, 0u32, 0u32, 0u32),
+        (2, 0, 2, 3),
+        (0, 0, 3, 2),
+        (0, 0, 5, 3),
+        (4, 2, 9, 9),
+        (7, 7, 8, 8),
+    ] {
+        for lazy_rect in [false, true] {
+            let by_index = records(true, lazy_rect, rect);
+            let by_scan = records(false, lazy_rect, rect);
+            assert_eq!(
+                by_index, by_scan,
+                "branch mismatch for rect {rect:?} (lazy_rect={lazy_rect})"
+            );
+        }
+    }
+
+    // And the branches are not vacuously equal: the one-row strip really does
+    // record its four members.
+    assert_eq!(records(true, false, (2, 0, 2, 3)).len(), 4);
+}

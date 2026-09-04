@@ -148,6 +148,11 @@ pub struct LiveEdgeCollector {
     members: Vec<MemberCell>,
     /// O(1) scalar lookup: (sheet_id, row0, col0) -> member index.
     index: FxHashMap<(SheetId, u32, u32), u32>,
+    /// True when `index` maps every member cell to its own index, i.e. no two
+    /// members share a `(sheet_id, row, col)`. Guards the index-probe branch
+    /// of `record_rect`, which would otherwise miss a shadowed duplicate that
+    /// the member scan would record.
+    index_covers_members: bool,
     /// O(1) name lookup: engine-folded name key -> member index (indices
     /// start after the cell members).
     name_index: FxHashMap<String, u32>,
@@ -254,9 +259,11 @@ impl LiveEdgeCollector {
             name_index.insert(name.clone(), (members.len() + j) as u32);
         }
         let total_members = members.len() + names.len();
+        let index_covers_members = index.len() == members.len();
         Self {
             members,
             index,
+            index_covers_members,
             name_index,
             total_members,
             diagnostic_enabled,
@@ -321,20 +328,74 @@ impl LiveEdgeCollector {
         self.record_edge(to, true, mechanisms);
     }
 
-    /// Record a rectangle read (0-based, inclusive corners). Intersection is
-    /// O(|SCC|): each member is tested against the rect once; the rect is
-    /// never enumerated per cell.
+    /// Record a rectangle read (0-based, inclusive corners).
+    ///
+    /// The rect is intersected with the SCC membership on whichever side is
+    /// smaller (GOD-242 / CL-051): probing `index` costs O(area) hash lookups,
+    /// scanning `members` costs O(|SCC|) comparisons. Both branches record the
+    /// identical edge set with identical mechanism flags — `index` is built
+    /// from `members` and covers every member cell — so the choice is purely a
+    /// cost one. The small-rect branch is only taken when `index` is a total
+    /// map of the membership (no two members share a cell), which it always is
+    /// for a real SCC.
     pub fn record_rect(&self, sheet_id: SheetId, sr: u32, sc: u32, er: u32, ec: u32) {
-        let pending_rects: Vec<PendingLazyRect> = {
-            let state = self.state.lock().unwrap();
-            state
-                .pending_lazy_scopes
-                .iter()
-                .flat_map(|scope| scope.rects.iter().copied())
-                .collect()
-        };
-        'rows: for row in sr..=er {
+        let pending_rects = self.pending_lazy_rects();
+        // The per-cell sweep below is a DIAGNOSTIC-ONLY census;
+        // `record_diagnostic_cell` is a no-op when diagnostics are off, so
+        // running the loop then walked the whole rect (unbounded, for a
+        // whole-column read) for nothing.
+        if self.diagnostic_enabled {
+            'rows: for row in sr..=er {
+                for col in sc..=ec {
+                    let lazy = pending_rects.iter().any(|rect| {
+                        rect.sheet_id == sheet_id
+                            && row >= rect.sr
+                            && row <= rect.er
+                            && col >= rect.sc
+                            && col <= rect.ec
+                    });
+                    let mechanisms =
+                        EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 };
+                    let _ = mechanisms;
+                    if !self.record_diagnostic_cell(sheet_id, row, col, true, EDGE_RANGE_EXPANSION)
+                    {
+                        break 'rows;
+                    }
+                }
+            }
+        }
+        let area = (er.saturating_sub(sr) as u64 + 1).saturating_mul(ec.saturating_sub(sc) as u64 + 1);
+        if self.index_covers_members && area < self.members.len() as u64 {
+            self.record_rect_by_index(sheet_id, sr, sc, er, ec, &pending_rects);
+        } else {
+            self.record_rect_by_member_scan(sheet_id, sr, sc, er, ec, &pending_rects);
+        }
+    }
+
+    fn pending_lazy_rects(&self) -> Vec<PendingLazyRect> {
+        let state = self.state.lock().unwrap();
+        state
+            .pending_lazy_scopes
+            .iter()
+            .flat_map(|scope| scope.rects.iter().copied())
+            .collect()
+    }
+
+    /// Small-rect branch: enumerate the rect and look each cell up in `index`.
+    fn record_rect_by_index(
+        &self,
+        sheet_id: SheetId,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+        pending_rects: &[PendingLazyRect],
+    ) {
+        for row in sr..=er {
             for col in sc..=ec {
+                let Some(&i) = self.index.get(&(sheet_id, row, col)) else {
+                    continue;
+                };
                 let lazy = pending_rects.iter().any(|rect| {
                     rect.sheet_id == sheet_id
                         && row >= rect.sr
@@ -342,12 +403,25 @@ impl LiveEdgeCollector {
                         && col >= rect.sc
                         && col <= rect.ec
                 });
-                let mechanisms = EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 };
-                if !self.record_diagnostic_cell(sheet_id, row, col, true, EDGE_RANGE_EXPANSION) {
-                    break 'rows;
-                }
+                self.record_edge(
+                    i,
+                    true,
+                    EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 },
+                );
             }
         }
+    }
+
+    /// Large-rect branch: test every member against the rect once.
+    fn record_rect_by_member_scan(
+        &self,
+        sheet_id: SheetId,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+        pending_rects: &[PendingLazyRect],
+    ) {
         for (i, m) in self.members.iter().enumerate() {
             if m.sheet_id == sheet_id && m.row >= sr && m.row <= er && m.col >= sc && m.col <= ec {
                 let lazy = pending_rects.iter().any(|rect| {
@@ -363,6 +437,26 @@ impl LiveEdgeCollector {
                     EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 },
                 );
             }
+        }
+    }
+
+    /// Test-only: record a rect through one specific branch of `record_rect`,
+    /// so the two can be proved to record the same edges for the same rect.
+    #[cfg(test)]
+    pub(crate) fn record_rect_forced_branch(
+        &self,
+        by_index: bool,
+        sheet_id: SheetId,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+    ) {
+        let pending_rects = self.pending_lazy_rects();
+        if by_index {
+            self.record_rect_by_index(sheet_id, sr, sc, er, ec, &pending_rects);
+        } else {
+            self.record_rect_by_member_scan(sheet_id, sr, sc, er, ec, &pending_rects);
         }
     }
 
