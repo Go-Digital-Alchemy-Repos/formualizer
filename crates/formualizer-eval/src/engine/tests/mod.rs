@@ -195,11 +195,14 @@ mod iterate_corpus_structural;
 mod iterate_corpus_text;
 mod live_edge_precision;
 mod live_edges;
+mod live_edges_record_rect_guard;
+mod live_edges_span_edge_cases;
 mod scalar_range_promotion;
 mod scc_iterate;
 mod scc_runtime_cycles;
 mod scc_runtime_property;
 mod short_circuit_dispatch;
+mod virtual_deps_span_arms;
 
 mod approximate_lookup_ignored_entries;
 mod format_channel_t1;

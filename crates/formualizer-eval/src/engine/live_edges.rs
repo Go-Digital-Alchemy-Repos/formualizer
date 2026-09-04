@@ -354,8 +354,7 @@ impl LiveEdgeCollector {
                             && col >= rect.sc
                             && col <= rect.ec
                     });
-                    let mechanisms =
-                        EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 };
+                    let mechanisms = EDGE_RANGE_EXPANSION | if lazy { EDGE_NON_IF_LAZY } else { 0 };
                     let _ = mechanisms;
                     if !self.record_diagnostic_cell(sheet_id, row, col, true, EDGE_RANGE_EXPANSION)
                     {
@@ -364,7 +363,8 @@ impl LiveEdgeCollector {
                 }
             }
         }
-        let area = (er.saturating_sub(sr) as u64 + 1).saturating_mul(ec.saturating_sub(sc) as u64 + 1);
+        let area =
+            (er.saturating_sub(sr) as u64 + 1).saturating_mul(ec.saturating_sub(sc) as u64 + 1);
         if self.index_covers_members && area < self.members.len() as u64 {
             self.record_rect_by_index(sheet_id, sr, sc, er, ec, &pending_rects);
         } else {
@@ -652,6 +652,18 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
     /// list comes from the same `active_span_ids` registration-order window the
     /// engine itself uses, so the recorded edges are exactly the cells the
     /// engine is about to consume.
+    ///
+    /// Known and accepted (review cycle 1, F4): for `Range3D` this resolves each
+    /// member rect a second time (once here for the used-region normalisation,
+    /// once again in the engine's own arm), so a span rect read costs two member
+    /// resolutions; measured acceptable for the caller's workload and left as is
+    /// rather than plumbing a normalisation-only entry point.
+    ///
+    /// Known and accepted (review cycle 1, F5): `Cell3D` members are recorded
+    /// through `record_scalar`, so their edges carry the `EDGE_EVALUATED_SCALAR`
+    /// mechanism label even though the read reached the engine as a 3-D span.
+    /// The label is diagnostic only -- staleness propagation uses the edge, not
+    /// its mechanism -- so no behaviour depends on it.
     fn record_three_dimensional_members(&self, reference: &ReferenceType, current_sheet: &str) {
         match reference {
             ReferenceType::Cell3D {
@@ -884,12 +896,14 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         }
         // FZ_SPAN_TRACE diagnostic: print BEFORE delegating, so a 3-D span read
         // that arrives through the SCC RecordingContext is attributable to this
-        // context rather than to an acyclic layer.
-        if crate::engine::eval::fz_span_trace_enabled()
-            && matches!(
-                reference,
-                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. }
-            )
+        // context rather than to an acyclic layer.  The cheap discriminant
+        // `matches!` is tested first so a non-3-D range read (the overwhelming
+        // majority) pays no `OnceLock` load with the variable unset (review
+        // cycle 1, F1).
+        if matches!(
+            reference,
+            ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. }
+        ) && crate::engine::eval::fz_span_trace_enabled()
         {
             eprintln!("FZ_SPAN_CTX recording cur={current_sheet}");
         }

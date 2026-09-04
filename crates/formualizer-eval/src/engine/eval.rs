@@ -921,8 +921,11 @@ impl ComputedWriteChunkPlan {
 /// actually read at a given pass can be read off the log rather than inferred
 /// from the sum.  Kept as a permanent diagnostic alongside `FZ_DEBUG_LOAD`:
 /// zero cost and zero output when the variable is unset (the environment is
-/// read once into a `OnceLock` and every trace site is behind the resulting
-/// `bool`), and no evaluation semantics depend on it.
+/// read once into a `OnceLock`, every trace site is behind the resulting
+/// `bool`, and no allocation or formatting work is done outside those blocks --
+/// review cycle 1, F1), and no evaluation semantics depend on it.  The trace
+/// lines carry shape only (sheet, sheet id, rect, counts, numeric sum), never
+/// member cell values (review cycle 1, F2).
 pub(crate) fn fz_span_trace_enabled() -> bool {
     static FZ_SPAN_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FZ_SPAN_TRACE.get_or_init(|| {
@@ -931,6 +934,31 @@ pub(crate) fn fz_span_trace_enabled() -> bool {
             Err(_) | Ok("") | Ok("0")
         )
     })
+}
+
+/// Shape summary of the rows one span member contributed, for `FZ_SPAN_TRACE`.
+///
+/// Returns `(row count, cell count, sum of the numeric cells, count of cells
+/// that are not `Int`/`Number`)`.  The trace deliberately carries shape and an
+/// aggregate only, never the member cell values themselves: the diagnosis this
+/// exists for compares a span *site* value against the member sum, and the
+/// stderr log is an egress surface for workbook contents (review cycle 1, F2).
+/// Called only from inside a `if fz_span_trace_enabled()` block.
+pub(crate) fn fz_span_shape(rows: &[Vec<LiteralValue>]) -> (usize, usize, f64, usize) {
+    let mut n_cells = 0usize;
+    let mut sum = 0.0f64;
+    let mut non_numeric = 0usize;
+    for r in rows {
+        for v in r {
+            n_cells += 1;
+            match v {
+                LiteralValue::Number(n) => sum += *n,
+                LiteralValue::Int(i) => sum += *i as f64,
+                _ => non_numeric += 1,
+            }
+        }
+    }
+    (rows.len(), n_cells, sum, non_numeric)
 }
 
 pub struct Engine<R> {
@@ -25008,9 +25036,8 @@ where
                 let fz_trace = fz_span_trace_enabled();
                 let mut rows = Vec::with_capacity(sheet_ids.len());
                 for sheet_id in sheet_ids {
-                    let fz_sheet = self.graph.sheet_name(sheet_id).to_string();
                     let reference = ReferenceType::Cell {
-                        sheet: Some(fz_sheet.clone()),
+                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
                         row: *row,
                         col: *col,
                         row_abs: *row_abs,
@@ -25023,9 +25050,14 @@ where
                         Ok(())
                     })?;
                     if fz_trace {
+                        let (n_rows, n_cells, sum, non_numeric) = fz_span_shape(&rows[fz_before..]);
                         eprintln!(
-                            "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={fz_sheet} rows={}..{} cols={}..{} v={:?}",
-                            *row, *row, *col, *col, &rows[fz_before..]
+                            "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={} rows={}..{} cols={}..{} n_rows={n_rows} n_cells={n_cells} sum={sum:?} non_numeric={non_numeric}",
+                            self.graph.sheet_name(sheet_id),
+                            *row,
+                            *row,
+                            *col,
+                            *col
                         );
                     }
                 }
@@ -25058,9 +25090,8 @@ where
                 let fz_trace = fz_span_trace_enabled();
                 let mut rows = Vec::new();
                 for sheet_id in sheet_ids {
-                    let fz_sheet = self.graph.sheet_name(sheet_id).to_string();
                     let reference = ReferenceType::Range {
-                        sheet: Some(fz_sheet.clone()),
+                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
                         start_row: *start_row,
                         start_col: *start_col,
                         end_row: *end_row,
@@ -25077,9 +25108,14 @@ where
                         Ok(())
                     })?;
                     if fz_trace {
+                        let (n_rows, n_cells, sum, non_numeric) = fz_span_shape(&rows[fz_before..]);
                         eprintln!(
-                            "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={fz_sheet} rows={:?}..{:?} cols={:?}..{:?} v={:?}",
-                            *start_row, *end_row, *start_col, *end_col, &rows[fz_before..]
+                            "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={} rows={:?}..{:?} cols={:?}..{:?} n_rows={n_rows} n_cells={n_cells} sum={sum:?} non_numeric={non_numeric}",
+                            self.graph.sheet_name(sheet_id),
+                            *start_row,
+                            *end_row,
+                            *start_col,
+                            *end_col
                         );
                     }
                 }
