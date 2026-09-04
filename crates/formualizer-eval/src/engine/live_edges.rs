@@ -539,6 +539,94 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
         }
     }
 
+    /// Record the member cells a 3-D span reference (`Acct1:Acct11!L18`) is
+    /// about to read (GOD-242 / CL-051).
+    ///
+    /// The engine's `Cell3D` / `Range3D` arms resolve each member sheet through
+    /// `Engine::resolve_range_view` directly — not through this recorder — and
+    /// return the concatenation as an *owned* row view whose sheet name is the
+    /// `"__tmp"` placeholder.  `record_view` therefore finds no registered
+    /// `SheetId` for it and records nothing (see the documented skip there),
+    /// and the per-member reads bypass the recorder too.  The span site then
+    /// carries an EMPTY live-edge set inside its SCC, so when a member's value
+    /// changes the settle loop never marks the site stale: the site keeps
+    /// whichever mid-settle transient members it saw on its single evaluation.
+    /// This is the same owned-view hazard `NamedRange` is already special-cased
+    /// for in `resolve_range_view` below.
+    ///
+    /// Span membership is NOT reinterpreted here (ES-010 / ES-047): the member
+    /// list comes from the same `active_span_ids` registration-order window the
+    /// engine itself uses, so the recorded edges are exactly the cells the
+    /// engine is about to consume.
+    fn record_three_dimensional_members(&self, reference: &ReferenceType, current_sheet: &str) {
+        match reference {
+            ReferenceType::Cell3D {
+                sheet_first,
+                sheet_last,
+                row,
+                col,
+                ..
+            } => {
+                if *row == 0 || *col == 0 {
+                    return;
+                }
+                let Some(sheet_ids) = self
+                    .engine
+                    .graph
+                    .sheet_reg()
+                    .active_span_ids(sheet_first, sheet_last)
+                else {
+                    return;
+                };
+                for sheet_id in sheet_ids {
+                    self.collector.record_scalar(sheet_id, *row - 1, *col - 1);
+                }
+            }
+            ReferenceType::Range3D {
+                sheet_first,
+                sheet_last,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                start_row_abs,
+                start_col_abs,
+                end_row_abs,
+                end_col_abs,
+            } => {
+                let Some(sheet_ids) = self
+                    .engine
+                    .graph
+                    .sheet_reg()
+                    .active_span_ids(sheet_first, sheet_last)
+                else {
+                    return;
+                };
+                for sheet_id in sheet_ids {
+                    // Resolve the member rect through the engine so unbounded
+                    // axes get the engine's own used-region normalisation, then
+                    // record the resulting rect (same shape as the `Range` path
+                    // in `resolve_range_reference`).
+                    let member = ReferenceType::Range {
+                        sheet: Some(self.engine.graph.sheet_name(sheet_id).to_string()),
+                        start_row: *start_row,
+                        start_col: *start_col,
+                        end_row: *end_row,
+                        end_col: *end_col,
+                        start_row_abs: *start_row_abs,
+                        start_col_abs: *start_col_abs,
+                        end_row_abs: *end_row_abs,
+                        end_col_abs: *end_col_abs,
+                    };
+                    if let Ok(view) = self.engine.resolve_range_view(&member, current_sheet) {
+                        self.record_view(&view);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn record_selected_non_if_lazy_view(&self, reference: &ReferenceType, view: &RangeView<'_>) {
         if view.is_empty() {
             return;
@@ -711,6 +799,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         {
             eprintln!("FZ_SPAN_CTX recording cur={current_sheet}");
         }
+        // 3-D spans resolve to an owned `"__tmp"` view that `record_view`
+        // cannot attribute; record their members explicitly (GOD-242 / CL-051).
+        self.record_three_dimensional_members(reference, current_sheet);
         let view = self.engine.resolve_range_view(reference, current_sheet)?;
         self.record_view(&view);
         Ok(view)

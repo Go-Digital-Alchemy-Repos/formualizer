@@ -432,3 +432,70 @@ fn reads_without_current_member_are_dropped() {
     let _ = interp.evaluate_ast(&parse("=A1"));
     assert!(collector.take_edges().is_empty());
 }
+
+/// A 3-D span read records a live edge to every member cell it consumes.
+///
+/// GOD-242 / CL-051: the engine's `Cell3D` / `Range3D` arms resolve each member
+/// sheet themselves and return the concatenation as an owned `"__tmp"` view,
+/// which carries no registered `SheetId`; the recorder therefore used to record
+/// nothing at all for a span site.  Inside an SCC that makes the site's live
+/// in-edge set empty, so the settle loop never re-evaluates it when a member's
+/// value moves and the site latches a mid-settle transient sum.
+#[test]
+fn three_dimensional_span_inside_static_scc_records_live_member_edges() {
+    let mut engine = new_engine();
+    for sheet in ["Acct1", "Acct2", "Acct3"] {
+        engine.add_sheet(sheet).unwrap();
+    }
+    set_num(&mut engine, "Acct1", 1, 2, 1.0);
+    set_num(&mut engine, "Acct2", 1, 2, 2.0);
+    set_num(&mut engine, "Acct3", 1, 2, 4.0);
+    engine.evaluate_all().unwrap();
+
+    let site = cell(&engine, "Sheet1", 1, 1);
+    let members = [
+        site,
+        cell(&engine, "Acct1", 1, 2),
+        cell(&engine, "Acct2", 1, 2),
+        cell(&engine, "Acct3", 1, 2),
+    ];
+    let collector = LiveEdgeCollector::new(&members);
+    let all_members = FxHashSet::from_iter([(0, 1), (0, 2), (0, 3)]);
+
+    // Cell3D: one cell per member sheet.
+    let v = eval_as_member(
+        &engine,
+        &collector,
+        0,
+        "Sheet1",
+        site,
+        "=SUM(Acct1:Acct3!B1)",
+    );
+    assert_eq!(v, LiteralValue::Number(7.0));
+    assert_eq!(edges(&collector), all_members);
+
+    // Range3D: one rect per member sheet.
+    let v = eval_as_member(
+        &engine,
+        &collector,
+        0,
+        "Sheet1",
+        site,
+        "=SUM(Acct1:Acct3!B1:B2)",
+    );
+    assert_eq!(v, LiteralValue::Number(7.0));
+    assert_eq!(edges(&collector), all_members);
+
+    // The span window is the registration-order window between the endpoints
+    // (ES-010 / ES-047); a narrower span records only the sheets inside it.
+    let v = eval_as_member(
+        &engine,
+        &collector,
+        0,
+        "Sheet1",
+        site,
+        "=SUM(Acct1:Acct2!B1)",
+    );
+    assert_eq!(v, LiteralValue::Number(3.0));
+    assert_eq!(edges(&collector), FxHashSet::from_iter([(0, 1), (0, 2)]));
+}

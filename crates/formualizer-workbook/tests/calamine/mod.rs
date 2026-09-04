@@ -40,3 +40,5 @@ mod shared_formulas;
 mod sheet_load;
 #[cfg(feature = "umya")]
 mod temporal_roundtrip;
+#[cfg(feature = "calamine")]
+mod three_dimensional_span_first_evaluation;

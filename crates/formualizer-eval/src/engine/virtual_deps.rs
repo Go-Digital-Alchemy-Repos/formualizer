@@ -284,6 +284,58 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
                     self.collected.lock().unwrap().insert(vid);
                 }
             }
+            ReferenceType::Cell3D {
+                sheet_first,
+                sheet_last,
+                row,
+                col,
+                ..
+            } => {
+                // Same owned-view blind spot as `RecordingContext` (GOD-242 /
+                // CL-051): the engine resolves each span member itself and
+                // returns an owned `"__tmp"` view, so nothing about the members
+                // reaches this collector unless it expands the span here.  The
+                // member window is the engine's own `active_span_ids` one; span
+                // membership semantics (ES-010 / ES-047) are unchanged.
+                if let Some(sheet_ids) = self
+                    .engine
+                    .graph
+                    .sheet_reg()
+                    .active_span_ids(sheet_first, sheet_last)
+                {
+                    for sheet_id in sheet_ids {
+                        let sheet_name = self.engine.graph.sheet_name(sheet_id).to_string();
+                        self.collect_formula_vertices_in_rect(&sheet_name, *row, *col, *row, *col);
+                    }
+                }
+            }
+            ReferenceType::Range3D {
+                sheet_first,
+                sheet_last,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            } => {
+                if let Some(sheet_ids) = self
+                    .engine
+                    .graph
+                    .sheet_reg()
+                    .active_span_ids(sheet_first, sheet_last)
+                {
+                    for sheet_id in sheet_ids {
+                        let sheet_name = self.engine.graph.sheet_name(sheet_id).to_string();
+                        self.collect_formula_vertices_for_range(
+                            &sheet_name,
+                            *start_row,
+                            *start_col,
+                            *end_row,
+                            *end_col,
+                        );
+                    }
+                }
+            }
             ReferenceType::Table(_) => {
                 // Table references might be tricky, skip for now or resolve from graph if possible
             }
