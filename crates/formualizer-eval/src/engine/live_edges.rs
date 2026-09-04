@@ -700,6 +700,17 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         if let ReferenceType::NamedRange(name) = reference {
             self.record_name(name);
         }
+        // FZ_SPAN_TRACE diagnostic: print BEFORE delegating, so a 3-D span read
+        // that arrives through the SCC RecordingContext is attributable to this
+        // context rather than to an acyclic layer.
+        if crate::engine::eval::fz_span_trace_enabled()
+            && matches!(
+                reference,
+                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. }
+            )
+        {
+            eprintln!("FZ_SPAN_CTX recording cur={current_sheet}");
+        }
         let view = self.engine.resolve_range_view(reference, current_sheet)?;
         self.record_view(&view);
         Ok(view)

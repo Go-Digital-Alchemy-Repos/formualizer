@@ -913,6 +913,26 @@ impl ComputedWriteChunkPlan {
     }
 }
 
+/// Env-gated diagnostic trace for 3-D span (`Sheet1:Sheet11!L18`) member reads.
+///
+/// Set `FZ_SPAN_TRACE=1` to print, on stderr, one line per member sheet a span
+/// reference consumes, the total the span resolved, and one line per settle
+/// pass of a cyclic/SCC evaluation unit, so the member multiset a span site
+/// actually read at a given pass can be read off the log rather than inferred
+/// from the sum.  Kept as a permanent diagnostic alongside `FZ_DEBUG_LOAD`:
+/// zero cost and zero output when the variable is unset (the environment is
+/// read once into a `OnceLock` and every trace site is behind the resulting
+/// `bool`), and no evaluation semantics depend on it.
+pub(crate) fn fz_span_trace_enabled() -> bool {
+    static FZ_SPAN_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FZ_SPAN_TRACE.get_or_init(|| {
+        !matches!(
+            std::env::var("FZ_SPAN_TRACE").as_deref(),
+            Err(_) | Ok("") | Ok("0")
+        )
+    })
+}
+
 pub struct Engine<R> {
     pub(crate) graph: DependencyGraph,
     resolver: R,
@@ -24985,20 +25005,36 @@ where
                     .sheet_reg()
                     .active_span_ids(sheet_first, sheet_last)
                     .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+                let fz_trace = fz_span_trace_enabled();
                 let mut rows = Vec::with_capacity(sheet_ids.len());
                 for sheet_id in sheet_ids {
+                    let fz_sheet = self.graph.sheet_name(sheet_id).to_string();
                     let reference = ReferenceType::Cell {
-                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
+                        sheet: Some(fz_sheet.clone()),
                         row: *row,
                         col: *col,
                         row_abs: *row_abs,
                         col_abs: *col_abs,
                     };
+                    let fz_before = rows.len();
                     let view = self.resolve_range_view(&reference, current_sheet)?;
                     view.for_each_row(&mut |row| {
                         rows.push(row.to_vec());
                         Ok(())
                     })?;
+                    if fz_trace {
+                        eprintln!(
+                            "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={fz_sheet} rows={}..{} cols={}..{} v={:?}",
+                            *row, *row, *col, *col, &rows[fz_before..]
+                        );
+                    }
+                }
+                if fz_trace {
+                    eprintln!(
+                        "FZ_SPAN_END kind=Cell3D cur={current_sheet} span={sheet_first}:{sheet_last} total_rows={} epoch={}",
+                        rows.len(),
+                        self.recalc_epoch
+                    );
                 }
                 Ok(RangeView::from_owned_rows(rows, self.config.date_system))
             }
@@ -25019,10 +25055,12 @@ where
                     .sheet_reg()
                     .active_span_ids(sheet_first, sheet_last)
                     .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+                let fz_trace = fz_span_trace_enabled();
                 let mut rows = Vec::new();
                 for sheet_id in sheet_ids {
+                    let fz_sheet = self.graph.sheet_name(sheet_id).to_string();
                     let reference = ReferenceType::Range {
-                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
+                        sheet: Some(fz_sheet.clone()),
                         start_row: *start_row,
                         start_col: *start_col,
                         end_row: *end_row,
@@ -25032,11 +25070,25 @@ where
                         end_row_abs: *end_row_abs,
                         end_col_abs: *end_col_abs,
                     };
+                    let fz_before = rows.len();
                     let view = self.resolve_range_view(&reference, current_sheet)?;
                     view.for_each_row(&mut |row| {
                         rows.push(row.to_vec());
                         Ok(())
                     })?;
+                    if fz_trace {
+                        eprintln!(
+                            "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={fz_sheet} rows={:?}..{:?} cols={:?}..{:?} v={:?}",
+                            *start_row, *end_row, *start_col, *end_col, &rows[fz_before..]
+                        );
+                    }
+                }
+                if fz_trace {
+                    eprintln!(
+                        "FZ_SPAN_END kind=Range3D cur={current_sheet} span={sheet_first}:{sheet_last} total_rows={} epoch={}",
+                        rows.len(),
+                        self.recalc_epoch
+                    );
                 }
                 Ok(RangeView::from_owned_rows(rows, self.config.date_system))
             }
@@ -26105,6 +26157,13 @@ where
             changed.fill(false);
             passes += 1;
             settle_passes += 1;
+            if fz_span_trace_enabled() {
+                eprintln!(
+                    "FZ_SPAN_PASS n={settle_passes} passes={passes} scc_len={} stale={}",
+                    cycle.len(),
+                    stale.len()
+                );
+            }
             for (p, i) in stale.into_iter().enumerate() {
                 run_member!(i);
                 pos[i] = p as i64;
