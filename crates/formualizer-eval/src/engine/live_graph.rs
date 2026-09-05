@@ -48,6 +48,13 @@ impl LiveGraphAnalysis {
 
 /// Iterative Tarjan over `n` nodes and directed `edges` (`from` depends on
 /// `to`). `edges` must be sorted and deduplicated for deterministic output.
+///
+/// `#[inline(never)]` so the classification frame is visible to a sampling
+/// profiler (`sample`, GOD-246 review cycle 1 F4): inlined into the settle
+/// loop it is indistinguishable from `evaluate_scc_unit`'s own self samples,
+/// which is why the cost lever 2A targets was never isolated.  This is a
+/// symbol-visibility change, not a behaviour change.
+#[inline(never)]
 pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAnalysis {
     debug_assert!(
         edges.is_sorted(),

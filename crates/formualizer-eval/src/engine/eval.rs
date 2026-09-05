@@ -936,6 +936,105 @@ pub(crate) fn fz_span_trace_enabled() -> bool {
     })
 }
 
+/// `FZ_EDGE_HASH=1` diagnostic (GOD-246): a per-settle-pass hash of the live
+/// edge set `evaluate_scc_unit` classifies, chained over every pass, plus the
+/// member basis those edge indices are relative to and a cumulative timer over
+/// [`analyze_live_graph`].
+///
+/// Same shape and same cost posture as [`fz_span_trace_enabled`]: the
+/// environment is read once into a `OnceLock`, the result is hoisted into a
+/// `bool` local at SCC entry, and every hashing site is behind that local, so
+/// an SCC evaluation pays exactly one `OnceLock` load and *no* per-pass work
+/// when the variable is unset.  The line carries hashes and counts only --
+/// never a cell value or a sheet name -- so it has the same privacy posture as
+/// `FZ_SPAN_TRACE`.
+pub(crate) fn fz_edge_hash_enabled() -> bool {
+    static FZ_EDGE_HASH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FZ_EDGE_HASH.get_or_init(|| {
+        !matches!(
+            std::env::var("FZ_EDGE_HASH").as_deref(),
+            Err(_) | Ok("") | Ok("0")
+        )
+    })
+}
+
+/// FNV-1a 64 offset basis.
+pub(crate) const FZ_FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 64 over explicit bytes.
+///
+/// Deliberately *not* `DefaultHasher` (SipHash with a per-process random key,
+/// so its output differs on every run) and not `rustc_hash` (deterministic but
+/// version- and word-size-dependent): a value banked in a receipt has to be
+/// byte-reproducible across builds and machines.
+#[inline]
+pub(crate) fn fz_fnv1a64(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// One `FZ_EDGE_HASH` summary line's worth of data (one per SCC evaluation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct EdgeHashSummary {
+    pub scc_len: usize,
+    pub passes: u64,
+    pub member_basis: u64,
+    pub edge_chain: u64,
+    pub final_pass_edges: usize,
+    pub final_pass_hash: u64,
+    pub distinct_edges: usize,
+    pub stale_chain: u64,
+    pub classify_ns: u128,
+    pub total_ns: u128,
+}
+
+/// Test-only side channel for [`EdgeHashSummary`], so a test can assert on the
+/// hash without parsing stderr and without depending on process-global
+/// `OnceLock` initialisation order.  Thread-local, so it is isolated per test.
+#[cfg(test)]
+pub(crate) mod edge_hash_test_hook {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static FORCED: Cell<bool> = const { Cell::new(false) };
+        static SUMMARIES: RefCell<Vec<super::EdgeHashSummary>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Force the `FZ_EDGE_HASH` block on for this thread (the env var's
+    /// `OnceLock` cannot be re-read once another test has initialised it).
+    pub(crate) fn set_forced(on: bool) {
+        FORCED.with(|f| f.set(on));
+    }
+
+    pub(crate) fn forced() -> bool {
+        FORCED.with(|f| f.get())
+    }
+
+    pub(crate) fn push(summary: super::EdgeHashSummary) {
+        SUMMARIES.with(|v| v.borrow_mut().push(summary));
+    }
+
+    pub(crate) fn take() -> Vec<super::EdgeHashSummary> {
+        SUMMARIES.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn fz_edge_hash_forced() -> bool {
+    edge_hash_test_hook::forced()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fz_edge_hash_forced() -> bool {
+    false
+}
+
 /// Shape summary of the rows one span member contributed, for `FZ_SPAN_TRACE`.
 ///
 /// Returns `(row count, cell count, sum of the numeric cells, count of cells
@@ -25478,6 +25577,32 @@ where
                 })
             })
             .collect();
+        // FZ_EDGE_HASH (GOD-246): per-pass live-edge hash receipt.  One
+        // `OnceLock` load per SCC evaluation when the variable is unset; every
+        // site below is behind `fz_edge_hash`, so the off path does no
+        // per-pass work at all.
+        let fz_edge_hash = fz_edge_hash_enabled() || fz_edge_hash_forced();
+        let mut eh_member_basis = 0u64;
+        let mut eh_edge_chain = FZ_FNV64_OFFSET;
+        let mut eh_stale_chain = FZ_FNV64_OFFSET;
+        let mut eh_passes = 0u64;
+        let mut eh_final_pass_hash = 0u64;
+        let mut eh_final_pass_edges = 0usize;
+        let mut eh_distinct: FxHashSet<(u32, u32)> = FxHashSet::default();
+        let mut eh_classify_ns = 0u128;
+        if fz_edge_hash {
+            // The canonical member basis the `(from, to)` indices are relative
+            // to: the A1 addresses in the order §7.13 sorted them, plus the
+            // member count and the recordable prefix length.
+            let mut h = FZ_FNV64_OFFSET;
+            for addr in &member_addresses {
+                h = fz_fnv1a64(h, addr.as_deref().unwrap_or("").as_bytes());
+                h = fz_fnv1a64(h, &[0xff]);
+            }
+            h = fz_fnv1a64(h, &(n as u64).to_le_bytes());
+            h = fz_fnv1a64(h, &(recordable as u64).to_le_bytes());
+            eh_member_basis = h;
+        }
         let instrumentation_matches: Vec<Option<usize>> = self
             .cycle_instrumentation
             .specs
@@ -25812,7 +25937,33 @@ where
             edges.sort_unstable();
             edges.dedup();
 
-            let analysis = analyze_live_graph(n, &edges);
+            // FZ_EDGE_HASH: hash the sorted deduped pass edge set here, after
+            // `dedup` and BEFORE classification, so the receipt describes the
+            // exact vector `analyze_live_graph` is about to consume.
+            if fz_edge_hash {
+                let mut h = FZ_FNV64_OFFSET;
+                for &(from, to) in &edges {
+                    h = fz_fnv1a64(h, &from.to_le_bytes());
+                    h = fz_fnv1a64(h, &to.to_le_bytes());
+                    eh_distinct.insert((from, to));
+                }
+                eh_passes += 1;
+                eh_edge_chain = fz_fnv1a64(eh_edge_chain, &h.to_le_bytes());
+                eh_edge_chain = fz_fnv1a64(eh_edge_chain, &(edges.len() as u64).to_le_bytes());
+                eh_final_pass_hash = h;
+                eh_final_pass_edges = edges.len();
+            }
+
+            let analysis = if fz_edge_hash {
+                // Cumulative classification cost (review cycle 1, F4): the
+                // number upstream #133 needs before lever 2A can be sized.
+                let started = crate::instant::FzInstant::now();
+                let analysis = analyze_live_graph(n, &edges);
+                eh_classify_ns += started.elapsed().as_nanos();
+                analysis
+            } else {
+                analyze_live_graph(n, &edges)
+            };
 
             if !self.cycle_instrumentation.specs.is_empty() {
                 let step = self.cycle_instrumentation.next_step;
@@ -26187,6 +26338,14 @@ where
             prev_pass = None;
             let topo_pos = analysis.topo_positions();
             stale.sort_unstable_by_key(|&i| topo_pos[i]);
+            // FZ_EDGE_HASH: the stale re-eval order, hashed after its sort --
+            // the sequence lever 2's `analysis` reuse could corrupt.
+            if fz_edge_hash {
+                for &i in &stale {
+                    eh_stale_chain = fz_fnv1a64(eh_stale_chain, &(i as u32).to_le_bytes());
+                }
+                eh_stale_chain = fz_fnv1a64(eh_stale_chain, &(stale.len() as u64).to_le_bytes());
+            }
             for x in pos.iter_mut() {
                 *x = -1;
             }
@@ -26262,6 +26421,38 @@ where
                 t.capped_sccs += 1;
             }
             t.elapsed_ms += task_start.elapsed().as_millis();
+        }
+
+        if fz_edge_hash {
+            let summary = EdgeHashSummary {
+                scc_len: cycle.len(),
+                passes: eh_passes,
+                member_basis: eh_member_basis,
+                edge_chain: eh_edge_chain,
+                final_pass_edges: eh_final_pass_edges,
+                final_pass_hash: eh_final_pass_hash,
+                distinct_edges: eh_distinct.len(),
+                stale_chain: eh_stale_chain,
+                classify_ns: eh_classify_ns,
+                total_ns: task_start.elapsed().as_nanos(),
+            };
+            eprintln!(
+                "FZ_EDGE_HASH scc_len={} passes={} member_basis={:016x} \
+edge_chain={:016x} final_pass_edges={} final_pass_hash={:016x} \
+distinct_edges={} stale_chain={:016x} classify_ns={} total_ns={}",
+                summary.scc_len,
+                summary.passes,
+                summary.member_basis,
+                summary.edge_chain,
+                summary.final_pass_edges,
+                summary.final_pass_hash,
+                summary.distinct_edges,
+                summary.stale_chain,
+                summary.classify_ns,
+                summary.total_ns,
+            );
+            #[cfg(test)]
+            edge_hash_test_hook::push(summary);
         }
 
         Ok(stamped)

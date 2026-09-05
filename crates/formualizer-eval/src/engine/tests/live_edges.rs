@@ -575,3 +575,113 @@ fn record_rect_small_rect_and_member_scan_record_identical_edges() {
     // record its four members.
     assert_eq!(records(true, false, (2, 0, 2, 3)).len(), 4);
 }
+
+/* ────────────── FZ_EDGE_HASH determinism (GOD-246 commit D) ────────────── */
+
+/// The `FZ_EDGE_HASH` receipt is a *receipt*: two evaluations of the same SCC
+/// over the same fixture must produce the same member basis and the same
+/// per-pass edge chain, and adding one live edge must change the chain.
+///
+/// Driven through `evaluate_scc_unit` directly (the same door
+/// `scc_runtime_cycles.rs` uses) so the hashed vector is the production one,
+/// and read back through the thread-local test hook rather than by parsing
+/// stderr — the env var's `OnceLock` cannot be re-read once another test in
+/// the process has initialised it.
+#[test]
+fn fz_edge_hash_is_deterministic_and_moves_when_an_edge_is_added() {
+    use crate::engine::eval::edge_hash_test_hook;
+
+    fn fixture() -> (Engine<TestWorkbook>, Vec<crate::engine::vertex::VertexId>) {
+        let mut engine = new_engine();
+        for sheet in ["Acct1", "Acct2", "Acct3"] {
+            engine.add_sheet(sheet).unwrap();
+        }
+        // Member cells must be FORMULA vertices: `evaluate_scc_unit` only
+        // makes formula/name members recordable edge targets (plain value
+        // cells land in the non-recordable `other` tail).
+        engine.set_cell_formula("Acct1", 1, 2, parse("=1")).unwrap();
+        engine.set_cell_formula("Acct2", 1, 2, parse("=2")).unwrap();
+        engine.set_cell_formula("Acct3", 1, 2, parse("=4")).unwrap();
+        engine.set_cell_formula("Acct1", 5, 2, parse("=8")).unwrap();
+        engine
+            .set_cell_formula("Sheet1", 1, 1, parse("=SUM(Acct1:Acct3!B1)"))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+
+        let addrs = [
+            cell(&engine, "Sheet1", 1, 1),
+            cell(&engine, "Acct1", 1, 2),
+            cell(&engine, "Acct2", 1, 2),
+            cell(&engine, "Acct3", 1, 2),
+            cell(&engine, "Acct1", 5, 2),
+        ];
+        let ids = addrs
+            .iter()
+            .map(|a| {
+                *engine
+                    .graph
+                    .get_vertex_id_for_address(a)
+                    .expect("member vertex exists")
+            })
+            .collect();
+        (engine, ids)
+    }
+
+    let summarise = |engine: &mut Engine<TestWorkbook>,
+                     members: &[crate::engine::vertex::VertexId]| {
+        let _ = edge_hash_test_hook::take();
+        edge_hash_test_hook::set_forced(true);
+        let result = engine.evaluate_scc_unit(members, None, None);
+        edge_hash_test_hook::set_forced(false);
+        result.expect("scc unit evaluates");
+        let mut got = edge_hash_test_hook::take();
+        assert_eq!(got.len(), 1, "exactly one SCC summary per evaluation");
+        got.pop().unwrap()
+    };
+
+    // Two evaluations of the same fixture: identical receipt.
+    let (mut engine, members) = fixture();
+    let first = summarise(&mut engine, &members);
+    let second = summarise(&mut engine, &members);
+    assert_eq!(first.scc_len, 5);
+    assert!(first.passes >= 1, "at least one classified pass");
+    assert_ne!(first.edge_chain, 0);
+    assert_eq!(
+        first.member_basis, second.member_basis,
+        "same member set must hash to the same basis"
+    );
+    assert_eq!(
+        first.edge_chain, second.edge_chain,
+        "same fixture must produce the same per-pass edge chain"
+    );
+    assert_eq!(first.distinct_edges, second.distinct_edges);
+    assert_eq!(first.final_pass_hash, second.final_pass_hash);
+
+    // A second, independently built copy of the same fixture agrees too, so
+    // the hash does not depend on engine identity or allocation order.
+    let (mut fresh, fresh_members) = fixture();
+    let third = summarise(&mut fresh, &fresh_members);
+    assert_eq!(third.member_basis, first.member_basis);
+    assert_eq!(third.edge_chain, first.edge_chain);
+
+    // Add one live edge (the site also reads member 4, Acct1!B5) — same member
+    // set, same basis, different edge chain.
+    let (mut widened, widened_members) = fixture();
+    widened
+        .set_cell_formula("Sheet1", 1, 1, parse("=SUM(Acct1:Acct3!B1)+Acct1!B5"))
+        .unwrap();
+    let wider = summarise(&mut widened, &widened_members);
+    assert_eq!(
+        wider.member_basis, first.member_basis,
+        "member set is unchanged, so the basis must not move"
+    );
+    assert_eq!(
+        wider.distinct_edges,
+        first.distinct_edges + 1,
+        "exactly one live edge was added"
+    );
+    assert_ne!(
+        wider.edge_chain, first.edge_chain,
+        "an added live edge must change the chain"
+    );
+}
