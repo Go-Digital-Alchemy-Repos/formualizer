@@ -686,6 +686,252 @@ fn fz_edge_hash_is_deterministic_and_moves_when_an_edge_is_added() {
     );
 }
 
+/* ───── analyze_live_graph memo across settle passes (GOD-246 lever 2A) ───── */
+
+/// Shared harness for the lever-2A memo tests: build a fixture, run one
+/// `evaluate_scc_unit` with the memo either enabled or disabled, and return
+/// the `FZ_EDGE_HASH` receipt for that run plus the settled member values.
+///
+/// The receipt is the edge-set witness: `edge_chain` folds every pass's
+/// sorted, deduped edge vector in pass order, `final_pass_hash` /
+/// `final_pass_edges` / `distinct_edges` pin the last pass and the union, and
+/// `stale_chain` pins the stale re-evaluation order the reused `analysis`
+/// could corrupt. (`evaluate_scc_unit` owns its collector, so a test cannot
+/// call `take_edge_records()` on it directly; the chain is strictly stronger,
+/// covering every pass rather than only the drained tail.)
+fn run_scc_with_memo(
+    memo_enabled: bool,
+    build: impl Fn() -> (
+        Engine<TestWorkbook>,
+        Vec<crate::engine::vertex::VertexId>,
+        Vec<(&'static str, u32, u32)>,
+    ),
+) -> (
+    crate::engine::eval::EdgeHashSummary,
+    Vec<Option<LiteralValue>>,
+) {
+    use crate::engine::eval::{edge_hash_test_hook, live_graph_memo_test_hook};
+
+    let (mut engine, members, probes) = build();
+    let _ = edge_hash_test_hook::take();
+    edge_hash_test_hook::set_forced(true);
+    live_graph_memo_test_hook::set_disabled(!memo_enabled);
+    let result = engine.evaluate_scc_unit(&members, None, None);
+    live_graph_memo_test_hook::set_disabled(false);
+    edge_hash_test_hook::set_forced(false);
+    result.expect("scc unit evaluates");
+
+    let mut got = edge_hash_test_hook::take();
+    assert_eq!(got.len(), 1, "exactly one SCC summary per evaluation");
+    let summary = got.pop().unwrap();
+    let values = probes
+        .iter()
+        .map(|&(sheet, row, col)| engine.get_cell_value(sheet, row, col))
+        .collect();
+    (summary, values)
+}
+
+/// Assert that the memo changed nothing observable: same values, same pass
+/// count, same per-pass edge chain, same stale order.
+fn assert_memo_is_observationally_transparent(
+    on: &(
+        crate::engine::eval::EdgeHashSummary,
+        Vec<Option<LiteralValue>>,
+    ),
+    off: &(
+        crate::engine::eval::EdgeHashSummary,
+        Vec<Option<LiteralValue>>,
+    ),
+) {
+    assert_eq!(on.1, off.1, "settled values must not depend on the memo");
+    assert_eq!(on.0.passes, off.0.passes, "pass count must not move");
+    assert_eq!(on.0.member_basis, off.0.member_basis);
+    assert_eq!(
+        on.0.edge_chain, off.0.edge_chain,
+        "the per-pass recorded edge sets must be identical"
+    );
+    assert_eq!(on.0.final_pass_edges, off.0.final_pass_edges);
+    assert_eq!(on.0.final_pass_hash, off.0.final_pass_hash);
+    assert_eq!(on.0.distinct_edges, off.0.distinct_edges);
+    assert_eq!(
+        on.0.stale_chain, off.0.stale_chain,
+        "the stale re-evaluation order must be identical"
+    );
+}
+
+/// A reader chain whose members are visited before their dependencies: pass 1
+/// reads stale values, the settle pass fixes them, and a third classified pass
+/// confirms exactness. Every pass records the identical edge vector, so
+/// `analyze_live_graph` must run exactly once.
+fn static_edge_set_fixture() -> (
+    Engine<TestWorkbook>,
+    Vec<crate::engine::vertex::VertexId>,
+    Vec<(&'static str, u32, u32)>,
+) {
+    let mut engine = new_engine();
+    // Deliberately NOT `evaluate_all()`d: the members must still be stale when
+    // `evaluate_scc_unit` runs, or there is no settle pass to memoise across.
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=Sheet1!A2+1"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 1, parse("=Sheet1!A3+1"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 1, parse("=Sheet1!A4+1"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 4, 1, parse("=1"))
+        .unwrap();
+    let probes = vec![
+        ("Sheet1", 1u32, 1u32),
+        ("Sheet1", 2, 1),
+        ("Sheet1", 3, 1),
+        ("Sheet1", 4, 1),
+    ];
+    let ids = probes
+        .iter()
+        .map(|&(sheet, row, col)| {
+            *engine
+                .graph
+                .get_vertex_id_for_address(&cell(&engine, sheet, row, col))
+                .expect("member vertex exists")
+        })
+        .collect();
+    (engine, ids, probes)
+}
+
+/// The same chain, but the first member's read set is decided by an `IF`
+/// condition that is itself stale on pass 1: the taken arm — and therefore the
+/// recorded edge vector — moves between pass 1 and the settle pass.
+fn changing_edge_set_fixture() -> (
+    Engine<TestWorkbook>,
+    Vec<crate::engine::vertex::VertexId>,
+    Vec<(&'static str, u32, u32)>,
+) {
+    let mut engine = new_engine();
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            1,
+            parse("=IF(Sheet1!A2>0,Sheet1!A3,Sheet1!A4)"),
+        )
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 1, parse("=1"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 1, parse("=7"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 4, 1, parse("=9"))
+        .unwrap();
+    let probes = vec![
+        ("Sheet1", 1u32, 1u32),
+        ("Sheet1", 2, 1),
+        ("Sheet1", 3, 1),
+        ("Sheet1", 4, 1),
+    ];
+    let ids = probes
+        .iter()
+        .map(|&(sheet, row, col)| {
+            *engine
+                .graph
+                .get_vertex_id_for_address(&cell(&engine, sheet, row, col))
+                .expect("member vertex exists")
+        })
+        .collect();
+    (engine, ids, probes)
+}
+
+/// Law: when the deduped live-edge vector is unchanged from the previous
+/// settle pass, `analyze_live_graph` is not re-run, and reusing its result
+/// changes nothing observable.
+#[test]
+fn unchanged_edge_set_across_settle_passes_classifies_once_and_preserves_results() {
+    let on = run_scc_with_memo(true, static_edge_set_fixture);
+    let off = run_scc_with_memo(false, static_edge_set_fixture);
+
+    // Non-vacuous: the fixture really does settle over more than one pass and
+    // really does record edges.
+    assert!(
+        on.0.passes >= 2,
+        "fixture must settle over several passes, got {}",
+        on.0.passes
+    );
+    assert_eq!(on.0.distinct_edges, 3, "the chain records three live edges");
+
+    assert_eq!(
+        on.0.classify_calls, 1,
+        "an unchanged edge vector must be classified exactly once"
+    );
+    assert!(
+        on.0.classify_skipped >= 1,
+        "at least one pass must reuse the memoised analysis, got {}",
+        on.0.classify_skipped
+    );
+    assert_eq!(
+        off.0.classify_skipped, 0,
+        "the disabled memo must never skip"
+    );
+    assert_eq!(
+        off.0.classify_calls,
+        on.0.classify_calls + on.0.classify_skipped,
+        "memo-off classifies once per pass"
+    );
+
+    assert_memo_is_observationally_transparent(&on, &off);
+    assert_eq!(
+        on.1,
+        vec![
+            Some(LiteralValue::Number(4.0)),
+            Some(LiteralValue::Number(3.0)),
+            Some(LiteralValue::Number(2.0)),
+            Some(LiteralValue::Number(1.0)),
+        ],
+        "the chain settles exactly"
+    );
+}
+
+/// Law: when a lazy arm flips and the deduped live-edge vector changes,
+/// `analyze_live_graph` is re-run for the new vector, and the run is identical
+/// to the unmemoised one.
+#[test]
+fn changed_edge_set_across_settle_passes_reclassifies_and_preserves_results() {
+    let on = run_scc_with_memo(true, changing_edge_set_fixture);
+    let off = run_scc_with_memo(false, changing_edge_set_fixture);
+
+    assert!(
+        on.0.passes >= 2,
+        "fixture must settle over several passes, got {}",
+        on.0.passes
+    );
+    assert!(
+        on.0.classify_calls >= 2,
+        "a changed edge vector must force a reclassification, got {}",
+        on.0.classify_calls
+    );
+    assert_eq!(
+        off.0.classify_calls,
+        on.0.classify_calls + on.0.classify_skipped,
+        "memo-off classifies once per pass"
+    );
+    assert_eq!(off.0.classify_skipped, 0);
+
+    // Non-vacuous: the arm really did flip — the union over passes holds both
+    // arms' edges, while the final pass holds only the taken one.
+    assert_eq!(on.0.distinct_edges, 3, "condition plus both arms");
+    assert_eq!(on.0.final_pass_edges, 2, "condition plus the taken arm");
+
+    assert_memo_is_observationally_transparent(&on, &off);
+    assert_eq!(
+        on.1[0],
+        Some(LiteralValue::Number(7.0)),
+        "the settled IF takes the true arm"
+    );
+}
+
 /* ─────── bounded Range3D shortcut parity (GOD-246 lever 1) ─────── */
 
 /// `record_rect_small_rect_and_member_scan_record_identical_edges` one level

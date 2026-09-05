@@ -13,7 +13,7 @@ use crate::engine::live_edges::{
     DiagnosticRecordedEdge, EDGE_EVALUATED_SCALAR, EDGE_LAZY_INACTIVE_BRANCH, EDGE_NON_IF_LAZY,
     EDGE_RANGE_EXPANSION, LiveEdgeCollector, RecordedEdge, RecordingContext,
 };
-use crate::engine::live_graph::analyze_live_graph;
+use crate::engine::live_graph::{LiveGraphAnalysis, analyze_live_graph};
 use crate::engine::lookup_index_cache::{
     BuildOutcome, LookupAxis, LookupIndex, LookupIndexCache, LookupIndexCacheReport,
     LookupIndexKey, estimate_bytes,
@@ -989,6 +989,10 @@ pub(crate) struct EdgeHashSummary {
     pub stale_chain: u64,
     pub classify_ns: u128,
     pub total_ns: u128,
+    /// Number of `analyze_live_graph` recomputes (GOD-246 lever 2A).
+    pub classify_calls: u64,
+    /// Number of passes that reused the memoised analysis (lever 2A).
+    pub classify_skipped: u64,
 }
 
 /// Test-only side channel for [`EdgeHashSummary`], so a test can assert on the
@@ -1032,6 +1036,39 @@ fn fz_edge_hash_forced() -> bool {
 #[cfg(not(test))]
 #[inline(always)]
 fn fz_edge_hash_forced() -> bool {
+    false
+}
+
+/// Test-only switch that disables the lever-2A `analyze_live_graph` memo, so a
+/// single test process can compare the memoised and unmemoised settle paths.
+/// Thread-local (same isolation posture as [`edge_hash_test_hook`]), read once
+/// per `evaluate_scc_unit` call and hoisted into a `bool` local.
+#[cfg(test)]
+pub(crate) mod live_graph_memo_test_hook {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set_disabled(on: bool) {
+        DISABLED.with(|f| f.set(on));
+    }
+
+    pub(crate) fn disabled() -> bool {
+        DISABLED.with(|f| f.get())
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn live_graph_memo_disabled() -> bool {
+    live_graph_memo_test_hook::disabled()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn live_graph_memo_disabled() -> bool {
     false
 }
 
@@ -25590,6 +25627,17 @@ where
         let mut eh_final_pass_edges = 0usize;
         let mut eh_distinct: FxHashSet<(u32, u32)> = FxHashSet::default();
         let mut eh_classify_ns = 0u128;
+        let mut eh_classify_calls = 0u64;
+        let mut eh_classify_skipped = 0u64;
+        // GOD-246 lever 2A: `analyze_live_graph` is pure in `(n, &edges)`
+        // (`live_graph.rs`: it reads only its two arguments and returns owned
+        // `Vec`s with no interior mutability), and `n` is fixed for the whole
+        // of this call.  So the analysis of a pass whose sorted, deduped edge
+        // vector equals the previous pass's is bit-identical to the previous
+        // pass's analysis and may be reused.  The memo holds the previous
+        // pass's `edges` (moved, never cloned) beside its analysis.
+        let live_graph_memo_enabled = !live_graph_memo_disabled();
+        let mut live_graph_memo: Option<(Vec<(u32, u32)>, LiveGraphAnalysis)> = None;
         if fz_edge_hash {
             // The canonical member basis the `(from, to)` indices are relative
             // to: the A1 addresses in the order §7.13 sorted them, plus the
@@ -25954,16 +26002,41 @@ where
                 eh_final_pass_edges = edges.len();
             }
 
-            let analysis = if fz_edge_hash {
-                // Cumulative classification cost (review cycle 1, F4): the
-                // number upstream #133 needs before lever 2A can be sized.
-                let started = crate::instant::FzInstant::now();
-                let analysis = analyze_live_graph(n, &edges);
-                eh_classify_ns += started.elapsed().as_nanos();
-                analysis
+            // Lever 2A: reuse the previous pass's analysis when this pass's
+            // sorted, deduped edge vector is element-wise equal to it.
+            let reuse = live_graph_memo_enabled
+                && live_graph_memo
+                    .as_ref()
+                    .is_some_and(|(prev_edges, _)| *prev_edges == edges);
+            if reuse {
+                if fz_edge_hash {
+                    eh_classify_skipped += 1;
+                }
             } else {
-                analyze_live_graph(n, &edges)
-            };
+                let fresh = if fz_edge_hash {
+                    // Cumulative classification cost (review cycle 1, F4): the
+                    // number upstream #133 needs. Times the recompute only.
+                    let started = crate::instant::FzInstant::now();
+                    let fresh = analyze_live_graph(n, &edges);
+                    eh_classify_ns += started.elapsed().as_nanos();
+                    eh_classify_calls += 1;
+                    fresh
+                } else {
+                    analyze_live_graph(n, &edges)
+                };
+                // Move, never clone: `edges` is dead after this point and is
+                // rebuilt from scratch on the next pass.
+                live_graph_memo = Some((std::mem::take(&mut edges), fresh));
+            }
+            let analysis = &live_graph_memo
+                .as_ref()
+                .expect("live-graph memo is populated on every pass")
+                .1;
+            debug_assert_eq!(
+                analysis.in_cycle.len(),
+                n,
+                "member count is fixed within one evaluate_scc_unit call"
+            );
 
             if !self.cycle_instrumentation.specs.is_empty() {
                 let step = self.cycle_instrumentation.next_step;
@@ -26435,11 +26508,14 @@ where
                 stale_chain: eh_stale_chain,
                 classify_ns: eh_classify_ns,
                 total_ns: task_start.elapsed().as_nanos(),
+                classify_calls: eh_classify_calls,
+                classify_skipped: eh_classify_skipped,
             };
             eprintln!(
                 "FZ_EDGE_HASH scc_len={} passes={} member_basis={:016x} \
 edge_chain={:016x} final_pass_edges={} final_pass_hash={:016x} \
-distinct_edges={} stale_chain={:016x} classify_ns={} total_ns={}",
+distinct_edges={} stale_chain={:016x} classify_ns={} total_ns={} \
+classify_calls={} classify_skipped={}",
                 summary.scc_len,
                 summary.passes,
                 summary.member_basis,
@@ -26450,6 +26526,8 @@ distinct_edges={} stale_chain={:016x} classify_ns={} total_ns={}",
                 summary.stale_chain,
                 summary.classify_ns,
                 summary.total_ns,
+                summary.classify_calls,
+                summary.classify_skipped,
             );
             #[cfg(test)]
             edge_hash_test_hook::push(summary);
