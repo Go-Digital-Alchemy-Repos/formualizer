@@ -161,6 +161,14 @@ pub struct LiveEdgeCollector {
     /// Full edge-universe capture is enabled only for an explicit diagnostic
     /// run, so ordinary cyclic evaluation retains its bounded SCC-only cost.
     diagnostic_enabled: bool,
+    /// Test-only: force the bounded-`Range3D` recording branch (GOD-246
+    /// lever 1) on or off, so the shortcut and the engine-resolve path can be
+    /// proved to record the same edges for the same span. `0` = as configured,
+    /// `1` = shortcut available, `2` = always take the engine path. Held on
+    /// the collector rather than in a global so concurrent tests cannot see
+    /// each other's setting.
+    #[cfg(test)]
+    range3d_shortcut_mode: std::sync::atomic::AtomicU8,
     replay_safe: AtomicBool,
     /// See module docs: uncontended Mutex forced by `Send + Sync` bounds on
     /// the resolver traits; SCC passes are single-threaded.
@@ -267,6 +275,8 @@ impl LiveEdgeCollector {
             name_index,
             total_members,
             diagnostic_enabled,
+            #[cfg(test)]
+            range3d_shortcut_mode: std::sync::atomic::AtomicU8::new(0),
             replay_safe: AtomicBool::new(false),
             state: Mutex::new(CollectorState::default()),
         }
@@ -458,6 +468,15 @@ impl LiveEdgeCollector {
         } else {
             self.record_rect_by_member_scan(sheet_id, sr, sc, er, ec, &pending_rects);
         }
+    }
+
+    /// Test-only: force the bounded-`Range3D` shortcut branch (GOD-246 lever
+    /// 1). `0` = as configured, `1` = shortcut available, `2` = always take
+    /// the engine-resolve path.
+    #[cfg(test)]
+    pub(crate) fn set_range3d_shortcut_mode(&self, mode: u8) {
+        self.range3d_shortcut_mode
+            .store(mode, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn record_selected_non_if_lazy_rect(
@@ -708,7 +727,29 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
                 else {
                     return;
                 };
+                // GOD-246 lever 1: for a member rect whose four axes are all
+                // bounded the engine performs NO normalisation at all --
+                // `resolve_shared_ref` only converts 1-based to 0-based and
+                // rejects reversed endpoints, and `resolve_used_extent_with_fallback`
+                // skips every branch when all four bounds are `Some` -- so the
+                // engine-resolved view records exactly the literal coordinates
+                // minus one.  Record that rect directly and skip the second
+                // resolve (`RecordingContext::record_bounded_range3d_member`
+                // documents the three cases that must still take the engine
+                // path).  Unbounded axes still need the engine's used-region
+                // normalisation and are untouched.
+                let bounded = match (start_row, start_col, end_row, end_col) {
+                    (Some(sr), Some(sc), Some(er), Some(ec)) => Some((*sr, *sc, *er, *ec)),
+                    _ => None,
+                };
+                let shortcut_available = self.range3d_shortcut_enabled();
                 for sheet_id in sheet_ids {
+                    if let Some((sr, sc, er, ec)) = bounded
+                        && shortcut_available
+                        && self.record_bounded_range3d_member(sheet_id, sr, sc, er, ec)
+                    {
+                        continue;
+                    }
                     // Resolve the member rect through the engine so unbounded
                     // axes get the engine's own used-region normalisation, then
                     // record the resulting rect (same shape as the `Range` path
@@ -731,6 +772,88 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
             }
             _ => {}
         }
+    }
+
+    /// Whether the bounded-`Range3D` shortcut may be taken at all
+    /// (GOD-246 lever 1).
+    ///
+    /// `force_materialize_range_views` is the one engine mode in which the
+    /// shortcut would change the recorded edge set: the engine's `Range` arm
+    /// then returns an owned view carrying the synthetic `"__tmp"` sheet
+    /// name, which has no registered `SheetId`, so `record_view` records
+    /// NOTHING for a span member today.  The gate preserves that exactly
+    /// rather than "fixing" it inside a performance change (review cycle 1,
+    /// F3).  The flag is `false` in both engine constructors and canonical
+    /// mode asserts it is never set, so the shortcut is live in every
+    /// measured configuration.
+    fn range3d_shortcut_enabled(&self) -> bool {
+        #[cfg(test)]
+        match self.collector.range3d_shortcut_mode.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        !self.engine.force_materialize_range_views
+    }
+
+    /// Record one fully bounded `Range3D` member rect directly, skipping the
+    /// engine resolve.  Returns `true` when this member is fully handled
+    /// (recorded, or provably records nothing), `false` when the caller must
+    /// fall back to the engine path.
+    ///
+    /// The three divergences review cycle 1 (F3) named, and how each is
+    /// handled so the recorded edge set cannot move:
+    ///
+    /// (a) **A literal `0` coordinate.**  `Engine::resolve_shared_ref`'s
+    ///     `Range` arm converts 1-based to 0-based with `checked_sub(1)` and
+    ///     returns `#REF!` on `Some(0)`, so `if let Ok(view)` fails and the
+    ///     engine path records NOTHING.  A direct `record_rect(.., sr - 1, ..)`
+    ///     would underflow instead (a debug-build panic).  Fall back, which
+    ///     reproduces "records nothing" by construction.  Reversed endpoints
+    ///     are the same story: `SheetRangeRef::from_parts` rejects them with
+    ///     `RangeOrder`, so the engine path records nothing.
+    ///
+    /// (b) **The sheet-id round trip.**  The engine path goes
+    ///     `sheet_id -> graph.sheet_name -> sheet_store lookup ->
+    ///     view.sheet_name() -> engine.sheet_id`, and the last hop is a
+    ///     case-folding registry lookup.  The shortcut walks the SAME chain
+    ///     (including taking the name back off the Arrow sheet) rather than
+    ///     assuming the round trip is the identity.
+    ///
+    /// (c) **A member sheet with no Arrow sheet.**  The engine's `Range` arm
+    ///     returns an empty owned view when `sheet_store().sheet(name)` misses,
+    ///     and `record_view` skips on `view.is_empty()`.  The shortcut mirrors
+    ///     that by recording nothing for such a member (returning `true`: the
+    ///     member IS handled, the answer is just "no edges").  With the Arrow
+    ///     sheet present and a non-reversed rect the view is never empty --
+    ///     `ArrowSheet::range_view` derives `rows`/`cols` from the requested
+    ///     corners verbatim, with no clamping to the used range or to the
+    ///     sheet dimensions.
+    fn record_bounded_range3d_member(
+        &self,
+        sheet_id: SheetId,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> bool {
+        // (a) zero coordinate or reversed endpoints -> the engine path errors
+        // and records nothing; let it.
+        if start_row == 0 || start_col == 0 || end_row < start_row || end_col < start_col {
+            return false;
+        }
+        // (b) same registry chain the engine-resolved view would take.
+        let sheet_name = self.engine.graph.sheet_name(sheet_id);
+        // (c) no Arrow sheet -> empty owned view -> `record_view` skips.
+        let Some(asheet) = self.engine.sheet_store().sheet(sheet_name) else {
+            return true;
+        };
+        let Some(sid) = self.engine.sheet_id(asheet.name.as_ref()) else {
+            return true;
+        };
+        self.collector
+            .record_rect(sid, start_row - 1, start_col - 1, end_row - 1, end_col - 1);
+        true
     }
 
     fn record_selected_non_if_lazy_view(&self, reference: &ReferenceType, view: &RangeView<'_>) {

@@ -185,3 +185,176 @@ fn cell3d_span_stopping_before_a_later_sheet_excludes_it() {
         &[1, 2, 3],
     );
 }
+
+/* ───── bounded Range3D shortcut edge cases (GOD-246 lever 1, review F3) ───── */
+
+/// Record a hand-built `Range3D` reference through `RecordingContext` with the
+/// bounded shortcut forced on (`1`) and forced off (`2`), and return the sorted
+/// `(from, to, selected, mechanisms)` tuples for each.
+fn shortcut_vs_engine(
+    engine: &Engine<TestWorkbook>,
+    members: &[CellRef],
+    reference: &formualizer_parse::parser::ReferenceType,
+) -> (Vec<(u32, u32, bool, u8)>, Vec<(u32, u32, bool, u8)>) {
+    use crate::traits::EvaluationContext;
+
+    let run = |mode: u8| {
+        let collector = LiveEdgeCollector::new(members);
+        collector.set_range3d_shortcut_mode(mode);
+        collector.set_current(0);
+        {
+            let ctx = RecordingContext::new(engine, &collector);
+            let _ = ctx.resolve_range_view(reference, "Sheet1");
+        }
+        let mut out: Vec<(u32, u32, bool, u8)> = collector
+            .take_edge_records()
+            .into_iter()
+            .map(|e| (e.from, e.to, e.selected, e.mechanisms))
+            .collect();
+        out.sort_unstable();
+        out
+    };
+    (run(1), run(2))
+}
+
+fn range3d(
+    first: &str,
+    last: &str,
+    start_row: Option<u32>,
+    start_col: Option<u32>,
+    end_row: Option<u32>,
+    end_col: Option<u32>,
+) -> formualizer_parse::parser::ReferenceType {
+    formualizer_parse::parser::ReferenceType::Range3D {
+        sheet_first: first.to_string(),
+        sheet_last: last.to_string(),
+        start_row,
+        start_col,
+        end_row,
+        end_col,
+        start_row_abs: true,
+        start_col_abs: true,
+        end_row_abs: true,
+        end_col_abs: true,
+    }
+}
+
+/// F3(a): a literal `0` coordinate. `Engine::resolve_shared_ref` converts
+/// 1-based to 0-based with `checked_sub(1)` and returns `#REF!`, so the engine
+/// path records nothing; the shortcut must not underflow `u32` (a debug-build
+/// panic) and must record nothing too.
+#[test]
+fn range3d_shortcut_with_a_zero_coordinate_records_nothing_on_either_branch() {
+    let (e, m) = fixture();
+    for reference in [
+        range3d("Acct1", "Acct3", Some(0), Some(2), Some(1), Some(2)),
+        range3d("Acct1", "Acct3", Some(1), Some(0), Some(1), Some(2)),
+        range3d("Acct1", "Acct3", Some(1), Some(2), Some(0), Some(2)),
+        range3d("Acct1", "Acct3", Some(1), Some(2), Some(1), Some(0)),
+    ] {
+        let (shortcut, engine_path) = shortcut_vs_engine(&e, &m, &reference);
+        assert_eq!(shortcut, engine_path, "branch mismatch for {reference:?}");
+        assert!(
+            shortcut.is_empty(),
+            "a zero coordinate records nothing: {reference:?}"
+        );
+    }
+}
+
+/// F3(a), other half: reversed endpoints. `SheetRangeRef::from_parts` rejects
+/// them with `RangeOrder`, so the engine path records nothing.
+#[test]
+fn range3d_shortcut_with_reversed_endpoints_matches_the_engine_path() {
+    let (e, m) = fixture();
+    for reference in [
+        range3d("Acct1", "Acct3", Some(5), Some(2), Some(1), Some(2)),
+        range3d("Acct1", "Acct3", Some(1), Some(4), Some(1), Some(2)),
+    ] {
+        let (shortcut, engine_path) = shortcut_vs_engine(&e, &m, &reference);
+        assert_eq!(shortcut, engine_path, "branch mismatch for {reference:?}");
+        assert!(shortcut.is_empty(), "reversed rect records nothing");
+    }
+}
+
+/// F3(b) + the ordinary case: a bounded member rect records the identical edge
+/// set, with identical `selected`/`mechanisms` flags, on both branches --
+/// including when the span endpoints differ in case from the registered sheet
+/// names, which is the path the sheet-id round trip has to survive.
+#[test]
+fn range3d_shortcut_records_the_same_edges_as_the_engine_path() {
+    let (e, m) = fixture();
+    for reference in [
+        range3d("Acct1", "Acct3", Some(1), Some(2), Some(1), Some(2)),
+        range3d("Acct1", "Acct3", Some(1), Some(2), Some(2), Some(2)),
+        range3d("Acct1", "Acct3", Some(1), Some(1), Some(5), Some(4)),
+        range3d("acct1", "ACCT3", Some(1), Some(2), Some(5), Some(2)),
+        // A rect that lands on no member at all.
+        range3d("Acct1", "Acct3", Some(20), Some(20), Some(21), Some(21)),
+    ] {
+        let (shortcut, engine_path) = shortcut_vs_engine(&e, &m, &reference);
+        assert_eq!(shortcut, engine_path, "branch mismatch for {reference:?}");
+    }
+    // And the assertion is not vacuous: the B1:B5 span really does record the
+    // three B1 members plus Acct1!B5.
+    let (shortcut, _) = shortcut_vs_engine(
+        &e,
+        &m,
+        &range3d("Acct1", "Acct3", Some(1), Some(2), Some(5), Some(2)),
+    );
+    assert_eq!(
+        shortcut.iter().map(|t| t.1).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+}
+
+/// F3(c): a member sheet registered in the graph but absent from the Arrow
+/// sheet store. The engine returns an empty owned view and `record_view` skips
+/// it, so the shortcut must record nothing for that member either -- even
+/// though a collector member sits inside its rect.
+#[test]
+fn range3d_shortcut_on_a_sheet_with_no_arrow_store_records_nothing() {
+    let (mut e, mut m) = fixture();
+    // `Engine::add_sheet` would call `ensure_arrow_sheet`; going through the
+    // graph directly registers the sheet without an Arrow sheet behind it.
+    let ghost = e.graph.add_sheet("Ghost").expect("register sheet");
+    assert!(
+        e.sheet_store().sheet("Ghost").is_none(),
+        "fixture precondition: Ghost has no Arrow sheet"
+    );
+    // A member cell on the ghost sheet, inside the rect the span would read.
+    m.push(CellRef::new(ghost, Coord::from_excel(1, 2, true, true)));
+
+    let reference = range3d("Ghost", "Ghost", Some(1), Some(2), Some(1), Some(2));
+    let (shortcut, engine_path) = shortcut_vs_engine(&e, &m, &reference);
+    assert_eq!(shortcut, engine_path, "branch mismatch for {reference:?}");
+    assert!(
+        shortcut.is_empty(),
+        "a member sheet with no Arrow store records nothing on either branch"
+    );
+}
+
+/// The shortcut must not be taken when any axis is unbounded: those still need
+/// the engine's used-region normalisation.
+#[test]
+fn range3d_unbounded_axes_still_agree_between_branches() {
+    let (e, m) = fixture();
+    for reference in [
+        range3d("Acct1", "Acct3", None, Some(2), None, Some(2)),
+        range3d("Acct1", "Acct3", Some(1), None, Some(1), None),
+        range3d("Acct1", "Acct3", Some(1), Some(2), None, Some(2)),
+    ] {
+        let (shortcut, engine_path) = shortcut_vs_engine(&e, &m, &reference);
+        assert_eq!(shortcut, engine_path, "branch mismatch for {reference:?}");
+    }
+    // Non-vacuous: the whole-column form records the used extent, which picks
+    // up Acct1!B5 (member 4).
+    let (shortcut, _) = shortcut_vs_engine(
+        &e,
+        &m,
+        &range3d("Acct1", "Acct3", None, Some(2), None, Some(2)),
+    );
+    assert_eq!(
+        shortcut.iter().map(|t| t.1).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+}

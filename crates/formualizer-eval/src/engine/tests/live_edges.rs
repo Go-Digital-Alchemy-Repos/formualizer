@@ -685,3 +685,69 @@ fn fz_edge_hash_is_deterministic_and_moves_when_an_edge_is_added() {
         "an added live edge must change the chain"
     );
 }
+
+/* ─────── bounded Range3D shortcut parity (GOD-246 lever 1) ─────── */
+
+/// `record_rect_small_rect_and_member_scan_record_identical_edges` one level
+/// up: a bounded `Range3D` read evaluated through a real formula records the
+/// IDENTICAL edge set — including `selected` and `mechanisms` — whether the
+/// bounded shortcut (direct `record_rect` from the literal coordinates) or the
+/// engine-resolve path produced it.  The lazy variant matters because the
+/// shortcut has to reach `record_rect` with the same pending-scope state, so
+/// the per-cell `EDGE_NON_IF_LAZY` bit cannot move either.
+#[test]
+fn bounded_range3d_shortcut_and_engine_resolve_record_identical_edges() {
+    let mut engine = new_engine();
+    for sheet in ["Acct1", "Acct2", "Acct3"] {
+        engine.add_sheet(sheet).unwrap();
+    }
+    for sheet in ["Acct1", "Acct2", "Acct3"] {
+        for row in 1..=3u32 {
+            for col in 1..=3u32 {
+                set_num(&mut engine, sheet, row, col, (row * 10 + col) as f64);
+            }
+        }
+    }
+    engine.evaluate_all().unwrap();
+
+    let site = cell(&engine, "Sheet1", 1, 1);
+    let mut members = vec![site];
+    for sheet in ["Acct1", "Acct2", "Acct3"] {
+        for row in 1..=3u32 {
+            for col in 1..=3u32 {
+                members.push(cell(&engine, sheet, row, col));
+            }
+        }
+    }
+
+    let records = |mode: u8, formula: &str| {
+        let collector = LiveEdgeCollector::new(&members);
+        collector.set_range3d_shortcut_mode(mode);
+        let value = eval_as_member(&engine, &collector, 0, "Sheet1", site, formula);
+        let mut out: Vec<(u32, u32, bool, u8)> = collector
+            .take_edge_records()
+            .into_iter()
+            .map(|e| (e.from, e.to, e.selected, e.mechanisms))
+            .collect();
+        out.sort_unstable();
+        (value, out)
+    };
+
+    for formula in [
+        "=SUM(Acct1:Acct3!B1:B2)",
+        "=SUM(Acct1:Acct3!A1:C3)",
+        "=SUM(Acct1:Acct3!B2:B2)",
+        // A lazy (non-IF) arm, so the pending-scope mechanism bits are in play.
+        "=IFERROR(SUM(Acct1:Acct3!A1:C2), 0)",
+        // A rect landing on no member.
+        "=SUM(Acct1:Acct3!F9:G9)",
+    ] {
+        let (shortcut_value, shortcut) = records(1, formula);
+        let (engine_value, engine_path) = records(2, formula);
+        assert_eq!(shortcut_value, engine_value, "value for {formula}");
+        assert_eq!(shortcut, engine_path, "edge records for {formula}");
+    }
+
+    // Not vacuous: the B1:B2 span records six member cells.
+    assert_eq!(records(1, "=SUM(Acct1:Acct3!B1:B2)").1.len(), 6);
+}
