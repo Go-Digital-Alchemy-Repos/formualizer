@@ -281,9 +281,8 @@ fn xlookup_matched_rows_multi_column_return_still_spills() {
 }
 
 /// Whole-column lookup against a whole-column return with UNEQUAL used regions
-/// must still resolve through the empty-lookup fallback: this is the landed
-/// `dynamic_lookup_arrow::xlookup_whole_column_empty_lookup_matches_first_cell`
-/// shape, restated here so the guard is pinned against consuming it.
+/// must still pass the declared-length guard and reach lookup evaluation.
+/// ES-058 then rejects the blank candidate for a numeric-zero needle.
 #[test]
 fn xlookup_whole_column_pair_survives_the_length_guard() {
     for mode in [
@@ -308,7 +307,7 @@ fn xlookup_whole_column_pair_survives_the_length_guard() {
         engine.evaluate_all().unwrap();
         assert_eq!(
             engine.get_cell_value("Sheet1", 1, PROBE_COL),
-            Some(LiteralValue::Number(42.0)),
+            Some(LiteralValue::Text("NF".into())),
             "{mode:?} T6 whole-column pair"
         );
     }

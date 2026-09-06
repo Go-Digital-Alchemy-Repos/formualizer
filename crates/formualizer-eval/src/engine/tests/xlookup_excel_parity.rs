@@ -104,7 +104,7 @@ fn xlookup_text_needle_does_not_coerce_to_number() {
 }
 
 #[test]
-fn xlookup_empty_string_needle_matches_blank_cell() {
+fn xlookup_empty_text_needle_does_not_match_blank_cell() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     // B1 blank, B2/B3 text; C1:C3 = 7,8,9.
     engine
@@ -138,10 +138,8 @@ fn xlookup_empty_string_needle_matches_blank_cell() {
 
     engine.evaluate_all().unwrap();
 
-    assert_eq!(
-        engine.get_cell_value("Sheet1", 10, 1),
-        Some(LiteralValue::Number(7.0))
-    );
+    // ES-058 frozen Excel capture row X12.
+    assert_na(&engine, 10, 1);
     assert_eq!(
         engine.get_cell_value("Sheet1", 11, 1),
         Some(LiteralValue::Number(8.0))
