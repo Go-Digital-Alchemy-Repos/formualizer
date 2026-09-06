@@ -1045,3 +1045,70 @@ fn xlookup_empty_text_needle_selects_neither_blank_nor_numeric_zero() {
         LiteralValue::Text("NF".into())
     );
 }
+
+#[test]
+fn classic_exact_blank_law_is_identical_after_lookup_index_warms() {
+    // ES-058 frozen warm rows repeat each lookup six times over 100 cells.
+    let mut engine = engine_with_config(EvalConfig::default());
+    number(&mut engine, "Sheet1", 1, 1, 1.0);
+    number(&mut engine, "Sheet1", 3, 1, 0.0);
+    for row in 1..=100 {
+        number(&mut engine, "Sheet1", row, 2, row as f64 * 10.0);
+    }
+    number(&mut engine, "Sheet1", 110, 1, 1.0);
+    number(&mut engine, "Sheet1", 110, 3, 0.0);
+    for col in 1..=100 {
+        number(&mut engine, "Sheet1", 111, col, col as f64 * 10.0);
+    }
+    for offset in 0..6 {
+        formula(
+            &mut engine,
+            "Sheet1",
+            1,
+            8 + offset,
+            "=MATCH(F1,$A$1:$A$100,0)",
+        );
+        formula(
+            &mut engine,
+            "Sheet1",
+            2,
+            8 + offset,
+            "=VLOOKUP(F1,$A$1:$B$100,2,FALSE)",
+        );
+        formula(
+            &mut engine,
+            "Sheet1",
+            3,
+            8 + offset,
+            "=HLOOKUP(F1,$A$110:$CV$111,2,FALSE)",
+        );
+    }
+
+    for pass in 0..2 {
+        engine.evaluate_all().unwrap();
+        for offset in 0..6 {
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 1, 8 + offset),
+                Some(LiteralValue::Number(3.0))
+            );
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 2, 8 + offset),
+                Some(LiteralValue::Number(30.0))
+            );
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 3, 8 + offset),
+                Some(LiteralValue::Number(30.0))
+            );
+        }
+        if pass == 0 {
+            let report = engine.last_lookup_index_cache_report();
+            assert!(report.builds >= 3, "{report:?}");
+            let vertices: Vec<_> = engine.graph.vertices_with_formulas().collect();
+            for vertex in vertices {
+                engine.graph.mark_vertex_dirty(vertex);
+            }
+        }
+    }
+    let warm = engine.last_lookup_index_cache_report();
+    assert!(warm.hits >= 18, "{warm:?}");
+}
