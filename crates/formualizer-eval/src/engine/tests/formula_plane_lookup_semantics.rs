@@ -882,3 +882,92 @@ fn approximate_and_wildcard_modes_do_not_hit_exact_cache() {
     assert_eq!(wildcard_report.hits, 0, "{wildcard_report:?}");
     assert_eq!(wildcard_report.builds, 0, "{wildcard_report:?}");
 }
+
+fn evaluate_three_cell_lookup(
+    values: [Option<f64>; 3],
+    horizontal: bool,
+    formula_text: &str,
+) -> LiteralValue {
+    let mut engine = engine_with_mode(FormulaPlaneMode::Off);
+    for (offset, value_num) in values.into_iter().enumerate() {
+        if let Some(value_num) = value_num {
+            if horizontal {
+                number(&mut engine, "Sheet1", 5, offset as u32 + 1, value_num);
+            } else {
+                number(&mut engine, "Sheet1", offset as u32 + 1, 1, value_num);
+            }
+        }
+    }
+    formula(&mut engine, "Sheet1", 1, 8, formula_text);
+    engine.evaluate_all().unwrap();
+    engine
+        .get_cell_value("Sheet1", 1, 8)
+        .expect("lookup result")
+}
+
+fn assert_na(actual: LiteralValue) {
+    assert!(
+        matches!(actual, LiteralValue::Error(ref error) if error.kind == ExcelErrorKind::Na),
+        "expected #N/A, got {actual:?}"
+    );
+}
+
+#[test]
+fn match_exact_blank_needle_selects_numeric_zero_instead_of_blank() {
+    // ES-058, frozen Excel capture rows B2, B3, B13-B15, B19 and B20.
+    assert_eq!(
+        evaluate_three_cell_lookup([Some(1.0), None, Some(0.0)], false, "=MATCH(F1,A1:A3,0)",),
+        LiteralValue::Number(3.0)
+    );
+    assert_na(evaluate_three_cell_lookup(
+        [Some(1.0), None, Some(2.0)],
+        false,
+        "=MATCH(F1,A1:A3,0)",
+    ));
+}
+
+#[test]
+fn vlookup_exact_blank_needle_selects_numeric_zero_instead_of_blank() {
+    // ES-058, frozen Excel capture rows B6 and B7.
+    assert_eq!(
+        evaluate_three_cell_lookup(
+            [Some(1.0), None, Some(0.0)],
+            false,
+            "=VLOOKUP(F1,A1:A3,1,FALSE)",
+        ),
+        LiteralValue::Number(0.0)
+    );
+    assert_na(evaluate_three_cell_lookup(
+        [Some(1.0), None, Some(2.0)],
+        false,
+        "=VLOOKUP(F1,A1:A3,1,FALSE)",
+    ));
+}
+
+#[test]
+fn hlookup_exact_blank_needle_selects_numeric_zero_instead_of_blank() {
+    // ES-058, frozen Excel capture rows B17 and B18.
+    assert_eq!(
+        evaluate_three_cell_lookup(
+            [Some(1.0), None, Some(0.0)],
+            true,
+            "=HLOOKUP(F1,A5:C5,1,FALSE)",
+        ),
+        LiteralValue::Number(0.0)
+    );
+    assert_na(evaluate_three_cell_lookup(
+        [Some(1.0), None, Some(2.0)],
+        true,
+        "=HLOOKUP(F1,A5:C5,1,FALSE)",
+    ));
+}
+
+#[test]
+fn exact_empty_text_needle_selects_neither_blank_nor_numeric_zero() {
+    // ES-058, frozen Excel capture row X13.
+    assert_na(evaluate_three_cell_lookup(
+        [Some(1.0), None, Some(0.0)],
+        false,
+        "=MATCH(\"\",A1:A3,0)",
+    ));
+}

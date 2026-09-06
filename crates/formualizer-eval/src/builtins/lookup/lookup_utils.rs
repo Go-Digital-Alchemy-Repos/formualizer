@@ -75,6 +75,17 @@ pub(crate) struct PreparedLookupMatcher<'a> {
     date_system: DateSystem,
 }
 
+fn is_numeric_exact_value(value: &LiteralValue) -> bool {
+    matches!(
+        value,
+        LiteralValue::Number(_)
+            | LiteralValue::Int(_)
+            | LiteralValue::Date(_)
+            | LiteralValue::DateTime(_)
+            | LiteralValue::Time(_)
+    )
+}
+
 impl<'a> PreparedLookupMatcher<'a> {
     pub(crate) fn new(needle: &'a LiteralValue, wildcard: bool, date_system: DateSystem) -> Self {
         let text = match needle {
@@ -100,6 +111,17 @@ impl<'a> PreparedLookupMatcher<'a> {
     }
 
     pub(crate) fn matches(&self, candidate: &LiteralValue) -> bool {
+        // ES-058: classic exact lookups coerce a blank needle to numeric zero,
+        // but no exact or wildcard lookup may select a blank candidate through
+        // this shared matcher. XLOOKUP and XMATCH handle their measured
+        // blank-needle exception before calling this matcher.
+        if matches!(candidate, LiteralValue::Empty) {
+            return false;
+        }
+        if matches!(self.needle, LiteralValue::Empty) || is_numeric_exact_value(self.needle) {
+            return is_numeric_exact_value(candidate)
+                && cmp_for_lookup(self.needle, candidate, self.date_system) == Some(0);
+        }
         match (&self.text, candidate) {
             (
                 Some(PreparedTextMatcher::Exact { folded_needle }),
@@ -111,10 +133,6 @@ impl<'a> PreparedLookupMatcher<'a> {
             ) => {
                 let folded_candidate = candidate_text.to_lowercase();
                 compiled.matches_folded(&folded_candidate)
-            }
-            // Excel: an empty-string needle also matches a blank cell.
-            (Some(PreparedTextMatcher::Exact { folded_needle }), LiteralValue::Empty) => {
-                folded_needle.is_empty()
             }
             // Excel exact lookups never match a text needle against a
             // non-text candidate: "20" does not find the number 20.
@@ -392,14 +410,9 @@ pub fn find_exact_index_in_view(
     match needle {
         LiteralValue::Number(n) => find_exact_number_in_view(view, *n, vertical),
         LiteralValue::Int(i) => find_exact_number_in_view(view, *i as f64, vertical),
-        // Excel: an empty-string needle matches the first blank cell (blank
-        // and "" are the same value class at the formula level).
-        LiteralValue::Text(s) if s.is_empty() && !wildcard => {
-            find_exact_empty_in_view(view, vertical)
-        }
         LiteralValue::Text(s) => find_exact_text_in_view(view, s, wildcard, vertical),
         LiteralValue::Boolean(b) => find_exact_boolean_in_view(view, *b, vertical),
-        LiteralValue::Empty => find_exact_empty_in_view(view, vertical),
+        LiteralValue::Empty => find_exact_number_in_view(view, 0.0, vertical),
         LiteralValue::Error(e) => Err(e.clone()),
         // A temporal needle searches the numeric lane by serial: the arrow
         // store keeps dates and times as serials under a temporal type tag,
@@ -441,13 +454,6 @@ fn find_exact_number_in_view(
                 }
             }
         }
-    }
-
-    // Excel-like semantics: Empty cells compare equal to numeric zero.
-    if n.abs() < 1e-12
-        && let Some(idx) = find_exact_empty_in_view(view, vertical)?
-    {
-        return Ok(Some(idx));
     }
 
     Ok(None)
@@ -530,35 +536,6 @@ fn find_exact_boolean_in_view(
             let (_row_start, _row_len, cols) = res?;
             for (c, arr) in cols.iter().enumerate() {
                 if !arr.is_null(0) && arr.value(0) == b {
-                    return Ok(Some(c));
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn find_exact_empty_in_view(
-    view: &RangeView<'_>,
-    vertical: bool,
-) -> Result<Option<usize>, ExcelError> {
-    if vertical {
-        for res in view.type_tags_slices() {
-            let (row_start, _row_len, cols) = res?;
-            if !cols.is_empty() {
-                let arr = &cols[0];
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) && arr.value(i) == crate::arrow_store::TypeTag::Empty as u8 {
-                        return Ok(Some(row_start + i));
-                    }
-                }
-            }
-        }
-    } else {
-        for res in view.type_tags_slices() {
-            let (_row_start, _row_len, cols) = res?;
-            for (c, arr) in cols.iter().enumerate() {
-                if !arr.is_null(0) && arr.value(0) == crate::arrow_store::TypeTag::Empty as u8 {
                     return Ok(Some(c));
                 }
             }

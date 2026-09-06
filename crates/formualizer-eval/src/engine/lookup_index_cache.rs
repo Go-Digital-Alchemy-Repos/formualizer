@@ -31,7 +31,6 @@ pub enum LookupHashKey {
     Number(u64),
     Text(Box<str>),
     Boolean(bool),
-    Empty,
 }
 
 impl Hash for LookupHashKey {
@@ -49,21 +48,26 @@ impl Hash for LookupHashKey {
                 2u8.hash(state);
                 value.hash(state);
             }
-            Self::Empty => {
-                3u8.hash(state);
-            }
         }
     }
 }
 
 impl LookupHashKey {
+    fn from_needle(value: &LiteralValue, date_system: DateSystem) -> Option<Self> {
+        if matches!(value, LiteralValue::Empty) {
+            Some(Self::Number(0.0f64.to_bits()))
+        } else {
+            Self::from_literal(value, date_system)
+        }
+    }
+
     pub(crate) fn from_literal(value: &LiteralValue, date_system: DateSystem) -> Option<Self> {
         match value {
             LiteralValue::Number(n) => Some(Self::Number(normalize_f64_bits(*n))),
             LiteralValue::Int(i) => Some(Self::Number(normalize_f64_bits(*i as f64))),
             LiteralValue::Text(s) => Some(Self::Text(s.to_lowercase().into_boxed_str())),
             LiteralValue::Boolean(b) => Some(Self::Boolean(*b)),
-            LiteralValue::Empty => Some(Self::Empty),
+            LiteralValue::Empty => None,
             // Temporal values are numbers in Excel: key them by their serial so
             // an exact lookup finds them whether the needle or the cell (or
             // both) carry a temporal type rather than a plain numeric.
@@ -84,7 +88,11 @@ fn normalize_f64_bits(n: f64) -> u64 {
     }
     let rounded = n.round();
     if (n - rounded).abs() < 1e-12 {
-        rounded.to_bits()
+        if rounded == 0.0 {
+            0.0f64.to_bits()
+        } else {
+            rounded.to_bits()
+        }
     } else {
         n.to_bits()
     }
@@ -103,7 +111,6 @@ pub struct LookupIndex {
     pub(crate) bytes: usize,
     pub(crate) entries: FxHashMap<LookupHashKey, DuplicateIndices>,
     pub(crate) cell_values: Box<[LiteralValue]>,
-    pub(crate) first_empty: Option<usize>,
 }
 
 impl LookupIndex {
@@ -133,7 +140,6 @@ impl LookupIndex {
 
         let mut entries: FxHashMap<LookupHashKey, DuplicateIndices> = FxHashMap::default();
         let mut cell_values = Vec::with_capacity(len);
-        let mut first_empty = None;
         let mut error_count = 0usize;
 
         for idx in 0..len {
@@ -143,9 +149,6 @@ impl LookupIndex {
             };
             if matches!(value, LiteralValue::Error(_)) {
                 error_count += 1;
-            }
-            if matches!(value, LiteralValue::Empty) && first_empty.is_none() {
-                first_empty = Some(idx);
             }
             if let Some(key) = LookupHashKey::from_literal(&value, date_system) {
                 let dups = entries.entry(key).or_insert_with(|| DuplicateIndices {
@@ -173,12 +176,11 @@ impl LookupIndex {
             bytes,
             entries,
             cell_values: cell_values.into_boxed_slice(),
-            first_empty,
         }))
     }
 
     pub(crate) fn find_first_exact(&self, needle: &LiteralValue) -> Option<usize> {
-        let hash_key = LookupHashKey::from_literal(needle, self.date_system)?;
+        let hash_key = LookupHashKey::from_needle(needle, self.date_system)?;
         if let Some(dups) = self.entries.get(&hash_key) {
             for &idx in &dups.all {
                 if cmp_for_lookup(needle, &self.cell_values[idx], self.date_system) == Some(0) {
@@ -186,20 +188,11 @@ impl LookupIndex {
                 }
             }
         }
-        if let Some(n) = numeric_zero_candidate(needle)
-            && n.abs() < 1e-12
-        {
-            return self.first_empty;
-        }
-        // Excel: an empty-string needle matches a blank cell.
-        if matches!(needle, LiteralValue::Text(s) if s.is_empty()) {
-            return self.first_empty;
-        }
         None
     }
 
     pub(crate) fn find_last_exact(&self, needle: &LiteralValue) -> Option<usize> {
-        let hash_key = LookupHashKey::from_literal(needle, self.date_system)?;
+        let hash_key = LookupHashKey::from_needle(needle, self.date_system)?;
         if let Some(dups) = self.entries.get(&hash_key) {
             for &idx in dups.all.iter().rev() {
                 if cmp_for_lookup(needle, &self.cell_values[idx], self.date_system) == Some(0) {
@@ -207,20 +200,7 @@ impl LookupIndex {
                 }
             }
         }
-        if let Some(n) = numeric_zero_candidate(needle)
-            && n.abs() < 1e-12
-        {
-            return self.first_empty;
-        }
         None
-    }
-}
-
-fn numeric_zero_candidate(needle: &LiteralValue) -> Option<f64> {
-    match needle {
-        LiteralValue::Number(n) => Some(*n),
-        LiteralValue::Int(i) => Some(*i as f64),
-        _ => None,
     }
 }
 

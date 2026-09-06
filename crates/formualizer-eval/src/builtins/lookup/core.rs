@@ -999,6 +999,89 @@ mod tests {
     }
 
     #[test]
+    fn match_exact_array_blank_needle_selects_numeric_zero_instead_of_blank() {
+        // ES-058, frozen Excel capture row B3; array-literal consumer path.
+        let wb = TestWorkbook::new().with_function(Arc::new(MatchFn));
+        let ctx = wb.interpreter();
+        let needle = lit(LiteralValue::Empty);
+        let values = lit(LiteralValue::Array(vec![vec![
+            LiteralValue::Empty,
+            LiteralValue::Number(0.0),
+            LiteralValue::Number(1.0),
+        ]]));
+        let mode = lit(LiteralValue::Int(0));
+        let args = vec![
+            ArgumentHandle::new(&needle, &ctx),
+            ArgumentHandle::new(&values, &ctx),
+            ArgumentHandle::new(&mode, &ctx),
+        ];
+        let actual = ctx
+            .context
+            .get_function("", "MATCH")
+            .unwrap()
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(actual, LiteralValue::Int(2));
+    }
+
+    #[test]
+    fn vlookup_exact_array_blank_needle_selects_numeric_zero_instead_of_blank() {
+        // ES-058, frozen Excel capture row B7; array-literal consumer path.
+        let wb = TestWorkbook::new().with_function(Arc::new(VLookupFn));
+        let ctx = wb.interpreter();
+        let needle = lit(LiteralValue::Empty);
+        let table = lit(LiteralValue::Array(vec![
+            vec![LiteralValue::Empty, LiteralValue::Int(10)],
+            vec![LiteralValue::Number(0.0), LiteralValue::Int(20)],
+        ]));
+        let column = lit(LiteralValue::Int(2));
+        let exact = lit(LiteralValue::Boolean(false));
+        let args = vec![
+            ArgumentHandle::new(&needle, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&column, &ctx),
+            ArgumentHandle::new(&exact, &ctx),
+        ];
+        let actual = ctx
+            .context
+            .get_function("", "VLOOKUP")
+            .unwrap()
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(actual, LiteralValue::Int(20));
+    }
+
+    #[test]
+    fn hlookup_exact_array_blank_needle_selects_numeric_zero_instead_of_blank() {
+        // ES-058, frozen Excel capture row B18; array-literal consumer path.
+        let wb = TestWorkbook::new().with_function(Arc::new(HLookupFn));
+        let ctx = wb.interpreter();
+        let needle = lit(LiteralValue::Empty);
+        let table = lit(LiteralValue::Array(vec![
+            vec![LiteralValue::Empty, LiteralValue::Number(0.0)],
+            vec![LiteralValue::Int(10), LiteralValue::Int(20)],
+        ]));
+        let row = lit(LiteralValue::Int(2));
+        let exact = lit(LiteralValue::Boolean(false));
+        let args = vec![
+            ArgumentHandle::new(&needle, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&row, &ctx),
+            ArgumentHandle::new(&exact, &ctx),
+        ];
+        let actual = ctx
+            .context
+            .get_function("", "HLOOKUP")
+            .unwrap()
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(actual, LiteralValue::Int(20));
+    }
+
+    #[test]
     fn match_wildcard_and_descending_and_unsorted() {
         // Wildcard: A1:A4 = "foo", "fob", "bar", "baz"
         let wb = TestWorkbook::new().with_function(Arc::new(MatchFn));
