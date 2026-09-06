@@ -897,6 +897,13 @@ fn evaluate_three_cell_lookup(
                 number(&mut engine, "Sheet1", offset as u32 + 1, 1, value_num);
             }
         }
+        text(
+            &mut engine,
+            "Sheet1",
+            offset as u32 + 1,
+            4,
+            &format!("p{}", offset + 1),
+        );
     }
     formula(&mut engine, "Sheet1", 1, 8, formula_text);
     engine.evaluate_all().unwrap();
@@ -970,4 +977,71 @@ fn exact_empty_text_needle_selects_neither_blank_nor_numeric_zero() {
         false,
         "=MATCH(\"\",A1:A3,0)",
     ));
+}
+
+#[test]
+fn xmatch_exact_blank_needle_selects_only_blank_candidate() {
+    // ES-058, frozen Excel capture rows X1, X5, X11 and X15.
+    assert_na(evaluate_three_cell_lookup(
+        [Some(1.0), Some(5.0), Some(0.0)],
+        false,
+        "=XMATCH(F1,A1:A3,0,1)",
+    ));
+    assert_eq!(
+        evaluate_three_cell_lookup(
+            [Some(0.0), None, Some(1.0)],
+            false,
+            "=XMATCH(F1,A1:A3,0,-1)",
+        ),
+        LiteralValue::Number(2.0)
+    );
+}
+
+#[test]
+fn xlookup_exact_blank_needle_selects_only_blank_candidate_in_search_direction() {
+    // ES-058, frozen Excel capture rows X6, X7, X9 and X10.
+    for search_mode in [1, -1] {
+        assert_eq!(
+            evaluate_three_cell_lookup(
+                [Some(0.0), None, Some(1.0)],
+                false,
+                &format!("=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",0,{search_mode})"),
+            ),
+            LiteralValue::Text("p2".into())
+        );
+    }
+}
+
+#[test]
+fn x_functions_wildcard_blank_needle_selects_only_blank_candidate() {
+    // ES-058, frozen Excel capture rows X14 and B10.
+    assert_eq!(
+        evaluate_three_cell_lookup(
+            [Some(1.0), None, Some(2.0)],
+            false,
+            "=XMATCH(F1,A1:A3,2,-1)",
+        ),
+        LiteralValue::Number(2.0)
+    );
+    assert_eq!(
+        evaluate_three_cell_lookup(
+            [Some(1.0), None, Some(2.0)],
+            false,
+            "=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",2,1)",
+        ),
+        LiteralValue::Text("p2".into())
+    );
+}
+
+#[test]
+fn xlookup_empty_text_needle_selects_neither_blank_nor_numeric_zero() {
+    // ES-058, frozen Excel capture row X12.
+    assert_eq!(
+        evaluate_three_cell_lookup(
+            [Some(0.0), None, Some(1.0)],
+            false,
+            "=XLOOKUP(\"\",A1:A3,D1:D3,\"NF\",0,1)",
+        ),
+        LiteralValue::Text("NF".into())
+    );
 }
