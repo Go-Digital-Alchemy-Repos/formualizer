@@ -1,10 +1,13 @@
 use crate::arrow_store;
-use crate::arrow_store::IngestBuilder;
+use crate::arrow_store::{
+    CellIngest, ColumnChunk, IngestBuilder, OverlayScalar, OverlayValue, TypeTag,
+};
 use crate::engine::CancelToken;
 use crate::stripes::NumericChunk;
 use arrow_array::Array;
 use arrow_schema::DataType;
 use formualizer_common::{CoercionPolicy, DateSystem, ExcelError, LiteralValue};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -25,6 +28,132 @@ pub struct RangeView<'a> {
     rows: usize,
     cols: usize,
     cancel_token: Option<CancelToken>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RangeMaterializationSummary {
+    pub(crate) rows: usize,
+    pub(crate) cells: usize,
+    pub(crate) numeric_sum: f64,
+    pub(crate) non_numeric: usize,
+}
+
+enum EffectiveCell<'a> {
+    Empty,
+    Number(f64),
+    Boolean(bool),
+    Text(Cow<'a, str>),
+    ErrorCode(u8),
+    Pending,
+}
+
+impl<'a> EffectiveCell<'a> {
+    #[inline]
+    fn from_chunk(chunk: &'a ColumnChunk, offset: usize) -> Self {
+        let cascade = arrow_store::OverlayCascade::new(&chunk.overlay, &chunk.computed_overlay);
+        if let Some(value) = cascade.get_scalar(offset) {
+            return match value {
+                OverlayScalar::Borrowed(value) => Self::from_borrowed_overlay(value),
+                OverlayScalar::Owned(value) => Self::from_owned_overlay(value),
+            };
+        }
+
+        match TypeTag::from_u8(chunk.type_tag.value(offset)) {
+            TypeTag::Empty => Self::Empty,
+            TypeTag::Number | TypeTag::DateTime | TypeTag::Duration => chunk
+                .numbers
+                .as_ref()
+                .filter(|array| !array.is_null(offset))
+                .map_or(Self::Empty, |array| Self::Number(array.value(offset))),
+            TypeTag::Boolean => chunk
+                .booleans
+                .as_ref()
+                .filter(|array| !array.is_null(offset))
+                .map_or(Self::Empty, |array| Self::Boolean(array.value(offset))),
+            TypeTag::Text => chunk
+                .text
+                .as_ref()
+                .filter(|array| !array.is_null(offset))
+                .map_or(Self::Empty, |array| {
+                    let array = array
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .unwrap();
+                    Self::Text(Cow::Borrowed(array.value(offset)))
+                }),
+            TypeTag::Error => chunk
+                .errors
+                .as_ref()
+                .filter(|array| !array.is_null(offset))
+                .map_or(Self::Empty, |array| Self::ErrorCode(array.value(offset))),
+            TypeTag::Pending => Self::Pending,
+        }
+    }
+
+    #[inline]
+    fn from_borrowed_overlay(value: &'a OverlayValue) -> Self {
+        match value {
+            OverlayValue::Empty => Self::Empty,
+            OverlayValue::Number(value)
+            | OverlayValue::DateTime(value)
+            | OverlayValue::Duration(value) => Self::Number(*value),
+            OverlayValue::Boolean(value) => Self::Boolean(*value),
+            OverlayValue::Text(value) => Self::Text(Cow::Borrowed(value.as_ref())),
+            OverlayValue::Error(code) => Self::ErrorCode(*code),
+            OverlayValue::Pending => Self::Pending,
+        }
+    }
+
+    #[inline]
+    fn from_owned_overlay(value: OverlayValue) -> Self {
+        match value {
+            OverlayValue::Empty => Self::Empty,
+            OverlayValue::Number(value)
+            | OverlayValue::DateTime(value)
+            | OverlayValue::Duration(value) => Self::Number(value),
+            OverlayValue::Boolean(value) => Self::Boolean(value),
+            OverlayValue::Text(value) => Self::Text(Cow::Owned(value.to_string())),
+            OverlayValue::Error(code) => Self::ErrorCode(code),
+            OverlayValue::Pending => Self::Pending,
+        }
+    }
+
+    #[inline]
+    fn as_ingest(&self) -> CellIngest<'_> {
+        match self {
+            Self::Empty => CellIngest::Empty,
+            Self::Number(value) => CellIngest::Number(*value),
+            Self::Boolean(value) => CellIngest::Boolean(*value),
+            Self::Text(value) => CellIngest::Text(value.as_ref()),
+            Self::ErrorCode(code) => CellIngest::ErrorCode(arrow_store::map_error_code(
+                arrow_store::unmap_error_code(*code),
+            )),
+            Self::Pending => CellIngest::Pending,
+        }
+    }
+
+    #[inline]
+    fn into_literal(self) -> LiteralValue {
+        match self {
+            Self::Empty => LiteralValue::Empty,
+            Self::Number(value) => LiteralValue::Number(value),
+            Self::Boolean(value) => LiteralValue::Boolean(value),
+            Self::Text(value) => LiteralValue::Text(value.into_owned()),
+            Self::ErrorCode(code) => {
+                LiteralValue::Error(ExcelError::new(arrow_store::unmap_error_code(code)))
+            }
+            Self::Pending => LiteralValue::Pending,
+        }
+    }
+
+    #[inline]
+    fn add_to_summary(&self, summary: &mut RangeMaterializationSummary) {
+        summary.cells += 1;
+        match self {
+            Self::Number(value) => summary.numeric_sum += value,
+            _ => summary.non_numeric += 1,
+        }
+    }
 }
 
 impl<'a> core::fmt::Debug for RangeView<'a> {
@@ -279,6 +408,133 @@ impl<'a> RangeView<'a> {
         })
     }
 
+    /// Vertically materialize borrowed member views into one owned view.
+    ///
+    /// This is the stateless Range3D materialization path from GOD-255. It
+    /// keeps the old row ordering and padding law while avoiding an
+    /// intermediate `Vec<Vec<LiteralValue>>` and repeated per-cell chunk
+    /// searches. The public row iterators remain unchanged.
+    pub(crate) fn try_from_vertical_views(
+        views: &[RangeView<'_>],
+        date_system: DateSystem,
+        summarize: bool,
+    ) -> Result<(RangeView<'static>, Vec<RangeMaterializationSummary>), ExcelError> {
+        let nrows = views
+            .iter()
+            .fold(0usize, |total, view| total.saturating_add(view.rows));
+        let ncols = views.iter().map(|view| view.cols).max().unwrap_or(0);
+        let mut builder = IngestBuilder::new("__tmp", ncols, 32 * 1024, date_system);
+        let mut summaries = Vec::with_capacity(if summarize { views.len() } else { 0 });
+
+        for view in views {
+            let summary = if summarize {
+                Self::append_vertical_member::<true>(view, ncols, &mut builder)?
+            } else {
+                Self::append_vertical_member::<false>(view, ncols, &mut builder)?
+            };
+            if summarize {
+                summaries.push(summary);
+            }
+        }
+
+        let sheet = Arc::new(builder.finish());
+        let view = if nrows == 0 || ncols == 0 {
+            RangeView {
+                backing: RangeBacking::Owned(sheet),
+                sr: 1,
+                sc: 1,
+                er: 0,
+                ec: 0,
+                rows: 0,
+                cols: 0,
+                cancel_token: None,
+            }
+        } else {
+            RangeView {
+                backing: RangeBacking::Owned(sheet),
+                sr: 0,
+                sc: 0,
+                er: nrows - 1,
+                ec: ncols - 1,
+                rows: nrows,
+                cols: ncols,
+                cancel_token: None,
+            }
+        };
+        Ok((view, summaries))
+    }
+
+    fn append_vertical_member<const SUMMARIZE: bool>(
+        view: &RangeView<'_>,
+        output_cols: usize,
+        builder: &mut IngestBuilder,
+    ) -> Result<RangeMaterializationSummary, ExcelError> {
+        let mut summary = RangeMaterializationSummary {
+            rows: view.rows,
+            ..RangeMaterializationSummary::default()
+        };
+        if view.rows == 0 || output_cols == 0 {
+            return Ok(summary);
+        }
+
+        let sheet = view.sheet();
+        let sheet_rows = sheet.nrows as usize;
+        let mut chunk_index = None;
+        let mut chunk_end = 0usize;
+        let mut column_chunks: Vec<Option<&ColumnChunk>> = Vec::with_capacity(view.cols);
+        let mut row_cells = Vec::with_capacity(output_cols);
+
+        for relative_row in 0..view.rows {
+            let absolute_row = view.sr.saturating_add(relative_row);
+            if absolute_row < sheet_rows && (chunk_index.is_none() || absolute_row >= chunk_end) {
+                let index = match sheet.chunk_starts.binary_search(&absolute_row) {
+                    Ok(index) => index,
+                    Err(0) => 0,
+                    Err(index) => index - 1,
+                };
+                chunk_index = Some(index);
+                chunk_end = sheet
+                    .chunk_starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(sheet_rows);
+                column_chunks.clear();
+                column_chunks.extend((view.sc..=view.ec).map(|column| {
+                    sheet
+                        .columns
+                        .get(column)
+                        .and_then(|source| source.chunk(index))
+                }));
+            }
+
+            let row_start = chunk_index
+                .and_then(|index| sheet.chunk_starts.get(index).copied())
+                .unwrap_or(0);
+            let offset = absolute_row.saturating_sub(row_start);
+            row_cells.clear();
+            for column in 0..output_cols {
+                let effective = if absolute_row >= sheet_rows || column >= view.cols {
+                    EffectiveCell::Empty
+                } else {
+                    column_chunks
+                        .get(column)
+                        .and_then(|chunk| *chunk)
+                        .filter(|chunk| offset < chunk.len())
+                        .map_or(EffectiveCell::Empty, |chunk| {
+                            EffectiveCell::from_chunk(chunk, offset)
+                        })
+                };
+                if SUMMARIZE && column < view.cols {
+                    effective.add_to_summary(&mut summary);
+                }
+                row_cells.push(effective);
+            }
+            builder.append_row_cells_iter(row_cells.iter().map(EffectiveCell::as_ingest))?;
+        }
+
+        Ok(summary)
+    }
+
     pub fn dims(&self) -> (usize, usize) {
         (self.rows, self.cols)
     }
@@ -415,72 +671,7 @@ impl<'a> RangeView<'a> {
         let row_start = chunk_starts[ch_idx];
         let in_off = abs_row - row_start;
         // Overlay takes precedence: user edits over computed over base.
-        let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-        if let Some(ov) = cascade.get_scalar(in_off) {
-            return ov.to_literal_for(sheet.date_system);
-        }
-        // Read tag and route to lane
-        let tag_u8 = ch.type_tag.value(in_off);
-        match arrow_store::TypeTag::from_u8(tag_u8) {
-            arrow_store::TypeTag::Empty => LiteralValue::Empty,
-            arrow_store::TypeTag::Number => {
-                if let Some(arr) = &ch.numbers {
-                    if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
-                    }
-                    LiteralValue::Number(arr.value(in_off))
-                } else {
-                    LiteralValue::Empty
-                }
-            }
-            arrow_store::TypeTag::DateTime | arrow_store::TypeTag::Duration => {
-                if let Some(arr) = &ch.numbers {
-                    if arr.is_null(in_off) {
-                        LiteralValue::Empty
-                    } else {
-                        LiteralValue::Number(arr.value(in_off))
-                    }
-                } else {
-                    LiteralValue::Empty
-                }
-            }
-            arrow_store::TypeTag::Boolean => {
-                if let Some(arr) = &ch.booleans {
-                    if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
-                    }
-                    LiteralValue::Boolean(arr.value(in_off))
-                } else {
-                    LiteralValue::Empty
-                }
-            }
-            arrow_store::TypeTag::Text => {
-                if let Some(arr) = &ch.text {
-                    if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
-                    }
-                    let sa = arr
-                        .as_any()
-                        .downcast_ref::<arrow_array::StringArray>()
-                        .unwrap();
-                    LiteralValue::Text(sa.value(in_off).to_string())
-                } else {
-                    LiteralValue::Empty
-                }
-            }
-            arrow_store::TypeTag::Error => {
-                if let Some(arr) = &ch.errors {
-                    if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
-                    }
-                    let kind = arrow_store::unmap_error_code(arr.value(in_off));
-                    LiteralValue::Error(ExcelError::new(kind))
-                } else {
-                    LiteralValue::Empty
-                }
-            }
-            arrow_store::TypeTag::Pending => LiteralValue::Pending,
-        }
+        EffectiveCell::from_chunk(ch, in_off).into_literal()
     }
 
     /// Iterate overlapping chunks by row segment.

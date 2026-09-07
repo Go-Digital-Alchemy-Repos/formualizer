@@ -25224,10 +25224,10 @@ where
                     .active_span_ids(sheet_first, sheet_last)
                     .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
                 let fz_trace = fz_span_trace_enabled();
-                let mut rows = Vec::new();
-                for sheet_id in sheet_ids {
+                let mut member_views = Vec::with_capacity(sheet_ids.len());
+                for sheet_id in &sheet_ids {
                     let reference = ReferenceType::Range {
-                        sheet: Some(self.graph.sheet_name(sheet_id).to_string()),
+                        sheet: Some(self.graph.sheet_name(*sheet_id).to_string()),
                         start_row: *start_row,
                         start_col: *start_col,
                         end_row: *end_row,
@@ -25237,32 +25237,35 @@ where
                         end_row_abs: *end_row_abs,
                         end_col_abs: *end_col_abs,
                     };
-                    let fz_before = rows.len();
-                    let view = self.resolve_range_view(&reference, current_sheet)?;
-                    view.for_each_row(&mut |row| {
-                        rows.push(row.to_vec());
-                        Ok(())
-                    })?;
-                    if fz_trace {
-                        let (n_rows, n_cells, sum, non_numeric) = fz_span_shape(&rows[fz_before..]);
+                    member_views.push(self.resolve_range_view(&reference, current_sheet)?);
+                }
+                let (view, summaries) = RangeView::try_from_vertical_views(
+                    &member_views,
+                    self.config.date_system,
+                    fz_trace,
+                )?;
+                if fz_trace {
+                    for (sheet_id, summary) in sheet_ids.iter().zip(&summaries) {
+                        let n_rows = summary.rows;
+                        let n_cells = summary.cells;
+                        let sum = summary.numeric_sum;
+                        let non_numeric = summary.non_numeric;
                         eprintln!(
                             "FZ_SPAN cur={current_sheet} span={sheet_first}:{sheet_last} sid={sheet_id:?} sheet={} rows={:?}..{:?} cols={:?}..{:?} n_rows={n_rows} n_cells={n_cells} sum={sum:?} non_numeric={non_numeric}",
-                            self.graph.sheet_name(sheet_id),
+                            self.graph.sheet_name(*sheet_id),
                             *start_row,
                             *end_row,
                             *start_col,
                             *end_col
                         );
                     }
-                }
-                if fz_trace {
                     eprintln!(
                         "FZ_SPAN_END kind=Range3D cur={current_sheet} span={sheet_first}:{sheet_last} total_rows={} epoch={}",
-                        rows.len(),
+                        view.dims().0,
                         self.recalc_epoch
                     );
                 }
-                Ok(RangeView::from_owned_rows(rows, self.config.date_system))
+                Ok(view)
             }
         }
     }

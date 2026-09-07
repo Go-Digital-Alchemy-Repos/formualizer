@@ -161,6 +161,7 @@ mod omitted_arguments;
 mod open_ended_bounds_caps;
 mod open_rect_bounds;
 mod overlay_compaction;
+mod range3d_stateless_materialization;
 mod region_lock;
 mod spill_overlay_writeback;
 mod sumif_arrow_used_bounds;
