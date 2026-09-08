@@ -26859,13 +26859,37 @@ where
             prev_pass = None;
             let topo_pos = analysis.topo_positions();
             stale.sort_unstable_by_key(|&i| topo_pos[i]);
-            // FZ_EDGE_HASH: the stale re-eval order, hashed after its sort --
-            // the sequence lever 2's `analysis` reuse could corrupt.
-            if fz_edge_hash {
-                for &i in &stale {
-                    eh_stale_chain = fz_fnv1a64(eh_stale_chain, &(i as u32).to_le_bytes());
+            let direct_stale = stale.len();
+
+            // Reverse the current live DAG into compact CSR. The direct stale
+            // readers seed this pass. When a seed actually changes, its live
+            // readers become eligible later in the same dependency-first topo
+            // sweep; unchanged results stop propagation instead of eagerly
+            // evaluating every reachable reader. Edges recorded by these
+            // evaluations are not consulted until the next classification,
+            // so a branch flip that introduces a backwards edge or live cycle
+            // still takes the ordinary reclassify path.
+            let mut reader_offsets = vec![0usize; n + 1];
+            for outs in &out_edges {
+                for &to in outs {
+                    reader_offsets[to as usize + 1] += 1;
                 }
-                eh_stale_chain = fz_fnv1a64(eh_stale_chain, &(stale.len() as u64).to_le_bytes());
+            }
+            for i in 0..n {
+                reader_offsets[i + 1] += reader_offsets[i];
+            }
+            let mut reader_cursor = reader_offsets[..n].to_vec();
+            let mut readers = vec![0u32; reader_offsets[n]];
+            for (from, outs) in out_edges.iter().enumerate() {
+                for &to in outs {
+                    let cursor = &mut reader_cursor[to as usize];
+                    readers[*cursor] = from as u32;
+                    *cursor += 1;
+                }
+            }
+            let mut scheduled = vec![false; n];
+            for &i in &stale {
+                scheduled[i] = true;
             }
             for x in pos.iter_mut() {
                 *x = -1;
@@ -26874,15 +26898,51 @@ where
             passes += 1;
             settle_passes += 1;
             if fz_span_trace_enabled() {
+                // Keep this marker before member evaluation: the trace parser
+                // attributes following span reads to the preceding pass line.
                 eprintln!(
-                    "FZ_SPAN_PASS n={settle_passes} passes={passes} scc_len={} stale={}",
+                    "FZ_SPAN_PASS n={settle_passes} passes={passes} scc_len={} stale={direct_stale}",
                     cycle.len(),
-                    stale.len()
                 );
             }
-            for (p, i) in stale.into_iter().enumerate() {
+            let mut closure = Vec::with_capacity(direct_stale);
+            for &i_raw in &analysis.topo {
+                let i = i_raw as usize;
+                if excluded[i] || !scheduled[i] {
+                    continue;
+                }
                 run_member!(i, passes);
-                pos[i] = p as i64;
+                pos[i] = closure.len() as i64;
+                closure.push(i);
+                if !changed[i] {
+                    continue;
+                }
+                for &reader_raw in &readers[reader_offsets[i]..reader_offsets[i + 1]] {
+                    let reader = reader_raw as usize;
+                    if excluded[reader] {
+                        continue;
+                    }
+                    debug_assert!(
+                        topo_pos[i] < topo_pos[reader],
+                        "acyclic live dependency must precede its reader"
+                    );
+                    scheduled[reader] = true;
+                }
+            }
+            // FZ_EDGE_HASH: hash the actual transitive re-evaluation order,
+            // including readers admitted because an earlier closure member
+            // changed. This is the sequence analysis reuse could corrupt.
+            if fz_edge_hash {
+                for &i in &closure {
+                    eh_stale_chain = fz_fnv1a64(eh_stale_chain, &(i as u32).to_le_bytes());
+                }
+                eh_stale_chain = fz_fnv1a64(eh_stale_chain, &(closure.len() as u64).to_le_bytes());
+            }
+            if fz_span_trace_enabled() {
+                eprintln!(
+                    "FZ_SPAN_CLOSURE_END n={settle_passes} passes={passes} closure={}",
+                    closure.len(),
+                );
             }
         }
 

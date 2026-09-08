@@ -1516,3 +1516,108 @@ fn evaluate_all_logged_handles_runtime_cycles_directly() {
     assert!(is_circ(&engine, "Sheet1", 2, 2));
     assert_eq!(res.cycle_errors, 1);
 }
+
+/* ────────────── static 11-sheet span settle laws (GOD-259) ────────────── */
+
+/// The span and explicit-scalar formulas are equivalent, but only the span
+/// site participates in the static SCC. `guard=true` selects account literals;
+/// `guard=false` selects Sheet1!A12 and makes the static cycle live.
+fn build_eleven_sheet_static_span(guard: bool) -> Engine<TestWorkbook> {
+    let mut engine = runtime_engine();
+    for account in 1..=11 {
+        engine.add_sheet(&format!("Acct{account}")).unwrap();
+    }
+    set_value(&mut engine, "Sheet1", 1, 26, LiteralValue::Boolean(guard));
+    set_formula(&mut engine, "Sheet1", 1, 1, "=SUM(Acct1:Acct11!A1)");
+    for row in 2..=12 {
+        set_formula(&mut engine, "Sheet1", row, 1, &format!("=A{}+1", row - 1));
+    }
+    for account in 1..=11 {
+        set_formula(
+            &mut engine,
+            &format!("Acct{account}"),
+            1,
+            1,
+            &format!("=IF(Sheet1!$Z$1,{account},Sheet1!$A$12)"),
+        );
+    }
+    set_formula(
+        &mut engine,
+        "Sheet1",
+        1,
+        2,
+        "=SUM(Acct1!A1,Acct2!A1,Acct3!A1,Acct4!A1,Acct5!A1,Acct6!A1,Acct7!A1,Acct8!A1,Acct9!A1,Acct10!A1,Acct11!A1)",
+    );
+    engine
+}
+
+fn evaluate_static_span_with_report(
+    engine: &mut Engine<TestWorkbook>,
+    phase: &str,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    engine.evaluate_all().unwrap();
+    let elapsed = started.elapsed();
+    let telemetry = engine.last_cycle_telemetry();
+    let passes = telemetry.max_passes_single_scc;
+    let ms_per_pass = if passes == 0 {
+        0.0
+    } else {
+        elapsed.as_secs_f64() * 1_000.0 / passes as f64
+    };
+    eprintln!(
+        "TIER0_STATIC_SPAN phase={phase} passes={passes} elapsed_ms={:.6} ms_per_pass={ms_per_pass:.9}",
+        elapsed.as_secs_f64() * 1_000.0,
+    );
+    elapsed
+}
+
+#[test]
+fn static_span_sum_matches_explicit_scalar_sum() {
+    let mut engine = build_eleven_sheet_static_span(true);
+    evaluate_static_span_with_report(&mut engine, "guard_true");
+
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 66.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 66.0);
+    assert_eq!(num(&engine, "Sheet1", 12, 1), 77.0);
+    let telemetry = engine.last_cycle_telemetry();
+    assert_eq!(telemetry.static_sccs, 1);
+    assert_eq!(telemetry.phantom_sccs, 1);
+    assert_eq!(telemetry.live_cycles_witnessed, 0);
+    assert_eq!(telemetry.capped_sccs, 0);
+    // No pass-count threshold: a valid settle optimisation may reduce this to
+    // one pass while preserving the exact values above.
+}
+
+#[test]
+fn static_span_guard_flip_reveals_the_live_cycle() {
+    let mut engine = build_eleven_sheet_static_span(true);
+    evaluate_static_span_with_report(&mut engine, "guard_true_before_flip");
+
+    set_value(&mut engine, "Sheet1", 1, 26, LiteralValue::Boolean(false));
+    evaluate_static_span_with_report(&mut engine, "guard_false_after_flip");
+
+    assert!(is_circ(&engine, "Sheet1", 1, 1));
+    assert!(is_circ(&engine, "Sheet1", 12, 1));
+    for account in 1..=11 {
+        assert!(is_circ(&engine, &format!("Acct{account}"), 1, 1));
+    }
+    let telemetry = engine.last_cycle_telemetry();
+    assert_eq!(telemetry.live_cycles_witnessed, 1);
+    assert_eq!(telemetry.capped_sccs, 0);
+}
+
+/// Baseline-only control. Run this ignored test on the pinned pre-S1 source to
+/// bank proof that the fixture exercises repeated settling. It is deliberately
+/// excluded from normal candidate runs because a correct S1 optimisation may
+/// reduce the same fixture to one pass.
+#[test]
+#[ignore = "baseline control for pinned pre-S1 source only"]
+fn baseline_static_span_fixture_requires_multiple_passes() {
+    let mut engine = build_eleven_sheet_static_span(true);
+    evaluate_static_span_with_report(&mut engine, "baseline_control");
+    assert!(
+        engine.last_cycle_telemetry().max_passes_single_scc > 1,
+        "pinned baseline must demonstrate repeated settling"
+    );
+}
