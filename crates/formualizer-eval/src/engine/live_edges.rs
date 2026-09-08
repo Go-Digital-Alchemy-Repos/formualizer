@@ -96,6 +96,11 @@ struct CollectorState {
     /// to SCC members; this is required to prove the diagnostic edge universe.
     diagnostic_edges: FxHashMap<(u32, SheetId, u32, u32), DiagnosticRecordedEdge>,
     diagnostic_overflow: bool,
+    /// Members that evaluated a 3-D reference since the last drain. This is
+    /// populated only for the opt-in settle-edge diagnostic; it must not be
+    /// inferred from `EDGE_RANGE_EXPANSION`, which also labels ordinary
+    /// two-dimensional range reads.
+    three_dimensional_readers: FxHashSet<u32>,
     /// Selected non-IF lazy arms awaiting an actual read. These labels are
     /// diagnostic metadata only: declaring an arm must never create a live
     /// edge that evaluation did not observe.
@@ -161,6 +166,9 @@ pub struct LiveEdgeCollector {
     /// Full edge-universe capture is enabled only for an explicit diagnostic
     /// run, so ordinary cyclic evaluation retains its bounded SCC-only cost.
     diagnostic_enabled: bool,
+    /// Enables exact attribution of 3-D span readers for the bounded
+    /// `FZ_SETTLE_EDGE_TRACE` diagnostic.
+    settle_edge_trace_enabled: bool,
     /// Test-only: force the bounded-`Range3D` recording branch (GOD-246
     /// lever 1) on or off, so the shortcut and the engine-resolve path can be
     /// proved to record the same edges for the same span. `0` = as configured,
@@ -248,6 +256,20 @@ impl LiveEdgeCollector {
         names: &[String],
         diagnostic_enabled: bool,
     ) -> Self {
+        Self::new_with_names_and_diagnostics_and_settle_trace(
+            cells,
+            names,
+            diagnostic_enabled,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_names_and_diagnostics_and_settle_trace(
+        cells: &[CellRef],
+        names: &[String],
+        diagnostic_enabled: bool,
+        settle_edge_trace_enabled: bool,
+    ) -> Self {
         let members: Vec<MemberCell> = cells
             .iter()
             .map(|c| MemberCell {
@@ -275,6 +297,7 @@ impl LiveEdgeCollector {
             name_index,
             total_members,
             diagnostic_enabled,
+            settle_edge_trace_enabled,
             #[cfg(test)]
             range3d_shortcut_mode: std::sync::atomic::AtomicU8::new(0),
             replay_safe: AtomicBool::new(false),
@@ -563,6 +586,15 @@ impl LiveEdgeCollector {
         let overflow = std::mem::take(&mut state.diagnostic_overflow);
         (records, overflow)
     }
+
+    /// Drain the members that evaluated at least one 3-D reference since the
+    /// previous edge drain. The disabled path never locks or mutates state.
+    pub(crate) fn take_three_dimensional_readers(&self) -> FxHashSet<u32> {
+        if !self.settle_edge_trace_enabled {
+            return FxHashSet::default();
+        }
+        std::mem::take(&mut self.state.lock().unwrap().three_dimensional_readers)
+    }
 }
 
 pub(crate) struct ReplaySafeGuard<'a>(&'a LiveEdgeCollector);
@@ -684,6 +716,17 @@ impl<'a, R: EvaluationContext> RecordingContext<'a, R> {
     /// The label is diagnostic only -- staleness propagation uses the edge, not
     /// its mechanism -- so no behaviour depends on it.
     fn record_three_dimensional_members(&self, reference: &ReferenceType, current_sheet: &str) {
+        if self.collector.settle_edge_trace_enabled
+            && matches!(
+                reference,
+                ReferenceType::Cell3D { .. } | ReferenceType::Range3D { .. }
+            )
+        {
+            let mut state = self.collector.state.lock().unwrap();
+            if let Some(current) = state.current {
+                state.three_dimensional_readers.insert(current);
+            }
+        }
         match reference {
             ReferenceType::Cell3D {
                 sheet_first,

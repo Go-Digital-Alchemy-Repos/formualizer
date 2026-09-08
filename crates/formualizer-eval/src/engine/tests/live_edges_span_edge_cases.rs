@@ -358,3 +358,43 @@ fn range3d_unbounded_axes_still_agree_between_branches() {
         vec![1, 2, 3, 4]
     );
 }
+
+#[test]
+fn settle_trace_span_reader_marker_is_opt_in_and_drains_once() {
+    let (engine, members) = fixture();
+    let enabled = LiveEdgeCollector::new_with_names_and_diagnostics_and_settle_trace(
+        &members,
+        &[],
+        false,
+        true,
+    );
+    let _ = eval_as_member(
+        &engine,
+        &enabled,
+        0,
+        "Sheet1",
+        members[0],
+        "=SUM(Acct1:Acct3!B1)",
+    );
+    let readers = enabled.take_three_dimensional_readers();
+    assert_eq!(readers.len(), 1);
+    assert!(readers.contains(&0));
+    assert!(
+        enabled.take_three_dimensional_readers().is_empty(),
+        "the reader generation drains with the pass recordings"
+    );
+
+    let disabled = LiveEdgeCollector::new(&members);
+    let _ = eval_as_member(
+        &engine,
+        &disabled,
+        0,
+        "Sheet1",
+        members[0],
+        "=SUM(Acct1:Acct3!B1)",
+    );
+    assert!(
+        disabled.take_three_dimensional_readers().is_empty(),
+        "the disabled diagnostic must not retain reader state"
+    );
+}

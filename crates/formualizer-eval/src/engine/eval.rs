@@ -84,6 +84,7 @@ use formualizer_parse::{ASTNode, ASTNodeType, ExcelError, ExcelErrorKind};
 use rayon::ThreadPoolBuilder;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -958,6 +959,24 @@ pub(crate) fn fz_edge_hash_enabled() -> bool {
     })
 }
 
+/// `FZ_SETTLE_EDGE_TRACE=1` diagnostic (GOD-259): attribute each acyclic
+/// settle decision to the exact retained edge generation and strict value
+/// comparison that made its target changed. Output contains member indices,
+/// type tags, counts, and deterministic opaque fingerprints only; it never
+/// contains sheet names, cell addresses, formulas, or literal values.
+pub(crate) fn fz_settle_edge_trace_enabled() -> bool {
+    static FZ_SETTLE_EDGE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FZ_SETTLE_EDGE_TRACE.get_or_init(|| {
+        !matches!(
+            std::env::var("FZ_SETTLE_EDGE_TRACE").as_deref(),
+            Err(_) | Ok("") | Ok("0")
+        )
+    })
+}
+
+const FZ_SETTLE_TRACE_CAUSAL_DETAILS_PER_PASS: usize = 128;
+const FZ_SETTLE_TRACE_CAUSAL_DETAILS_PER_SCC: usize = 1_024;
+
 /// FNV-1a 64 offset basis.
 pub(crate) const FZ_FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -974,6 +993,219 @@ pub(crate) fn fz_fnv1a64(mut h: u64, bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+struct FzTraceHasher(u64);
+
+impl Hasher for FzTraceHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = fz_fnv1a64(self.0, bytes);
+    }
+}
+
+fn fz_literal_value_fingerprint(value: &LiteralValue) -> u64 {
+    let mut hasher = FzTraceHasher(FZ_FNV64_OFFSET);
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn fz_literal_value_type(value: &LiteralValue) -> &'static str {
+    match value {
+        LiteralValue::Int(_) => "int",
+        LiteralValue::Number(_) => "number",
+        LiteralValue::Text(_) => "text",
+        LiteralValue::Boolean(_) => "boolean",
+        LiteralValue::Array(_) => "array",
+        LiteralValue::Date(_) => "date",
+        LiteralValue::DateTime(_) => "datetime",
+        LiteralValue::Time(_) => "time",
+        LiteralValue::Duration(_) => "duration",
+        LiteralValue::Empty => "empty",
+        LiteralValue::Pending => "pending",
+        LiteralValue::Error(_) => "error",
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SettleValueEvidence {
+    comparison_pass: usize,
+    before_type: &'static str,
+    after_type: &'static str,
+    before_fingerprint: u64,
+    after_fingerprint: u64,
+    strict_neq: bool,
+    before_nan: bool,
+    after_nan: bool,
+}
+
+impl SettleValueEvidence {
+    fn capture(
+        before: &LiteralValue,
+        after: &LiteralValue,
+        strict_neq: bool,
+        comparison_pass: usize,
+    ) -> Self {
+        Self {
+            comparison_pass,
+            before_type: fz_literal_value_type(before),
+            after_type: fz_literal_value_type(after),
+            before_fingerprint: fz_literal_value_fingerprint(before),
+            after_fingerprint: fz_literal_value_fingerprint(after),
+            strict_neq,
+            before_nan: matches!(before, LiteralValue::Number(value) if value.is_nan()),
+            after_nan: matches!(after, LiteralValue::Number(value) if value.is_nan()),
+        }
+    }
+
+    fn comparison(self) -> &'static str {
+        if !self.strict_neq {
+            "equal"
+        } else if (self.before_nan || self.after_nan)
+            && self.before_type == self.after_type
+            && self.before_fingerprint == self.after_fingerprint
+        {
+            "nan_non_reflexive"
+        } else if self.before_type != self.after_type {
+            "type_changed"
+        } else if self.before_fingerprint != self.after_fingerprint {
+            "fingerprint_changed"
+        } else {
+            "strict_neq_same_fingerprint"
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SettleClassificationCounts {
+    nan_nonreflexive: usize,
+    numeric_changed: usize,
+    nonnumeric_changed: usize,
+    type_changed: usize,
+    strict_neq_same_fingerprint: usize,
+    unexpected_equal: usize,
+}
+
+impl SettleClassificationCounts {
+    fn record(&mut self, evidence: SettleValueEvidence) {
+        match evidence.comparison() {
+            "nan_non_reflexive" => self.nan_nonreflexive += 1,
+            "type_changed" => self.type_changed += 1,
+            "fingerprint_changed"
+                if matches!(evidence.before_type, "int" | "number")
+                    && matches!(evidence.after_type, "int" | "number") =>
+            {
+                self.numeric_changed += 1;
+            }
+            "fingerprint_changed" => self.nonnumeric_changed += 1,
+            "strict_neq_same_fingerprint" => self.strict_neq_same_fingerprint += 1,
+            "equal" => self.unexpected_equal += 1,
+            _ => unreachable!("SettleValueEvidence::comparison returns a closed set"),
+        }
+    }
+}
+
+fn fz_compress_member_ranges(sorted_members: &[u32]) -> String {
+    let mut encoded = String::new();
+    let Some((&first, rest)) = sorted_members.split_first() else {
+        return encoded;
+    };
+    let mut start = first;
+    let mut end = first;
+    let mut write_range = |start: u32, end: u32| {
+        use std::fmt::Write;
+        if !encoded.is_empty() {
+            encoded.push(',');
+        }
+        if start == end {
+            write!(encoded, "{start}").expect("writing to String cannot fail");
+        } else {
+            write!(encoded, "{start}-{end}").expect("writing to String cannot fail");
+        }
+    };
+    for &member in rest {
+        if member == end.saturating_add(1) {
+            end = member;
+        } else {
+            write_range(start, end);
+            start = member;
+            end = member;
+        }
+    }
+    write_range(start, end);
+    encoded
+}
+
+#[cfg(test)]
+mod settle_value_evidence_tests {
+    use super::{
+        LiteralValue, SettleClassificationCounts, SettleValueEvidence, fz_compress_member_ranges,
+    };
+
+    #[test]
+    fn trace_evidence_classifies_nan_signed_zero_and_type_changes() {
+        let nan = LiteralValue::Number(f64::NAN);
+        let nan_evidence = SettleValueEvidence::capture(&nan, &nan, nan != nan, 7);
+        assert_eq!(nan_evidence.comparison(), "nan_non_reflexive");
+        assert_eq!(nan_evidence.comparison_pass, 7);
+        assert_eq!(
+            nan_evidence.before_fingerprint,
+            nan_evidence.after_fingerprint
+        );
+
+        let negative_zero = LiteralValue::Number(-0.0);
+        let positive_zero = LiteralValue::Number(0.0);
+        let zero_evidence = SettleValueEvidence::capture(
+            &negative_zero,
+            &positive_zero,
+            negative_zero != positive_zero,
+            8,
+        );
+        assert_eq!(zero_evidence.comparison(), "equal");
+        assert_ne!(
+            zero_evidence.before_fingerprint,
+            zero_evidence.after_fingerprint
+        );
+
+        let int = LiteralValue::Int(1);
+        let number = LiteralValue::Number(1.0);
+        let type_evidence = SettleValueEvidence::capture(&int, &number, int != number, 9);
+        assert_eq!(type_evidence.comparison(), "type_changed");
+        assert_eq!(type_evidence.before_type, "int");
+        assert_eq!(type_evidence.after_type, "number");
+    }
+
+    #[test]
+    fn trace_encoder_and_counts_cover_every_causal_target() {
+        assert_eq!(fz_compress_member_ranges(&[]), "");
+        assert_eq!(
+            fz_compress_member_ranges(&[2, 3, 4, 9, 11, 12]),
+            "2-4,9,11-12"
+        );
+
+        let mut counts = SettleClassificationCounts::default();
+        let before_number = LiteralValue::Number(1.0);
+        let after_number = LiteralValue::Number(2.0);
+        counts.record(SettleValueEvidence::capture(
+            &before_number,
+            &after_number,
+            before_number != after_number,
+            1,
+        ));
+        let before_text = LiteralValue::Text("a".to_string());
+        let after_text = LiteralValue::Text("b".to_string());
+        counts.record(SettleValueEvidence::capture(
+            &before_text,
+            &after_text,
+            before_text != after_text,
+            1,
+        ));
+        assert_eq!(counts.numeric_changed, 1);
+        assert_eq!(counts.nonnumeric_changed, 1);
+    }
 }
 
 /// One `FZ_EDGE_HASH` summary line's worth of data (one per SCC evaluation).
@@ -25617,6 +25849,7 @@ where
                 })
             })
             .collect();
+        let fz_settle_edge_trace = fz_settle_edge_trace_enabled();
         // FZ_EDGE_HASH (GOD-246): per-pass live-edge hash receipt.  One
         // `OnceLock` load per SCC evaluation when the variable is unset; every
         // site below is behind `fz_edge_hash`, so the off path does no
@@ -25641,7 +25874,7 @@ where
         // pass's `edges` (moved, never cloned) beside its analysis.
         let live_graph_memo_enabled = !live_graph_memo_disabled();
         let mut live_graph_memo: Option<(Vec<(u32, u32)>, LiveGraphAnalysis)> = None;
-        if fz_edge_hash {
+        if fz_edge_hash || fz_settle_edge_trace {
             // The canonical member basis the `(from, to)` indices are relative
             // to: the A1 addresses in the order §7.13 sorted them, plus the
             // member count and the recordable prefix length.
@@ -25653,6 +25886,18 @@ where
             h = fz_fnv1a64(h, &(n as u64).to_le_bytes());
             h = fz_fnv1a64(h, &(recordable as u64).to_le_bytes());
             eh_member_basis = h;
+        }
+        let mut settle_edge_recorded_pass = fz_settle_edge_trace.then(|| vec![0usize; n]);
+        let mut settle_span_readers = fz_settle_edge_trace.then(|| vec![false; n]);
+        let mut settle_member_evals = fz_settle_edge_trace.then(|| vec![0usize; n]);
+        let mut settle_value_evidence =
+            fz_settle_edge_trace.then(|| vec![None::<SettleValueEvidence>; n]);
+        let mut settle_causal_details_emitted = 0usize;
+        let mut settle_causal_details_dropped = 0usize;
+        if fz_settle_edge_trace {
+            eprintln!(
+                "FZ_SETTLE_EDGE_TRACE_SCC member_basis={eh_member_basis:016x} members={n} recordable={recordable}"
+            );
         }
         let instrumentation_matches: Vec<Option<usize>> = self
             .cycle_instrumentation
@@ -25806,10 +26051,11 @@ where
             }
         }
 
-        let collector = LiveEdgeCollector::new_with_names_and_diagnostics(
+        let collector = LiveEdgeCollector::new_with_names_and_diagnostics_and_settle_trace(
             &cell_refs,
             &name_keys,
             diagnostic_enabled,
+            fz_settle_edge_trace,
         );
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
@@ -25832,9 +26078,12 @@ where
         // Evaluate-and-commit one member; returns Ok(true) when the member was
         // stamped `#CIRC!` (array result — would-be spill anchor, spec §7.9).
         macro_rules! run_member {
-            ($i:expr) => {{
+            ($i:expr, $trace_pass:expr) => {{
                 let i: usize = $i;
                 let m = &members[i];
+                if let Some(counts) = settle_member_evals.as_mut() {
+                    counts[i] = counts[i].saturating_add(1);
+                }
                 if i < recordable {
                     collector.set_current(i as u32);
                 }
@@ -25855,6 +26104,14 @@ where
                     excluded[i] = true;
                     stamped += 1;
                     changed[i] = last_value[i] != circ_error;
+                    if let Some(evidence) = settle_value_evidence.as_mut() {
+                        evidence[i] = Some(SettleValueEvidence::capture(
+                            &last_value[i],
+                            &circ_error,
+                            changed[i],
+                            $trace_pass,
+                        ));
+                    }
                     last_value[i] = circ_error.clone();
                 } else {
                     self.graph.update_vertex_value(m.vertex, value.clone());
@@ -25878,6 +26135,14 @@ where
                         );
                     }
                     changed[i] = last_value[i] != value;
+                    if let Some(evidence) = settle_value_evidence.as_mut() {
+                        evidence[i] = Some(SettleValueEvidence::capture(
+                            &last_value[i],
+                            &value,
+                            changed[i],
+                            $trace_pass,
+                        ));
+                    }
                     last_value[i] = value;
                 }
             }};
@@ -25902,7 +26167,7 @@ where
                 if excluded[i] {
                     continue;
                 }
-                run_member!(i);
+                run_member!(i, passes);
                 pos[i] = p;
                 p += 1;
             }
@@ -25947,6 +26212,7 @@ where
             // out-edge set, members that didn't keep last-known edges.
             let mut drained = collector.take_edge_records();
             drained.sort_unstable_by_key(|record| (record.from, record.to));
+            let three_dimensional_readers = collector.take_three_dimensional_readers();
             let (diagnostic_drained, diagnostic_overflow) =
                 collector.take_diagnostic_edge_records();
             if diagnostic_overflow {
@@ -25957,10 +26223,21 @@ where
             for i in 0..n {
                 if pos[i] >= 0 {
                     out_edges[i].clear();
+                    if let Some(recorded_pass) = settle_edge_recorded_pass.as_mut() {
+                        recorded_pass[i] = passes;
+                    }
+                    if let Some(span_readers) = settle_span_readers.as_mut() {
+                        span_readers[i] = false;
+                    }
                     if let Some(records) = out_edge_records.as_mut() {
                         records[i].clear();
                     }
                     diagnostic_edge_records[i].clear();
+                }
+            }
+            if let Some(span_readers) = settle_span_readers.as_mut() {
+                for reader in three_dimensional_readers {
+                    span_readers[reader as usize] = true;
                 }
             }
             for record in &drained {
@@ -26268,7 +26545,7 @@ where
                         if !order.is_empty() {
                             passes += 1;
                             for i in order {
-                                run_member!(i);
+                                run_member!(i, passes);
                                 pos[i] = position;
                                 position += 1;
                             }
@@ -26363,7 +26640,7 @@ where
                             if excluded[i] {
                                 continue;
                             }
-                            run_member!(i);
+                            run_member!(i, passes);
                             pos[i] = p;
                             p += 1;
                         }
@@ -26386,6 +26663,174 @@ where
                 if is_stale {
                     stale.push(i);
                 }
+            }
+            if fz_settle_edge_trace {
+                let recorded_pass = settle_edge_recorded_pass
+                    .as_ref()
+                    .expect("settle trace pass generations are enabled");
+                let span_readers = settle_span_readers
+                    .as_ref()
+                    .expect("settle trace span readers are enabled");
+                let member_evals = settle_member_evals
+                    .as_ref()
+                    .expect("settle trace evaluation counters are enabled");
+                let evidence = settle_value_evidence
+                    .as_ref()
+                    .expect("settle trace value evidence is enabled");
+                let span_reader_count = span_readers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, is_span_reader)| **is_span_reader && !excluded[*i])
+                    .count();
+                let total_remaining = FZ_SETTLE_TRACE_CAUSAL_DETAILS_PER_SCC
+                    .saturating_sub(settle_causal_details_emitted);
+                let mut detail_remaining =
+                    FZ_SETTLE_TRACE_CAUSAL_DETAILS_PER_PASS.min(total_remaining);
+                let mut pass_causal_edges = 0usize;
+                let mut pass_causal_hash = FZ_FNV64_OFFSET;
+                let mut pass_details_emitted = 0usize;
+                let mut other_sources = 0usize;
+                let mut other_edges = 0usize;
+                let mut other_stale_edges = 0usize;
+                for from in 0..n {
+                    if excluded[from] {
+                        continue;
+                    }
+                    if !span_readers[from] {
+                        other_sources += 1;
+                        other_edges += out_edges[from].len();
+                        other_stale_edges += out_edges[from]
+                            .iter()
+                            .filter(|&&to| {
+                                let to = to as usize;
+                                changed[to]
+                                    && (pos[from] < 0 || (pos[to] >= 0 && pos[from] < pos[to]))
+                            })
+                            .count();
+                        continue;
+                    }
+                    let mut causal_edges = 0usize;
+                    let mut causal_hash = FZ_FNV64_OFFSET;
+                    let mut nonstale_edges = 0usize;
+                    let mut nonstale_hash = FZ_FNV64_OFFSET;
+                    let mut source_details_emitted = 0usize;
+                    let mut causal_targets = Vec::new();
+                    let mut classifications = SettleClassificationCounts::default();
+                    let mut evidence_current = 0usize;
+                    let mut evidence_stale = 0usize;
+                    let mut evidence_missing = 0usize;
+                    for &to_raw in &out_edges[from] {
+                        let to = to_raw as usize;
+                        let is_stale =
+                            changed[to] && (pos[from] < 0 || (pos[to] >= 0 && pos[from] < pos[to]));
+                        if !is_stale {
+                            nonstale_edges += 1;
+                            nonstale_hash = fz_fnv1a64(nonstale_hash, &to_raw.to_le_bytes());
+                            nonstale_hash = fz_fnv1a64(
+                                nonstale_hash,
+                                &(recorded_pass[from] as u64).to_le_bytes(),
+                            );
+                            continue;
+                        }
+                        causal_edges += 1;
+                        pass_causal_edges += 1;
+                        causal_targets.push(to_raw);
+                        causal_hash = fz_fnv1a64(causal_hash, &to_raw.to_le_bytes());
+                        causal_hash =
+                            fz_fnv1a64(causal_hash, &(recorded_pass[from] as u64).to_le_bytes());
+                        match evidence[to] {
+                            Some(value) => {
+                                classifications.record(value);
+                                if value.comparison_pass == passes {
+                                    evidence_current += 1;
+                                } else {
+                                    evidence_stale += 1;
+                                }
+                                causal_hash = fz_fnv1a64(
+                                    causal_hash,
+                                    &(value.comparison_pass as u64).to_le_bytes(),
+                                );
+                                causal_hash = fz_fnv1a64(
+                                    causal_hash,
+                                    &value.before_fingerprint.to_le_bytes(),
+                                );
+                                causal_hash =
+                                    fz_fnv1a64(causal_hash, &value.after_fingerprint.to_le_bytes());
+                                causal_hash = fz_fnv1a64(causal_hash, value.before_type.as_bytes());
+                                causal_hash = fz_fnv1a64(causal_hash, &[0xff]);
+                                causal_hash = fz_fnv1a64(causal_hash, value.after_type.as_bytes());
+                                causal_hash = fz_fnv1a64(
+                                    causal_hash,
+                                    &[
+                                        value.strict_neq as u8,
+                                        value.before_nan as u8,
+                                        value.after_nan as u8,
+                                    ],
+                                );
+                                if detail_remaining > 0 {
+                                    detail_remaining -= 1;
+                                    source_details_emitted += 1;
+                                    pass_details_emitted += 1;
+                                    settle_causal_details_emitted += 1;
+                                    eprintln!(
+                                        "FZ_SETTLE_EDGE_TRACE_CAUSAL member_basis={eh_member_basis:016x} pass={passes} from={from} to={to} edge_recorded_pass={} pos_from={} pos_to={} changed_to={} value_evidence_pass={} value_evidence_current={} before_type={} after_type={} before_hash={:016x} after_hash={:016x} strict_neq={} before_nan={} after_nan={} comparison={}",
+                                        recorded_pass[from],
+                                        pos[from],
+                                        pos[to],
+                                        changed[to],
+                                        value.comparison_pass,
+                                        value.comparison_pass == passes,
+                                        value.before_type,
+                                        value.after_type,
+                                        value.before_fingerprint,
+                                        value.after_fingerprint,
+                                        value.strict_neq,
+                                        value.before_nan,
+                                        value.after_nan,
+                                        value.comparison(),
+                                    );
+                                }
+                            }
+                            None => {
+                                evidence_missing += 1;
+                                causal_hash = fz_fnv1a64(causal_hash, b"missing-evidence");
+                                if detail_remaining > 0 {
+                                    detail_remaining -= 1;
+                                    source_details_emitted += 1;
+                                    pass_details_emitted += 1;
+                                    settle_causal_details_emitted += 1;
+                                    eprintln!(
+                                        "FZ_SETTLE_EDGE_TRACE_CAUSAL member_basis={eh_member_basis:016x} pass={passes} from={from} to={to} edge_recorded_pass={} pos_from={} pos_to={} changed_to={} value_evidence_pass=none value_evidence_current=false comparison=missing",
+                                        recorded_pass[from], pos[from], pos[to], changed[to],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    pass_causal_hash = fz_fnv1a64(pass_causal_hash, &(from as u32).to_le_bytes());
+                    pass_causal_hash = fz_fnv1a64(pass_causal_hash, &causal_hash.to_le_bytes());
+                    let source_details_dropped = causal_edges - source_details_emitted;
+                    let causal_targets = fz_compress_member_ranges(&causal_targets);
+                    eprintln!(
+                        "FZ_SETTLE_EDGE_TRACE_READER member_basis={eh_member_basis:016x} pass={passes} member={from} edge_recorded_pass={} eval_count={} scc_passes={passes} edges={} causal_edges={causal_edges} causal_targets={causal_targets} causal_hash={causal_hash:016x} evidence_current={evidence_current} evidence_stale={evidence_stale} evidence_missing={evidence_missing} nan_nonreflexive={} numeric_changed={} nonnumeric_changed={} type_changed={} strict_neq_same_fingerprint={} unexpected_equal={} causal_details={source_details_emitted} causal_dropped={source_details_dropped} nonstale_edges={nonstale_edges} nonstale_hash={nonstale_hash:016x}",
+                        recorded_pass[from],
+                        member_evals[from],
+                        out_edges[from].len(),
+                        classifications.nan_nonreflexive,
+                        classifications.numeric_changed,
+                        classifications.nonnumeric_changed,
+                        classifications.type_changed,
+                        classifications.strict_neq_same_fingerprint,
+                        classifications.unexpected_equal,
+                    );
+                }
+                let pass_details_dropped = pass_causal_edges - pass_details_emitted;
+                settle_causal_details_dropped =
+                    settle_causal_details_dropped.saturating_add(pass_details_dropped);
+                eprintln!(
+                    "FZ_SETTLE_EDGE_TRACE_PASS member_basis={eh_member_basis:016x} pass={passes} settle_passes={settle_passes} members={n} stale_readers={} span_readers={span_reader_count} span_causal_edges={pass_causal_edges} span_causal_hash={pass_causal_hash:016x} causal_details={pass_details_emitted} causal_dropped={pass_details_dropped} other_sources={other_sources} other_edges={other_edges} other_stale_edges={other_stale_edges}",
+                    stale.len(),
+                );
             }
             if stale.is_empty() {
                 break; // values exact — phantom SCC (or dissolved live cycle)
@@ -26436,7 +26881,7 @@ where
                 );
             }
             for (p, i) in stale.into_iter().enumerate() {
-                run_member!(i);
+                run_member!(i, passes);
                 pos[i] = p as i64;
             }
         }
@@ -26497,6 +26942,13 @@ where
                 t.capped_sccs += 1;
             }
             t.elapsed_ms += task_start.elapsed().as_millis();
+        }
+
+        if fz_settle_edge_trace {
+            eprintln!(
+                "FZ_SETTLE_EDGE_TRACE_END member_basis={eh_member_basis:016x} passes={passes} causal_details={} causal_dropped={} detail_limit={FZ_SETTLE_TRACE_CAUSAL_DETAILS_PER_SCC}",
+                settle_causal_details_emitted, settle_causal_details_dropped,
+            );
         }
 
         if fz_edge_hash {
