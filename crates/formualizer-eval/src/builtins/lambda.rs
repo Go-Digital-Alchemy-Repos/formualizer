@@ -199,6 +199,15 @@ impl CustomCallable for LambdaClosure {
         interp: &crate::interpreter::Interpreter<'ctx>,
         args: &[LiteralValue],
     ) -> Result<CalcValue<'ctx>, ExcelError> {
+        self.invoke_with_references(interp, args, &[])
+    }
+
+    fn invoke_with_references<'ctx>(
+        &self,
+        interp: &crate::interpreter::Interpreter<'ctx>,
+        args: &[LiteralValue],
+        references: &[Option<ReferenceType>],
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
         if args.len() != self.arity() {
             return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
                 format!(
@@ -210,8 +219,18 @@ impl CustomCallable for LambdaClosure {
         }
 
         let mut env = self.captured_env.clone();
-        for (name, value) in self.params.iter().zip(args.iter()) {
-            env = env.with_binding(name, LocalBinding::Value(value.clone()));
+        for (idx, (name, value)) in self.params.iter().zip(args.iter()).enumerate() {
+            // A parameter written as a range keeps that range beside the value
+            // the caller already materialized, so a by-ref slot in the body
+            // sees the range rather than the lifted array (CL-085).
+            let binding = match references.get(idx).and_then(Option::as_ref) {
+                Some(reference) => LocalBinding::ValueWithReference {
+                    value: value.clone(),
+                    reference: reference.clone(),
+                },
+                None => LocalBinding::Value(value.clone()),
+            };
+            env = env.with_binding(name, binding);
         }
 
         let scoped = interp.with_local_env(env);

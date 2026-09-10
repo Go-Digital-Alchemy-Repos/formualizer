@@ -1,5 +1,6 @@
 use crate::engine::named_range::{NameScope, NamedDefinition};
 use crate::engine::{Engine, EvalConfig};
+use crate::reference::{CellRef, Coord, RangeRef};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::{ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::parse;
@@ -308,8 +309,7 @@ fn let_range_binding_shadows_workbook_name_engine() {
 
 /// Evaluate `formula` in C1 over the CL-085 reproduction grid
 /// (A1:A3 = 1,2,3 and B1:B3 = 10,20,30; all invented data).
-fn cl085_eval(formula: &str) -> LiteralValue {
-    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+fn cl085_fill_grid(engine: &mut Engine<TestWorkbook>) {
     for (row, a, b) in [(1u32, 1.0, 10.0), (2, 2.0, 20.0), (3, 3.0, 30.0)] {
         engine
             .set_cell_value("Sheet1", row, 1, LiteralValue::Number(a))
@@ -318,6 +318,11 @@ fn cl085_eval(formula: &str) -> LiteralValue {
             .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
             .unwrap();
     }
+}
+
+fn cl085_eval(formula: &str) -> LiteralValue {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    cl085_fill_grid(&mut engine);
     engine
         .set_cell_formula("Sheet1", 1, 3, parse(formula).unwrap())
         .unwrap();
@@ -483,14 +488,21 @@ fn let_range_local_wins_over_a_hidden_xlpm_workbook_name_of_the_same_spelling() 
             NameScope::Workbook,
         )
         .unwrap();
-    for (row, a, b) in [(1u32, 1.0, 10.0), (2, 2.0, 20.0), (3, 3.0, 30.0)] {
-        engine
-            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(a))
-            .unwrap();
-        engine
-            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
-            .unwrap();
-    }
+    cl085_fill_grid(&mut engine);
+    // A plain-spelled workbook name colliding with the local's spelling, over
+    // the other column, so taking the workbook route would answer 1 (B1 = 10
+    // is not 2 either, so it would in fact be #N/A) rather than the local's 2.
+    let sid = engine.sheet_id("Sheet1").unwrap();
+    engine
+        .define_name(
+            "r",
+            NamedDefinition::Range(RangeRef::new(
+                CellRef::new(sid, Coord::from_excel(1, 2, true, true)),
+                CellRef::new(sid, Coord::from_excel(3, 2, true, true)),
+            )),
+            NameScope::Workbook,
+        )
+        .unwrap();
     engine
         .set_cell_formula("Sheet1", 1, 3, parse("=LET(r,A1:A3,MATCH(2,r,0))").unwrap())
         .unwrap();
@@ -500,4 +512,84 @@ fn let_range_local_wins_over_a_hidden_xlpm_workbook_name_of_the_same_spelling() 
         cl085_number(engine.get_cell_value("Sheet1", 1, 3).unwrap()),
         2.0
     );
+}
+
+/// Assert `formula` evaluates to an error of `kind` over the CL-085 grid.
+fn cl085_assert_error_kind(formula: &str, kind: ExcelErrorKind) {
+    match cl085_eval(formula) {
+        LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{formula}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+#[test]
+fn offset_over_a_lambda_range_parameter_uses_the_passed_range_as_its_base() {
+    // A LAMBDA parameter, not just a LET binding: OFFSET needs a real
+    // reference, so the passed range must survive the call boundary.
+    cl085_assert_number("=LET(f,LAMBDA(v,SUM(OFFSET(v,1,0,2,1))),f(A1:A3))", 5.0);
+}
+
+#[test]
+fn columns_over_let_range_local_counts_the_bound_range() {
+    cl085_assert_number("=LET(r,A1:B1,COLUMNS(r))", 2.0);
+}
+
+#[test]
+fn single_cell_offset_over_let_range_local_selects_the_bound_range_cell() {
+    cl085_assert_number("=LET(r,A1:A3,OFFSET(r,1,0,1,1))", 2.0);
+}
+
+#[test]
+fn let_local_bound_to_a_workbook_range_name_matches_inside_that_range() {
+    // The bound expression is itself a workbook-scope name, so the local
+    // carries a name-shaped reference rather than a literal A1 range.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    cl085_fill_grid(&mut engine);
+    let sid = engine.sheet_id("Sheet1").unwrap();
+    engine
+        .define_name(
+            "Readings",
+            NamedDefinition::Range(RangeRef::new(
+                CellRef::new(sid, Coord::from_excel(1, 1, true, true)),
+                CellRef::new(sid, Coord::from_excel(3, 1, true, true)),
+            )),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            3,
+            parse("=LET(x,Readings,MATCH(2,x,0))").unwrap(),
+        )
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        cl085_number(engine.get_cell_value("Sheet1", 1, 3).unwrap()),
+        2.0
+    );
+}
+
+#[test]
+fn offset_over_a_let_value_local_reports_a_reference_error() {
+    // Excel's answer here is #VALUE!, not #REF!. This pins the engine's
+    // ACTUAL kind so the divergence is visible; the kind mismatch is a filed
+    // open question, not a claim that #REF! is correct.
+    cl085_assert_error_kind("=LET(x,5,OFFSET(x,0,0))", ExcelErrorKind::Ref);
+}
+
+#[test]
+fn row_over_a_let_value_local_reports_a_reference_error() {
+    // Excel's answer here is #VALUE!, not #REF!; see the note above. The kind
+    // divergence is a filed open question, not a correctness claim.
+    cl085_assert_error_kind("=LET(x,5,ROW(x))", ExcelErrorKind::Ref);
+}
+
+#[test]
+fn column_over_a_let_value_local_reports_a_reference_error() {
+    // Excel's answer here is #VALUE!, not #REF!; see the note above. The kind
+    // divergence is a filed open question, not a correctness claim.
+    cl085_assert_error_kind("=LET(x,5,COLUMN(x))", ExcelErrorKind::Ref);
 }

@@ -102,6 +102,29 @@ pub trait CustomCallable: Send + Sync {
         interp: &Interpreter<'ctx>,
         args: &[LiteralValue],
     ) -> Result<CalcValue<'ctx>, ExcelError>;
+
+    /// Invoke with each argument's optional bound reference alongside the
+    /// already-materialized values (CL-085).
+    ///
+    /// `references[i]` is the spreadsheet reference argument `i` was written
+    /// as, when it was written as one; `None` otherwise, and a short slice is
+    /// read as `None` for every missing position. A callable that binds its
+    /// arguments to locals uses this to bind a range-valued parameter as
+    /// [`crate::interpreter::LocalBinding::ValueWithReference`], so a by-ref
+    /// argument slot inside the body sees the range rather than a lifted
+    /// array.
+    ///
+    /// Defaults to [`Self::invoke`], so an implementor that does not care
+    /// about references needs no change.
+    fn invoke_with_references<'ctx>(
+        &self,
+        interp: &Interpreter<'ctx>,
+        args: &[LiteralValue],
+        references: &[Option<ReferenceType>],
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
+        let _ = references;
+        self.invoke(interp, args)
+    }
 }
 
 #[derive(Clone)]
@@ -362,6 +385,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     pub(crate) fn with_scalar_value(&self, value: LiteralValue) -> Self {
         let mut handle = self.duplicate();
         handle.value_override = Some(crate::traits::CalcValue::Scalar(value));
+        handle.cached_ref = std::cell::OnceCell::new();
         handle.cached_reference_or_value = std::cell::OnceCell::new();
         handle.cached_resolved = std::cell::OnceCell::new();
         handle.cached_value = std::cell::OnceCell::new();
@@ -795,7 +819,21 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// existing value fallback runs instead of the workbook-name route (which
     /// would report the local's spelling as an undefined name); `None` when the
     /// name is not locally bound and the workbook-name route is correct.
+    ///
+    /// The asymmetry with the other reference predicates is deliberate and
+    /// load-bearing. `as_reference_or_eval`, `as_reference` and
+    /// `reference_for_eval` report a range-bound local as a reference (that is
+    /// CL-085), while [`Self::may_return_reference`] and
+    /// [`Self::reference_attempt`] keep reporting every local as a
+    /// non-reference. That second half is the CL-053 guard: it is what keeps a
+    /// bare LET local in `OR`/`AND` on the value path, where a boolean local
+    /// must stay a boolean. Do not "unify" the two halves.
     fn local_named_reference(&self, name: &str) -> Option<Result<ReferenceType, ExcelError>> {
+        // `None` here sends the name down the ordinary workbook-name route.
+        // Open question for a later round: a local bound to a *literal-valued*
+        // workbook defined name currently yields `Some(Err(#REF!))` from the
+        // arm below rather than the literal's own by-ref behaviour; only the
+        // range-valued defined-name case is pinned by tests today.
         self.interp.resolve_local_name(name)?;
         Some(
             self.interp
@@ -1512,6 +1550,13 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// Returns the raw reference from the AST when this argument is a reference.
     /// This does not evaluate the reference or materialize values.
     pub fn as_reference(&self) -> Result<&ReferenceType, ExcelError> {
+        // An array-lifted handle carries a scalar override, not the syntax's
+        // own reference, so it must never report one — the same guard
+        // `may_return_reference` and `reference_attempt` already apply.
+        if self.value_override.is_some() {
+            return Err(ExcelError::new(ExcelErrorKind::Ref)
+                .with_message("Expected a reference (by-ref argument)"));
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {
