@@ -159,6 +159,15 @@ fn array_lifted_argument_positions(name: &str, args_len: usize) -> Option<Vec<us
 #[derive(Clone)]
 pub enum LocalBinding {
     Value(LiteralValue),
+    /// A local bound to a spreadsheet reference expression.
+    ///
+    /// `value` is exactly what [`LocalBinding::Value`] would have carried, so the
+    /// value path is unchanged; `reference` additionally lets a by-ref argument
+    /// slot see the range the local was bound to (CL-085).
+    ValueWithReference {
+        value: LiteralValue,
+        reference: ReferenceType,
+    },
     Callable(Arc<dyn crate::traits::CustomCallable>),
 }
 
@@ -334,6 +343,9 @@ impl<'a> Interpreter<'a> {
         };
         match self.local_env.lookup(name)? {
             LocalBinding::Value(v) => Some(crate::traits::CalcValue::Scalar(v)),
+            LocalBinding::ValueWithReference { value, .. } => {
+                Some(crate::traits::CalcValue::Scalar(value))
+            }
             LocalBinding::Callable(c) => Some(crate::traits::CalcValue::Callable(c)),
         }
     }
@@ -344,12 +356,24 @@ impl<'a> Interpreter<'a> {
         }
         match self.local_env.lookup(name)? {
             LocalBinding::Callable(c) => Some(c),
-            LocalBinding::Value(_) => None,
+            LocalBinding::Value(_) | LocalBinding::ValueWithReference { .. } => None,
         }
     }
 
     pub fn resolve_local_name(&self, name: &str) -> Option<LocalBinding> {
         self.local_env.lookup(name)
+    }
+
+    /// The spreadsheet reference a LET/LAMBDA local was bound to, when it was
+    /// bound to a reference expression rather than a computed value (CL-085).
+    pub fn resolve_local_bound_reference(&self, name: &str) -> Option<ReferenceType> {
+        if self.local_env.is_empty() {
+            return None;
+        }
+        match self.local_env.lookup(name)? {
+            LocalBinding::ValueWithReference { reference, .. } => Some(reference),
+            LocalBinding::Value(_) | LocalBinding::Callable(_) => None,
+        }
     }
 
     pub fn resolve_range_view<'c>(
