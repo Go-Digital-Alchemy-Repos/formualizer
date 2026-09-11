@@ -99,14 +99,25 @@ impl Function for EdateFn {
     //    cell filled, no spill. OT-198 receipt `g4d_excel_cse_probe.json` row
     //    `Q33_edate_range_dynamic` (EOMONTH is row `Q32`).
     //  - ARRAY VALUE: there is NO DIRECT clean-room Excel row for this case.
-    //    It rests on the HELD-CALLER measurement instead: at the Knighthead
-    //    producer cell, `EOMONTH` receives an array value (TYPE 64, 10
-    //    elements, `ISREF` FALSE) produced by `DATE`, and desktop Excel
-    //    computes a NUMBER there rather than `#VALUE!` (OT-198 g4c and this
-    //    round's receipt `g3c_producer_bisect.json`). The same receipt
-    //    measured that rewriting those calls into the lifting identity
-    //    `DATE(YEAR(d),MONTH(d)+m+1,0)` makes the producer compute a number on
-    //    the candidate wheel. Excel must therefore lift over an array value.
+    //    It rests on the HELD-CALLER measurement, which is a SPLICE of two
+    //    measurements taken on different instruments. Stated separately, as
+    //    the GOD-286 close-out review required:
+    //      (i)  THE ENGINE measures that at the Knighthead producer cell
+    //           `EOMONTH`'s slot 0 is an array value (TYPE 64, 10 elements,
+    //           `ISREF` FALSE) produced by `DATE` -- this round's receipt
+    //           `g3c_producer_bisect.json`, measured on the candidate wheel,
+    //           i.e. on the artefact under test.
+    //      (ii) DESKTOP EXCEL computes a NUMBER at that same cell rather than
+    //           `#VALUE!` -- OT-198 g4c.
+    //    That EXCEL's operand at that cell is also an array value is INFERRED,
+    //    not observed: the un-excluded alternative is that Excel collapses the
+    //    operand somewhere this engine does not. Only an Excel oracle settles
+    //    it, and GOD-286 was forbidden to open Excel.
+    //    Supporting but weaker: the same receipt measured that rewriting those
+    //    calls into the lifting identity `DATE(YEAR(d),MONTH(d)+m+1,0)` makes
+    //    the producer compute a number on the candidate wheel. The receipt
+    //    labels that "evidence of SUFFICIENCY, not a numeric oracle"; it was
+    //    never graded against a live-Excel value.
     //
     // The refusal is declared by `elementwise_lift_refuses_range_reference`
     // below and enforced at the interpreter's lifting sites.
@@ -228,14 +239,25 @@ impl Function for EomonthFn {
     //    cell filled, no spill. OT-198 receipt `g4d_excel_cse_probe.json` row
     //    `Q32_eomonth_range_dynamic` (EDATE is row `Q33`).
     //  - ARRAY VALUE: there is NO DIRECT clean-room Excel row for this case.
-    //    It rests on the HELD-CALLER measurement instead: at the Knighthead
-    //    producer cell, `EOMONTH` receives an array value (TYPE 64, 10
-    //    elements, `ISREF` FALSE) produced by `DATE`, and desktop Excel
-    //    computes a NUMBER there rather than `#VALUE!` (OT-198 g4c and this
-    //    round's receipt `g3c_producer_bisect.json`). The same receipt
-    //    measured that rewriting those calls into the lifting identity
-    //    `DATE(YEAR(d),MONTH(d)+m+1,0)` makes the producer compute a number on
-    //    the candidate wheel. Excel must therefore lift over an array value.
+    //    It rests on the HELD-CALLER measurement, which is a SPLICE of two
+    //    measurements taken on different instruments. Stated separately, as
+    //    the GOD-286 close-out review required:
+    //      (i)  THE ENGINE measures that at the Knighthead producer cell
+    //           `EOMONTH`'s slot 0 is an array value (TYPE 64, 10 elements,
+    //           `ISREF` FALSE) produced by `DATE` -- this round's receipt
+    //           `g3c_producer_bisect.json`, measured on the candidate wheel,
+    //           i.e. on the artefact under test.
+    //      (ii) DESKTOP EXCEL computes a NUMBER at that same cell rather than
+    //           `#VALUE!` -- OT-198 g4c.
+    //    That EXCEL's operand at that cell is also an array value is INFERRED,
+    //    not observed: the un-excluded alternative is that Excel collapses the
+    //    operand somewhere this engine does not. Only an Excel oracle settles
+    //    it, and GOD-286 was forbidden to open Excel.
+    //    Supporting but weaker: the same receipt measured that rewriting those
+    //    calls into the lifting identity `DATE(YEAR(d),MONTH(d)+m+1,0)` makes
+    //    the producer compute a number on the candidate wheel. The receipt
+    //    labels that "evidence of SUFFICIENCY, not a numeric oracle"; it was
+    //    never graded against a live-Excel value.
     //
     // The refusal is declared by `elementwise_lift_refuses_range_reference`
     // below and enforced at the interpreter's lifting sites.

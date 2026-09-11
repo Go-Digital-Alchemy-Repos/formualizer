@@ -2453,16 +2453,33 @@ fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
 /// the ATP range-reference refusal Excel shows at rows Q32/Q33 would apply
 /// through the local too.
 ///
-/// CAUSE OF THE DIVERGENCE: it is NOT the array-value lift added here, and NOT
-/// the range-reference refusal, which is enforced at every one of the
-/// interpreter's five lifting sites. It is CL-085, the missing
-/// reference-preserving LET binding: on this fork a LET local is materialised
-/// as a VALUE (measured: `ISREF` on a range-bound local is FALSE), so the
-/// refusal cannot see a reference to refuse and the argument presents as an
-/// array value, which this change lifts by design. CL-085 is fixed on a
-/// different candidate lineage (fork 6da35585) that is NOT in this round's
-/// base; when that binding lands, these two formulas should return to
-/// `#VALUE!` and this test is the one to update.
+/// CAUSE OF THE DIVERGENCE, corrected by the GOD-286 close-out review after an
+/// earlier, WRONG statement here blamed CL-085:
+///
+/// It is NOT the array-value lift added here, and NOT the range-reference
+/// refusal itself, which is enforced at every one of the interpreter's five
+/// lifting sites. The local IS a reference node — inside the LET body the
+/// argument is `ASTNodeType::Reference { ReferenceType::NamedRange(..) }`, so
+/// `ArgumentHandle::is_multi_cell_range_reference` passes its `is_reference_node`
+/// test. It returns `false` at the NEXT step: `shape_hint()` routes a Reference
+/// through `Interpreter::ast_shape_hint` -> `effective_reference` ->
+/// `probe_range_dimensions` (`interpreter.rs:30-72`), whose match has arms for
+/// `ReferenceType::Range` and `::Cell` ONLY and falls to `_ => None` for
+/// `NamedRange`. Nothing on that path consults `local_env`. So the refusal fails
+/// because THE SHAPE PROBE HAS NO `NamedRange` ARM AND NEVER ASKS THE LOCAL
+/// ENVIRONMENT — not because the binding lost its reference-ness.
+///
+/// CONSEQUENCE, and why the earlier statement mattered: CL-085's fix (fork
+/// 6da35585, which sits on this same base 1a831439) adds
+/// `LocalBinding::ValueWithReference`, `resolve_local_bound_reference`,
+/// `bound_reference_in_env` and `local_named_reference` and wires them into
+/// `reference_attempt` and the three by-ref accessors. It does NOT touch
+/// `ast_shape_hint`, `arena_shape_hint`, `probe_range_dimensions` or
+/// `shape_hint`. So merging CL-085 does NOT clear this divergence: it would
+/// still lift. Clearing it needs THIS round's predicate to consult the local
+/// environment — point `is_multi_cell_range_reference` and its AST/arena twins
+/// at `local_named_reference` / `resolve_local_bound_reference`, then re-measure.
+/// That is a named open thread against GOD-286, not a CL-085 follow-on.
 #[test]
 fn cl087_atp_date_offsets_through_a_let_local_is_cl085() {
     let wb = cl087_workbook();
