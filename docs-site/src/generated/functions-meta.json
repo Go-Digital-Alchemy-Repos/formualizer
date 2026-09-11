@@ -427,7 +427,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "datetime",
     "implementationSource": "crates/formualizer-eval/src/builtins/datetime/date_time.rs",
@@ -546,7 +547,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "datetime",
     "implementationSource": "crates/formualizer-eval/src/builtins/datetime/date_parts.rs",
@@ -859,7 +861,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "datetime",
     "implementationSource": "crates/formualizer-eval/src/builtins/datetime/date_parts.rs",
@@ -1385,7 +1388,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "datetime",
     "implementationSource": "crates/formualizer-eval/src/builtins/datetime/date_parts.rs",
@@ -4666,7 +4670,7 @@
     "variadic": true
   },
   "financial/npv": {
-    "argSchema": "arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
+    "argSchema": "arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}",
     "args": [
       {
         "by_ref": false,
@@ -4690,7 +4694,7 @@
         ],
         "max": null,
         "name": "arg2",
-        "repeating": null,
+        "repeating": "1",
         "required": true,
         "shape": "scalar"
       }
@@ -6139,7 +6143,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "info",
     "implementationSource": "crates/formualizer-eval/src/builtins/info.rs",
@@ -6418,8 +6423,22 @@
     "variadic": false
   },
   "lambda/lambda": {
-    "argSchema": "<unavailable: arg_schema panicked>",
-    "args": [],
+    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
+    "args": [
+      {
+        "by_ref": false,
+        "coercion": "None",
+        "has_default": false,
+        "kinds": [
+          "any"
+        ],
+        "max": null,
+        "name": "arg1",
+        "repeating": null,
+        "required": true,
+        "shape": "scalar"
+      }
+    ],
     "caps": [
       "PURE",
       "SHORT_CIRCUIT"
@@ -6431,13 +6450,27 @@
     "name": "LAMBDA",
     "registrationSource": "crates/formualizer-eval/src/builtins/lambda.rs",
     "shortSummary": "Creates an anonymous callable that can be invoked with spreadsheet arguments.",
-    "signature": "LAMBDA(<schema unavailable>)",
+    "signature": "LAMBDA(arg1...: any@scalar)",
     "typeName": "LambdaFn",
     "variadic": true
   },
   "lambda/let": {
-    "argSchema": "<unavailable: arg_schema panicked>",
-    "args": [],
+    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
+    "args": [
+      {
+        "by_ref": false,
+        "coercion": "None",
+        "has_default": false,
+        "kinds": [
+          "any"
+        ],
+        "max": null,
+        "name": "arg1",
+        "repeating": null,
+        "required": true,
+        "shape": "scalar"
+      }
+    ],
     "caps": [
       "PURE",
       "SHORT_CIRCUIT"
@@ -6449,7 +6482,7 @@
     "name": "LET",
     "registrationSource": "crates/formualizer-eval/src/builtins/lambda.rs",
     "shortSummary": "Binds local names to values and evaluates a final expression with those bindings.",
-    "signature": "LET(<schema unavailable>)",
+    "signature": "LET(arg1...: any@scalar)",
     "typeName": "LetFn",
     "variadic": true
   },
@@ -6484,7 +6517,9 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "RETURNS_REFERENCE",
+      "SHORT_CIRCUIT"
     ],
     "category": "logical_ext",
     "implementationSource": "crates/formualizer-eval/src/builtins/logical_ext.rs",
@@ -6528,7 +6563,9 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "RETURNS_REFERENCE",
+      "SHORT_CIRCUIT"
     ],
     "category": "logical_ext",
     "implementationSource": "crates/formualizer-eval/src/builtins/logical_ext.rs",
@@ -6560,6 +6597,7 @@
     ],
     "caps": [
       "PURE",
+      "RETURNS_REFERENCE",
       "SHORT_CIRCUIT"
     ],
     "category": "logical_ext",
@@ -6689,8 +6727,7 @@
     "caps": [
       "PURE",
       "REDUCTION",
-      "BOOL_ONLY",
-      "SHORT_CIRCUIT"
+      "BOOL_ONLY"
     ],
     "category": "logical",
     "implementationSource": "crates/formualizer-eval/src/builtins/logical.rs",
@@ -6739,6 +6776,7 @@
     ],
     "caps": [
       "PURE",
+      "RETURNS_REFERENCE",
       "SHORT_CIRCUIT"
     ],
     "category": "logical",
@@ -6772,8 +6810,7 @@
     "caps": [
       "PURE",
       "REDUCTION",
-      "BOOL_ONLY",
-      "SHORT_CIRCUIT"
+      "BOOL_ONLY"
     ],
     "category": "logical",
     "implementationSource": "crates/formualizer-eval/src/builtins/logical.rs",
@@ -6918,7 +6955,9 @@
     ],
     "caps": [
       "PURE",
-      "LOOKUP"
+      "LOOKUP",
+      "RETURNS_REFERENCE",
+      "SHORT_CIRCUIT"
     ],
     "category": "lookup",
     "implementationSource": "crates/formualizer-eval/src/builtins/lookup/choose.rs",
@@ -7086,10 +7125,10 @@
     "variadic": false
   },
   "lookup/drop": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7143,10 +7182,10 @@
     "variadic": true
   },
   "lookup/filter": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7159,7 +7198,7 @@
         "shape": "range"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7194,16 +7233,16 @@
     "minArgs": 2,
     "name": "FILTER",
     "registrationSource": "crates/formualizer-eval/src/builtins/lookup/dynamic.rs",
-    "shortSummary": "Filters rows from an array using a Boolean include mask.",
+    "shortSummary": "Filters rows or columns from an array using a Boolean include mask.",
     "signature": "FILTER(arg1: range@range, arg2: range@range, arg3?...: any@scalar)",
     "typeName": "FilterFn",
     "variadic": true
   },
   "lookup/groupby": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7216,7 +7255,7 @@
         "shape": "range"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7515,10 +7554,10 @@
     "variadic": false
   },
   "lookup/pivotby": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg7{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg8{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg9{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg7{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg8{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg9{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7531,7 +7570,7 @@
         "shape": "range"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7544,7 +7583,7 @@
         "shape": "range"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7718,7 +7757,9 @@
         "shape": "scalar"
       }
     ],
-    "caps": [],
+    "caps": [
+      "VOLATILE"
+    ],
     "category": "lookup",
     "implementationSource": "crates/formualizer-eval/src/builtins/lookup/dynamic.rs",
     "maxArgs": null,
@@ -7862,11 +7903,42 @@
     "typeName": "SequenceFn",
     "variadic": true
   },
-  "lookup/sort": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}",
+  "lookup/single": {
+    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
+        "coercion": "None",
+        "has_default": false,
+        "kinds": [
+          "any"
+        ],
+        "max": null,
+        "name": "arg1",
+        "repeating": null,
+        "required": true,
+        "shape": "scalar"
+      }
+    ],
+    "caps": [
+      "PURE"
+    ],
+    "category": "lookup",
+    "implementationSource": "crates/formualizer-eval/src/builtins/lookup/dynamic.rs",
+    "maxArgs": 1,
+    "minArgs": 1,
+    "name": "SINGLE",
+    "registrationSource": "crates/formualizer-eval/src/builtins/lookup/dynamic.rs",
+    "shortSummary": "Compatibility wrapper emitted by older Excel OOXML writers for explicit implicit intersection. Modern formulas spell the same operation with `@`.",
+    "signature": "SINGLE(arg1: any@scalar)",
+    "typeName": "SingleFn",
+    "variadic": false
+  },
+  "lookup/sort": {
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}",
+    "args": [
+      {
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7933,10 +8005,10 @@
     "variadic": true
   },
   "lookup/sortby": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7949,7 +8021,7 @@
         "shape": "range"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -7990,10 +8062,10 @@
     "variadic": true
   },
   "lookup/take": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -8165,10 +8237,10 @@
     "variadic": true
   },
   "lookup/transpose": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -8196,10 +8268,10 @@
     "variadic": false
   },
   "lookup/unique": {
-    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}; arg3{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}",
+    "argSchema": "arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}; arg3{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}",
     "args": [
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -8356,7 +8428,7 @@
     "variadic": true
   },
   "lookup/xlookup": {
-    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
+    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
     "args": [
       {
         "by_ref": false,
@@ -8372,7 +8444,7 @@
         "shape": "scalar"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -8385,7 +8457,7 @@
         "shape": "range"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -8453,7 +8525,7 @@
     "variadic": true
   },
   "lookup/xmatch": {
-    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
+    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}",
     "args": [
       {
         "by_ref": false,
@@ -8469,7 +8541,7 @@
         "shape": "scalar"
       },
       {
-        "by_ref": true,
+        "by_ref": false,
         "coercion": "None",
         "has_default": false,
         "kinds": [
@@ -8541,7 +8613,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -10075,7 +10148,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -10379,7 +10453,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -10755,7 +10830,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -10799,7 +10875,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -10843,7 +10920,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -11107,7 +11185,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -11547,7 +11626,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "math",
     "implementationSource": "crates/formualizer-eval/src/builtins/math/numeric.rs",
@@ -16353,7 +16433,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "text",
     "implementationSource": "crates/formualizer-eval/src/builtins/text/len_left_right.rs",

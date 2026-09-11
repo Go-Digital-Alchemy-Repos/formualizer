@@ -2264,13 +2264,22 @@ fn cl087_lifted_positions(name: &str, args_len: usize) -> Option<Vec<usize>> {
 
 #[test]
 fn cl087_date_parts_lift_over_a_range() {
-    // Excel measured (16.105.3, dynamic-array entry via Range.Formula2).
+    // Excel measured, 16.105.3, OT-198 receipt `g4d_excel_cse_probe.json`.
+    // The entry mode DIFFERS per assertion and is cited per assertion: only
+    // YEAR has a dynamic-array row; MONTH and DAY were measured under
+    // Ctrl+Shift+Enter array entry only.
     let wb = cl087_workbook();
+    // Rows `Q27_year_range_dynamic` (dynamic entry, Range.Formula2, 3 cells
+    // filled) and `Q01_year_range` (array entry, Range.FormulaArray).
     assert_eq!(
         cl087_elementwise(&wb, "=YEAR(A1:A3)"),
         vec![2023.0, 2023.0, 2023.0]
     );
+    // Row `Q02_month_range`: ARRAY entry (Ctrl+Shift+Enter) only. No
+    // dynamic-entry row exists for MONTH over a range.
     assert_eq!(cl087_elementwise(&wb, "=MONTH(A1:A3)"), vec![3.0, 3.0, 3.0]);
+    // Row `Q03_day_range`: ARRAY entry (Ctrl+Shift+Enter) only. No
+    // dynamic-entry row exists for DAY over a range.
     assert_eq!(
         cl087_elementwise(&wb, "=DAY(A1:A3)"),
         vec![15.0, 16.0, 17.0]
@@ -2279,16 +2288,22 @@ fn cl087_date_parts_lift_over_a_range() {
 
 #[test]
 fn cl087_date_parts_lift_over_an_if_produced_array() {
-    // Excel measured. This is the producer shape that CL-087 was raised for.
+    // Excel measured, 16.105.3, OT-198 receipt `g4d_excel_cse_probe.json`.
+    // This is the producer shape that CL-087 was raised for. Entry mode is
+    // cited per assertion.
     let wb = cl087_workbook();
+    // Rows `Q31_year_if_array_dynamic` (dynamic entry) and `Q07_year_if_array`
+    // (array entry): both modes agree.
     assert_eq!(
         cl087_elementwise(&wb, "=YEAR(IF(ISNUMBER(A1:A3),A1:A3,0))"),
         vec![2023.0, 2023.0, 2023.0]
     );
+    // Row `Q10_month_if_array`: ARRAY entry (Ctrl+Shift+Enter) only.
     assert_eq!(
         cl087_elementwise(&wb, "=MONTH(IF(ISNUMBER(A1:A3),A1:A3,0))"),
         vec![3.0, 3.0, 3.0]
     );
+    // Row `Q11_day_if_array`: ARRAY entry (Ctrl+Shift+Enter) only.
     assert_eq!(
         cl087_elementwise(&wb, "=DAY(IF(ISNUMBER(A1:A3),A1:A3,0))"),
         vec![15.0, 16.0, 17.0]
@@ -2297,20 +2312,33 @@ fn cl087_date_parts_lift_over_an_if_produced_array() {
 
 #[test]
 fn cl087_date_parts_lift_through_a_let_local() {
-    // Excel measured.
+    // Excel measured, 16.105.3, OT-198 receipt `g4d_excel_cse_probe.json`.
+    // Entry mode is cited per assertion, and the LAST assertion is the one
+    // where the two entry modes DISAGREE.
     let wb = cl087_workbook();
+    // Rows `Q29_let_local_range_year_dynamic` (dynamic entry) and
+    // `Q19_let_local_range_year_plain` (array entry): both modes agree.
     assert_eq!(
         cl087_elementwise(&wb, "=LET(r,A1:A3,YEAR(r))"),
         vec![2023.0, 2023.0, 2023.0]
     );
+    // Row `Q22_let_local_range_month_plain`: ARRAY entry only.
     assert_eq!(
         cl087_elementwise(&wb, "=LET(r,A1:A3,MONTH(r))"),
         vec![3.0, 3.0, 3.0]
     );
+    // Row `Q23_let_local_range_day_plain`: ARRAY entry only.
     assert_eq!(
         cl087_elementwise(&wb, "=LET(r,A1:A3,DAY(r))"),
         vec![15.0, 16.0, 17.0]
     );
+    // The Knighthead producer shape. The two Excel entry modes DISAGREE here:
+    // row `Q28_producer_shape_dynamic` (dynamic entry, Range.Formula2)
+    // measured {2023;2023;2023} spilling three rows, while row
+    // `Q20_producer_shape_plain` (Ctrl+Shift+Enter array entry) measured
+    // #VALUE! in all three cells. The assertion pins the DYNAMIC-entry row,
+    // because dynamic entry is the mode the Knighthead producer itself uses.
+    // The array-entry answer is a declared residual, not a refutation.
     assert_eq!(
         cl087_elementwise(&wb, "=LET(r,IF(ISNUMBER(A1:A3),A1:A3,0),YEAR(r))"),
         vec![2023.0, 2023.0, 2023.0]
@@ -2321,9 +2349,12 @@ fn cl087_date_parts_lift_through_a_let_local() {
 fn cl087_rounding_family_lifts_over_a_range() {
     let wb = cl087_workbook();
     let serials = vec![45000.0, 45001.0, 45002.0];
-    // Excel measured.
+    // Excel measured, 16.105.3, OT-198 receipt `g4d_excel_cse_probe.json`
+    // rows `Q35_roundup_range_dynamic` (dynamic entry) and `Q05_roundup_range`
+    // (array entry): both modes agree.
     assert_eq!(cl087_elementwise(&wb, "=ROUNDUP(A1:A3,0)"), serials);
-    // Excel measured; must not regress (ROUND lifted before CL-087 too).
+    // Excel measured, same receipt, row `Q34_round_range_dynamic`: DYNAMIC
+    // entry only. Must not regress (ROUND lifted before CL-087 too).
     assert_eq!(cl087_elementwise(&wb, "=ROUND(A1:A3,0)"), serials);
     // Specification, same rounding family.
     assert_eq!(cl087_elementwise(&wb, "=ROUNDDOWN(A1:A3,0)"), serials);
@@ -2380,12 +2411,24 @@ fn cl087_aggregation_over_a_lifted_result() {
 
 #[test]
 fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
-    // Excel measured (16.105.3): the Analysis-ToolPak lineage answers #VALUE!
-    // to a multi-cell range in a scalar-shaped slot, with no spill.
-    // EDATE is a BEHAVIOUR CHANGE: it lifted before CL-087.
+    // The Analysis-ToolPak lineage answers #VALUE! to a multi-cell range in a
+    // scalar-shaped slot, with no spill. EDATE is a BEHAVIOUR CHANGE: it
+    // lifted before CL-087. Provenance is cited per assertion; only the first
+    // two are Excel-measured.
     let wb = cl087_workbook();
+    // Excel measured, 16.105.3, OT-198 receipt `g4d_excel_cse_probe.json`
+    // rows `Q32_eomonth_range_dynamic` (dynamic entry, 1 cell filled, so no
+    // spill) and `Q04_eomonth_range` (array entry, #VALUE! in all three).
     cl087_scalar_error(&wb, "=EOMONTH(A1:A3,0)", ExcelErrorKind::Value);
+    // Excel measured, same receipt, row `Q33_edate_range_dynamic`: DYNAMIC
+    // entry only, 1 cell filled, so no spill. No array-entry row exists for
+    // EDATE over a range.
     cl087_scalar_error(&wb, "=EDATE(A1:A3,0)", ExcelErrorKind::Value);
+    // NOT Excel measured: the receipt has NO row for EDATE reached through a
+    // LET local, in either entry mode. This assertion extends the measured
+    // EDATE(A1:A3,0) answer to the LET-local shape on the reasoning that a LET
+    // local binds the range unchanged (which rows Q19/Q29 show for YEAR). It
+    // is a declared residual for a later Excel oracle.
     cl087_scalar_error(&wb, "=LET(r,A1:A3,EDATE(r,0))", ExcelErrorKind::Value);
 }
 
@@ -2402,11 +2445,17 @@ fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
 ///    (OT-198 receipt `g4d_excel_cse_probe.json` row `Q33_edate_range_dynamic`),
 ///    the Analysis-ToolPak lineage resist that `EOMONTH` also shows (Q32).
 ///  - the months-slot shape itself has NO live-Excel measurement. GOD-286 could
-///    not open Excel. Held-corpus exposure is ZERO: of 272,791 EDATE-bearing
-///    cells across the 67 held workbooks, 0 put a multi-cell range in either
-///    slot (receipt `g8b_edate_months_slot_census.json`), so nothing measured
-///    depends on the choice. It is carried as a declared residual for a later
-///    Excel oracle, not as a settled answer.
+///    not open Excel. Held-corpus exposure is zero AS A LOWER BOUND: of 272,791
+///    EDATE-bearing cells across the 67 held workbooks, 0 put a multi-cell
+///    range in either slot (receipt `g8b_edate_months_slot_census.json`). That
+///    receipt states in its own `limits` field that it is a STATIC TEXT census
+///    which does NOT count a range reaching EDATE through a LET/LAMBDA local, a
+///    defined name or INDIRECT, "so this is a lower bound" -- and the sibling
+///    test `cl087_atp_date_offsets_do_not_lift_over_a_range` asserts exactly
+///    the LET-local shape, so that uncounted class is known to be reachable.
+///    The census therefore bounds, but does not prove, the exposure. It is
+///    carried as a declared residual for a later Excel oracle, not as a
+///    settled answer.
 #[test]
 fn cl087_edate_months_slot_stops_lifting() {
     let wb = cl087_workbook();
