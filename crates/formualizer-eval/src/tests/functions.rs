@@ -768,10 +768,12 @@ fn array_lifting_scalar_family() {
     assert_eq!(number("=SUM(ISNUMBER(A1:A3)*1)"), LiteralValue::Number(3.0));
     assert_eq!(number("=SUM(MOD(A1:A3,2))"), LiteralValue::Number(2.0));
     assert_eq!(number("=SUM(SQRT(D1:D3))"), LiteralValue::Number(6.0));
-    assert_eq!(
-        number("=SUM(EDATE(G1,H1:J1))"),
-        LiteralValue::Number(131584.0)
-    );
+    // The `=SUM(EDATE(G1,H1:J1))` assertion that stood here moved to
+    // `cl087_edate_months_slot_stops_lifting` under CL-087. It asserted a
+    // NUMBER, it was authored in GOD-185 commit 727a92e5 -- the same commit
+    // that created the name allowlist this round retires -- and no Excel
+    // oracle ever backed it (ES-008 recorded the whole allowlist as
+    // "unverified on an Excel oracle"). See that test for the citation.
 
     match number("=ROUND(A1:B2,A1:A3)") {
         LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Value),
@@ -2385,6 +2387,30 @@ fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
     cl087_scalar_error(&wb, "=EOMONTH(A1:A3,0)", ExcelErrorKind::Value);
     cl087_scalar_error(&wb, "=EDATE(A1:A3,0)", ExcelErrorKind::Value);
     cl087_scalar_error(&wb, "=LET(r,A1:A3,EDATE(r,0))", ExcelErrorKind::Value);
+}
+
+/// EDATE's SECOND slot (`months`) with a multi-cell range: the shape that
+/// `array_lifting_scalar_family` asserted as a NUMBER until CL-087.
+///
+/// PROVENANCE, stated because this assertion CHANGED:
+///  - the number it used to assert was authored in GOD-185 commit 727a92e5,
+///    the same commit that created the function-name allowlist CL-087 retires,
+///    and ES-008 records that allowlist as "unverified on an Excel oracle".
+///    It was an author expectation, never a measurement.
+///  - the measurement that exists is for EDATE's FIRST slot: desktop Excel
+///    16.105.3 answers `#VALUE!` to `EDATE(A1:A3,0)` under dynamic-array entry
+///    (OT-198 receipt `g4d_excel_cse_probe.json` row `Q33_edate_range_dynamic`),
+///    the Analysis-ToolPak lineage resist that `EOMONTH` also shows (Q32).
+///  - the months-slot shape itself has NO live-Excel measurement. GOD-286 could
+///    not open Excel. Held-corpus exposure is ZERO: of 272,791 EDATE-bearing
+///    cells across the 67 held workbooks, 0 put a multi-cell range in either
+///    slot (receipt `g8b_edate_months_slot_census.json`), so nothing measured
+///    depends on the choice. It is carried as a declared residual for a later
+///    Excel oracle, not as a settled answer.
+#[test]
+fn cl087_edate_months_slot_stops_lifting() {
+    let wb = cl087_workbook();
+    cl087_scalar_error(&wb, "=SUM(EDATE(B1,A1:A3))", ExcelErrorKind::Value);
 }
 
 #[test]
