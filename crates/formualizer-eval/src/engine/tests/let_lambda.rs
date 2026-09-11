@@ -593,3 +593,52 @@ fn column_over_a_let_value_local_reports_a_reference_error() {
     // divergence is a filed open question, not a correctness claim.
     cl085_assert_error_kind("=LET(x,5,COLUMN(x))", ExcelErrorKind::Ref);
 }
+
+#[test]
+fn inner_value_local_shadows_an_outer_range_local_in_a_by_ref_slot() {
+    // Excel's lexical scope: the inner `r` shadows the outer one, so MATCH must
+    // NOT see A1:A3 - if it did, it would find 2 at index 2. It sees the scalar
+    // 5 instead, and MATCH(2, 5, 0) is #N/A, which is also Excel's answer.
+    //
+    // This is the one place the `Some(Err(#REF!))` arm is observed end to end:
+    // the by-ref accessor refuses the value-bound local, MATCH takes its value
+    // fallback, and the #REF! never surfaces. It also pins that a preserved
+    // reference is dropped when a nested LET rebinds the same identifier.
+    cl085_assert_error_kind("=LET(r,A1:A3,LET(r,5,MATCH(2,r,0)))", ExcelErrorKind::Na);
+}
+
+#[test]
+fn inner_range_local_shadows_an_outer_range_local_in_a_by_ref_slot() {
+    // The same shadowing rule the other way: the inner binding's range is the
+    // one MATCH sees. Looking for 20 in A1:A3 would be #N/A; in B1:B3 it is 2.
+    cl085_assert_number("=LET(r,A1:A3,LET(r,B1:B3,MATCH(20,r,0)))", 2.0);
+}
+
+#[test]
+fn let_range_local_on_another_sheet_resolves_against_that_sheet() {
+    // A preserved ReferenceType that carries no sheet is resolved later against
+    // the interpreter's current sheet. Bind the local to an explicitly
+    // sheet-qualified range on a second sheet and consume it by reference from
+    // Sheet1: the answer must come from Sheet2's column, not Sheet1's.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    cl085_fill_grid(&mut engine);
+    for (row, v) in [(1u32, 100.0), (2, 200.0), (3, 300.0)] {
+        engine
+            .set_cell_value("Sheet2", row, 1, LiteralValue::Number(v))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            3,
+            parse("=LET(r,Sheet2!A1:A3,MATCH(200,r,0))").unwrap(),
+        )
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        cl085_number(engine.get_cell_value("Sheet1", 1, 3).unwrap()),
+        2.0
+    );
+}

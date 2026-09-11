@@ -816,9 +816,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     ///
     /// `Some(Ok(reference))` when the local was bound to a reference expression;
     /// `Some(Err(#REF!))` when it was bound to a plain value, so the consumer's
-    /// existing value fallback runs instead of the workbook-name route (which
-    /// would report the local's spelling as an undefined name); `None` when the
-    /// name is not locally bound and the workbook-name route is correct.
+    /// own error path runs instead of the workbook-name route (which would
+    /// report the local's spelling as an undefined name). A consumer that has a
+    /// value fallback takes it; one that does not (`args.rs` by_ref,
+    /// `reference_fns.rs` OFFSET) returns `#REF!`, where before this change it
+    /// returned a spurious `#NAME?`. `None` when the name is not locally bound
+    /// and the workbook-name route is correct.
     ///
     /// The asymmetry with the other reference predicates is deliberate and
     /// load-bearing. `as_reference_or_eval`, `as_reference` and
@@ -829,6 +832,14 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// bare LET local in `OR`/`AND` on the value path, where a boolean local
     /// must stay a boolean. Do not "unify" the two halves.
     fn local_named_reference(&self, name: &str) -> Option<Result<ReferenceType, ExcelError>> {
+        // An array-lifted handle carries a scalar override rather than the
+        // syntax's own reference, so it must never report one. The guard lives
+        // here, at the single point all three by-ref accessors share, rather
+        // than on one of them: `reference_for_eval` and `as_reference_or_eval`
+        // are the two the live consumers actually reach.
+        if self.value_override.is_some() {
+            return None;
+        }
         // `None` here sends the name down the ordinary workbook-name route.
         // Open question for a later round: a local bound to a *literal-valued*
         // workbook defined name currently yields `Some(Err(#REF!))` from the
@@ -1552,7 +1563,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     pub fn as_reference(&self) -> Result<&ReferenceType, ExcelError> {
         // An array-lifted handle carries a scalar override, not the syntax's
         // own reference, so it must never report one — the same guard
-        // `may_return_reference` and `reference_attempt` already apply.
+        // `may_return_reference` and `reference_attempt` already apply. Since
+        // `local_named_reference` now carries the same guard, this one is
+        // belt-and-braces for the non-local arms of this accessor.
         if self.value_override.is_some() {
             return Err(ExcelError::new(ExcelErrorKind::Ref)
                 .with_message("Expected a reference (by-ref argument)"));
