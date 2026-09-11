@@ -85,6 +85,89 @@ fn range_or_scalar<'a, 'b>(
     })
 }
 
+/// ES-063 (OT-216): the first error carried by a SELECTED cell of the
+/// sum/average range propagates out of the criteria-aggregation family.
+///
+/// MEASURED on desktop Excel 16.105.3 (GOD-288 gate G4, receipt
+/// `g4_cleanroom_array_and_sumif_oracle.json`, key `ot216_sumif_error_swallow`),
+/// on this table: `D1:D4` = k, k, m, m; `E1:E4` = 5, `=1/0`, 7, 9 (the error in
+/// a MATCHED row); `F1:F4` = k, k, m, m; `G1:G4` = 5, 6, `=1/0`, 9 (the error
+/// in an UNMATCHED row). The error is PRODUCED by evaluating `=1/0`, never
+/// typed in as a literal, because that is how the Knighthead `Calc` column
+/// produces its own.
+///
+/// * `=SUMIF(D1:D4,"k",E1:E4)` answers `#DIV/0!` -- a matched cell's error
+///   propagates;
+/// * `=SUMIF(F1:F4,"k",G1:G4)` answers `11` (5 + 6) -- an unmatched cell's
+///   error is never read;
+/// * `=SUM(E1:E4)` over the same range answers `#DIV/0!`.
+///
+/// Before this function the engine answered `5` to the first: `slice_numbers`
+/// renders a non-numeric cell as an Arrow null and `sum_array` skips nulls, so
+/// an error inside the selected set was silently dropped. GOD-289's P1 probe
+/// (`p1_sumif_probe_wheel_of_record.json`) measures the defect on the wheel of
+/// record over the oracle's own table. That is the whole of Knighthead Ledger
+/// band A (`Output!T3:T103`, 93 `#VALUE!`-versus-zero leaf pairs per row,
+/// 1,581 leaves over the 17 captured rows).
+///
+/// Only cells the mask SELECTS are inspected, so the unmatched-row half of
+/// ES-063 is preserved by construction -- the selector is the very same
+/// `BooleanArray` that `filter_array` consumes, so the two halves of the rule
+/// cannot drift apart.
+///
+/// COST. A range with no non-numeric cell costs nothing: `null_count() == 0`
+/// returns immediately. Beyond that the claim has to be stated precisely,
+/// because `slice_numbers` renders BLANKS AND TEXT as nulls too, not only
+/// errors -- so on a sum range carrying blanks the guard does not fire and
+/// this calls `RangeView::get_cell` once per SELECTED null position.
+/// `get_cell` is a binary search over the chunk starts plus a `LiteralValue`
+/// materialisation. For the Knighthead caller (101 SUMIF cells over a 1,301-row
+/// range) that is immaterial; for a broad criteria over a long sparse range it
+/// is O(selected non-numeric cells) per formula. The view's `errors_slices()`
+/// lane would answer the same question without materialising a value, but it
+/// is chunk-iterator shaped rather than offset-sliceable, so adopting it is not
+/// a one-liner; the perf debt is carried on OT-199 with the rest of this
+/// merge's.
+///
+/// Scan order is the iteration order of the caller -- row chunk, then column,
+/// then row within the chunk. For the single-column ranges ES-063 was measured
+/// on that is plain top-to-bottom; Excel's order for a multi-column selection
+/// carrying two DIFFERENT errors is not measured by any oracle this project
+/// holds, and no caller in the held corpus has that shape.
+fn first_selected_error(
+    view: &crate::engine::range_view::RangeView<'_>,
+    numeric_col: &arrow_array::Float64Array,
+    mask: Option<&BooleanArray>,
+    row_start: usize,
+    row_len: usize,
+    col: usize,
+) -> Option<ExcelError> {
+    if numeric_col.null_count() == 0 {
+        return None;
+    }
+    // Every mask on every path into this function is built at `row_len`, and a
+    // genuine skew would panic two lines later in `filter_array`. Clamp anyway
+    // rather than add a new panic surface ahead of the old one.
+    let scan_len = match mask {
+        Some(m) => row_len.min(m.len()),
+        None => row_len,
+    };
+    for i in 0..scan_len {
+        if let Some(m) = mask
+            && !(m.is_valid(i) && m.value(i))
+        {
+            continue;
+        }
+        if i < numeric_col.len() && numeric_col.is_valid(i) {
+            continue;
+        }
+        if let LiteralValue::Error(e) = view.get_cell(row_start + i, col) {
+            return Some(e);
+        }
+    }
+    None
+}
+
 fn eval_if_family<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     ctx: &dyn FunctionContext<'b>,
@@ -600,6 +683,22 @@ fn eval_if_family<'a, 'b>(
                                 .as_ref()
                                 .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
                             if let Some(tc) = target_col {
+                                // ES-063: a selected cell carrying an error
+                                // propagates, before any arithmetic.
+                                if let Some(ref sv) = sum_view
+                                    && let Some(e) = first_selected_error(
+                                        sv,
+                                        tc.as_ref(),
+                                        Some(&mask),
+                                        row_start,
+                                        row_len,
+                                        c,
+                                    )
+                                {
+                                    return Ok(crate::traits::CalcValue::Scalar(
+                                        LiteralValue::Error(e),
+                                    ));
+                                }
                                 let filtered = filter_array(tc.as_ref(), &mask).unwrap();
                                 let f64_arr =
                                     filtered.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -627,6 +726,16 @@ fn eval_if_family<'a, 'b>(
                                 .as_ref()
                                 .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
                             if let Some(tc) = target_col {
+                                // ES-063, with every cell selected.
+                                if let Some(ref sv) = sum_view
+                                    && let Some(e) = first_selected_error(
+                                        sv, tc.as_ref(), None, row_start, row_len, c,
+                                    )
+                                {
+                                    return Ok(crate::traits::CalcValue::Scalar(
+                                        LiteralValue::Error(e),
+                                    ));
+                                }
                                 if let Some(s) = sum_array::<Float64Type, _>(tc.as_ref()) {
                                     total_sum += s;
                                 }

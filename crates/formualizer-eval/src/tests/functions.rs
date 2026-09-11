@@ -1,7 +1,7 @@
 use crate::builtins::math::{Atan2Fn, CosFn, SinFn, TanFn};
 use crate::test_workbook::TestWorkbook;
 use crate::traits::ArgumentHandle;
-use formualizer_common::{ExcelErrorKind, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 
 fn ensure_lifting_builtins() {
@@ -2434,7 +2434,7 @@ fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
     // The LET-local shape is NOT asserted here. It used to be, extending the
     // measured EDATE(A1:A3,0) answer to `=LET(r,A1:A3,EDATE(r,0))` on the
     // reasoning that a LET local binds the range unchanged; on this fork it
-    // does not. See `cl087_atp_date_offsets_through_a_let_local_is_cl085`
+    // does not. See `ot209_atp_refusal_cannot_see_a_range_through_a_let_local`
     // below, which PINS the measured behaviour and states why it diverges.
 }
 
@@ -2480,8 +2480,18 @@ fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
 /// environment — point `is_multi_cell_range_reference` and its AST/arena twins
 /// at `local_named_reference` / `resolve_local_bound_reference`, then re-measure.
 /// That is a named open thread against GOD-286, not a CL-085 follow-on.
+///
+/// The open thread is OT-209, and this test is its pin. GOD-289 merged
+/// CL-085 (`6da35585`) onto this branch and MEASURED the prediction above:
+/// the merge does not clear the divergence and this test still asserts the
+/// lift. OT-209 was left unfixed there by contract, because the Knighthead
+/// sheet-path inventory
+/// (`research/reports/god283_knighthead_residual_prediction_2026-09-11.md`
+/// section 2.3) does not place the shape on that caller's path, and because
+/// fixing it would make `EDATE`/`EOMONTH` refuse a range-bound local, which
+/// is a behaviour change with an unmeasured held-corpus population.
 #[test]
-fn cl087_atp_date_offsets_through_a_let_local_is_cl085() {
+fn ot209_atp_refusal_cannot_see_a_range_through_a_let_local() {
     let wb = cl087_workbook();
     assert_eq!(
         cl087_elementwise(&wb, "=LET(r,A1:A3,EDATE(r,0))"),
@@ -2658,4 +2668,147 @@ fn cl087_single_cell_reference_does_not_trigger_the_range_refusal() {
     assert_eq!(cl087_scalar(&wb, "=SUM(EDATE(A1:A1,0))"), 45000.0);
     cl087_scalar_error(&wb, "=SUM(EOMONTH(A1:A3,0))", ExcelErrorKind::Value);
     cl087_scalar_error(&wb, "=SUM(EDATE(A1:A3,0))", ExcelErrorKind::Value);
+}
+
+/* ───────── ES-063 / OT-216: criteria-aggregation error propagation ─────────
+ *
+ * Invented data only, and the SAME TABLE the Excel oracle used, cell for cell
+ * (GOD-288 gate G4, receipt `g4_cleanroom_array_and_sumif_oracle.json`, key
+ * `fixture.values_written_by_openpyxl`):
+ *
+ *   A1:A4  k  k  m  m         criteria; rows 1 and 2 match "k"
+ *   B1:B4  5  #DIV/0! 7  9    sum_range, error in a MATCHED row (row 2)
+ *   C1:C4  k  k  m  m         criteria
+ *   D1:D4  5  6  #DIV/0!  9   sum_range, error in an UNMATCHED row (row 3)
+ *   E1:E4  5  #VALUE!  7  9   the same as B, with a different error KIND
+ *
+ * (The oracle's own column letters were D/E and F/G; the columns are shifted
+ * here because this workbook starts at A1. The VALUES and the row-by-row
+ * match/no-match structure are the oracle's.)
+ *
+ * The expected values are MEASURED: desktop Excel 16.105.3, GOD-288 gate G4,
+ * key `ot216_sumif_error_swallow`, rows D01/D02/D03. ES-063 states the rule.
+ *
+ * ONE DIFFERENCE FROM THE ORACLE, stated because it matters: the oracle's
+ * error cells are EVALUATED (`=1/0`), as the Knighthead `Calc` column's are,
+ * while `TestWorkbook::with_range` takes literals, so the error cells here are
+ * literal `LiteralValue::Error`. The evaluated-error arm is the round's P1
+ * probe (`p1_sumif_error_propagation_probe.py`), which writes `=1/0` into a
+ * real `formualizer.Workbook` and measures both arms; these unit tests pin the
+ * aggregation rule, the probe pins it end to end.
+ *
+ * The defect these pin: `slice_numbers` renders a non-numeric cell as an Arrow
+ * null and `sum_array` skips nulls, so before GOD-289 `=SUMIF(A1:A4,"k",B1:B4)`
+ * answered 5 -- the error was silently dropped. That is Knighthead Ledger
+ * band A (`Output!T3:T103`), 93 of 101 leaves per row on 17 captured rows.
+ */
+
+fn es063_workbook() -> TestWorkbook {
+    let div = || LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div));
+    let val = || LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+    let k = || LiteralValue::Text("k".into());
+    let m = || LiteralValue::Text("m".into());
+    TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![k(), LiteralValue::Int(5), k(), LiteralValue::Int(5),
+                 LiteralValue::Int(5)],
+            vec![k(), div(), k(), LiteralValue::Int(6), val()],
+            vec![m(), LiteralValue::Int(7), m(), div(), LiteralValue::Int(7)],
+            vec![m(), LiteralValue::Int(9), m(), LiteralValue::Int(9),
+                 LiteralValue::Int(9)],
+        ],
+    )
+}
+
+fn es063_number(wb: &TestWorkbook, formula: &str) -> f64 {
+    cl087_number(&evaluate_lifting_formula(wb, formula))
+}
+
+fn es063_error(wb: &TestWorkbook, formula: &str, kind: ExcelErrorKind) {
+    match evaluate_lifting_formula(wb, formula) {
+        LiteralValue::Error(error) => assert_eq!(error.kind, kind, "{formula}"),
+        other => panic!("{formula}: expected {kind:?}, got {other:?}"),
+    }
+}
+
+/// ES-063 D01 and its SUMIFS/AVERAGEIF/AVERAGEIFS siblings, which share
+/// `eval_if_family`: an error in a SELECTED cell of the sum/average range
+/// propagates out of the function.
+#[test]
+fn es063_criteria_aggregates_propagate_a_matched_range_error() {
+    let wb = es063_workbook();
+    es063_error(&wb, "=SUMIF(A1:A4,\"k\",B1:B4)", ExcelErrorKind::Div);
+    es063_error(&wb, "=SUMIFS(B1:B4,A1:A4,\"k\")", ExcelErrorKind::Div);
+    es063_error(&wb, "=AVERAGEIF(A1:A4,\"k\",B1:B4)", ExcelErrorKind::Div);
+    es063_error(&wb, "=AVERAGEIFS(B1:B4,A1:A4,\"k\")", ExcelErrorKind::Div);
+}
+
+/// The AVERAGE arm needs a SECOND error kind to say anything.
+///
+/// `eval_if_family` already answers `#DIV/0!` from its `Average` arm whenever
+/// `total_count == 0`, so an AVERAGEIF that propagated NOTHING but selected
+/// nothing would look identical to one that propagated the fixture's
+/// `#DIV/0!`. Column E carries a `#VALUE!` in the matched row instead, so
+/// these two assert the PROPAGATED KIND and cannot be satisfied by the
+/// empty-selection path. (Raised by the GOD-289 pre-build review.)
+#[test]
+fn es063_average_arm_propagates_the_error_kind_not_an_empty_selection() {
+    let wb = es063_workbook();
+    es063_error(&wb, "=AVERAGEIF(A1:A4,\"k\",E1:E4)", ExcelErrorKind::Value);
+    es063_error(&wb, "=AVERAGEIFS(E1:E4,A1:A4,\"k\")", ExcelErrorKind::Value);
+    es063_error(&wb, "=SUMIF(A1:A4,\"k\",E1:E4)", ExcelErrorKind::Value);
+    // and the empty selection still answers #DIV/0! for its own reason
+    es063_error(&wb, "=AVERAGEIF(A1:A4,\"z\",B1:B4)", ExcelErrorKind::Div);
+}
+
+/// ES-063 D02: the other half of the rule, and the half this fix must NOT
+/// move. An error in a row the criteria does not select is never read.
+#[test]
+fn es063_criteria_aggregates_do_not_read_an_unmatched_range_error() {
+    let wb = es063_workbook();
+    assert_eq!(es063_number(&wb, "=SUMIF(C1:C4,\"k\",D1:D4)"), 11.0);
+    assert_eq!(es063_number(&wb, "=SUMIFS(D1:D4,C1:C4,\"k\")"), 11.0);
+    assert_eq!(es063_number(&wb, "=AVERAGEIF(C1:C4,\"k\",D1:D4)"), 5.5);
+    assert_eq!(es063_number(&wb, "=AVERAGEIFS(D1:D4,C1:C4,\"k\")"), 5.5);
+}
+
+/// ES-063 D03: the control. Plain `SUM` over the same range propagates any
+/// error, matched or not, and did so before this round too.
+#[test]
+fn es063_plain_sum_control_propagates_any_range_error() {
+    let wb = es063_workbook();
+    es063_error(&wb, "=SUM(B1:B4)", ExcelErrorKind::Div);
+    es063_error(&wb, "=SUM(D1:D4)", ExcelErrorKind::Div);
+}
+
+/// A criteria that selects nothing does not select the error cell either, so
+/// the answer stays 0 -- the empty-selection arm of the same rule.
+#[test]
+fn es063_criteria_matching_nothing_never_reads_the_error() {
+    let wb = es063_workbook();
+    assert_eq!(es063_number(&wb, "=SUMIF(A1:A4,\"z\",B1:B4)"), 0.0);
+}
+
+/// The COUNT arm has no sum_range and no Excel oracle in this project, so the
+/// fix deliberately leaves it alone. This pins that it did not move.
+#[test]
+fn es063_count_arm_is_unchanged_and_has_no_oracle() {
+    let wb = es063_workbook();
+    assert_eq!(es063_number(&wb, "=COUNTIF(A1:A4,\"k\")"), 2.0);
+    assert_eq!(es063_number(&wb, "=COUNTIFS(A1:A4,\"k\")"), 2.0);
+    // An error INSIDE the criteria_range: counted as non-matching, no oracle.
+    assert_eq!(es063_number(&wb, "=COUNTIF(B1:B4,\">0\")"), 3.0);
+}
+
+/// The two-argument form, where the criteria range IS the sum range. The
+/// numeric comparison `">4"` leaves the error position an Arrow null, so the
+/// mask is invalid there and the cell is selected by neither
+/// `first_selected_error` nor `filter_array`: the answer is 5 + 7 + 9.
+#[test]
+fn es063_two_argument_sumif_does_not_select_the_error_cell() {
+    let wb = es063_workbook();
+    assert_eq!(es063_number(&wb, "=SUMIF(B1:B4,\">4\")"), 21.0);
 }
