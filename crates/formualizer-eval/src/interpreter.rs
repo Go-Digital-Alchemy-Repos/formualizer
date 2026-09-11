@@ -176,6 +176,15 @@ fn elementwise_lift_refused_by_range_reference(
 #[derive(Clone)]
 pub enum LocalBinding {
     Value(LiteralValue),
+    /// A local bound to a spreadsheet reference expression.
+    ///
+    /// `value` is exactly what [`LocalBinding::Value`] would have carried, so the
+    /// value path is unchanged; `reference` additionally lets a by-ref argument
+    /// slot see the range the local was bound to (CL-085).
+    ValueWithReference {
+        value: LiteralValue,
+        reference: ReferenceType,
+    },
     Callable(Arc<dyn crate::traits::CustomCallable>),
 }
 
@@ -351,6 +360,9 @@ impl<'a> Interpreter<'a> {
         };
         match self.local_env.lookup(name)? {
             LocalBinding::Value(v) => Some(crate::traits::CalcValue::Scalar(v)),
+            LocalBinding::ValueWithReference { value, .. } => {
+                Some(crate::traits::CalcValue::Scalar(value))
+            }
             LocalBinding::Callable(c) => Some(crate::traits::CalcValue::Callable(c)),
         }
     }
@@ -361,12 +373,24 @@ impl<'a> Interpreter<'a> {
         }
         match self.local_env.lookup(name)? {
             LocalBinding::Callable(c) => Some(c),
-            LocalBinding::Value(_) => None,
+            LocalBinding::Value(_) | LocalBinding::ValueWithReference { .. } => None,
         }
     }
 
     pub fn resolve_local_name(&self, name: &str) -> Option<LocalBinding> {
         self.local_env.lookup(name)
+    }
+
+    /// The spreadsheet reference a LET/LAMBDA local was bound to, when it was
+    /// bound to a reference expression rather than a computed value (CL-085).
+    pub fn resolve_local_bound_reference(&self, name: &str) -> Option<ReferenceType> {
+        if self.local_env.is_empty() {
+            return None;
+        }
+        match self.local_env.lookup(name)? {
+            LocalBinding::ValueWithReference { reference, .. } => Some(reference),
+            LocalBinding::Value(_) | LocalBinding::Callable(_) => None,
+        }
     }
 
     pub fn resolve_range_view<'c>(
@@ -1378,13 +1402,19 @@ impl<'a> Interpreter<'a> {
 
                 if let Some(callable) = self.resolve_local_callable(name) {
                     let mut eval_args = Vec::with_capacity(args.len());
+                    let mut arg_references = Vec::with_capacity(args.len());
                     for arg_id in args {
+                        // Same rule as the AST twin above (CL-085).
+                        arg_references.push(
+                            ArgumentHandle::new_arena(*arg_id, self, data_store, sheet_registry)
+                                .bound_reference_in_env(&self.local_env),
+                        );
                         eval_args.push(
                             self.evaluate_arena_ast(*arg_id, data_store, sheet_registry)?
                                 .into_literal(),
                         );
                     }
-                    return callable.invoke(self, &eval_args);
+                    return callable.invoke_with_references(self, &eval_args, &arg_references);
                 }
 
                 Err(ExcelError::new(ExcelErrorKind::Name)
@@ -2213,10 +2243,16 @@ impl<'a> Interpreter<'a> {
 
         if let Some(callable) = self.resolve_local_callable(name) {
             let mut eval_args = Vec::with_capacity(args.len());
+            let mut arg_references = Vec::with_capacity(args.len());
             for arg in args {
+                // Same rule `LET` uses to keep a bound range (CL-085): a
+                // syntactic reference expression, or a local that itself
+                // carries a bound reference; nothing else.
+                arg_references
+                    .push(ArgumentHandle::new(arg, self).bound_reference_in_env(&self.local_env));
                 eval_args.push(self.evaluate_ast(arg)?.into_literal());
             }
-            return callable.invoke(self, &eval_args);
+            return callable.invoke_with_references(self, &eval_args, &arg_references);
         }
 
         // Include the function name in the error message for better debugging
