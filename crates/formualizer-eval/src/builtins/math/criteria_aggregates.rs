@@ -136,13 +136,17 @@ fn range_or_scalar<'a, 'b>(
 /// holds, and no caller in the held corpus has that shape.
 fn first_selected_error(
     view: &crate::engine::range_view::RangeView<'_>,
-    numeric_col: &arrow_array::Float64Array,
+    numeric_col: Option<&arrow_array::Float64Array>,
     mask: Option<&BooleanArray>,
     row_start: usize,
     row_len: usize,
     col: usize,
 ) -> Option<ExcelError> {
-    if numeric_col.null_count() == 0 {
+    // `numeric_col` is None when `slice_numbers` found NO numeric data in the
+    // column at all -- which is exactly the Knighthead band-A shape, where
+    // every one of the 1,301 `Calc!BL` cells is `#VALUE!`. The scan must still
+    // run there; only the all-numeric fast path depends on having a column.
+    if numeric_col.is_some_and(|c| c.null_count() == 0) {
         return None;
     }
     // Every mask on every path into this function is built at `row_len`, and a
@@ -158,7 +162,7 @@ fn first_selected_error(
         {
             continue;
         }
-        if i < numeric_col.len() && numeric_col.is_valid(i) {
+        if numeric_col.is_some_and(|c| i < c.len() && c.is_valid(i)) {
             continue;
         }
         if let LiteralValue::Error(e) = view.get_cell(row_start + i, col) {
@@ -682,23 +686,27 @@ fn eval_if_family<'a, 'b>(
                             let target_col = sum_slices
                                 .as_ref()
                                 .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
+                            // ES-063: a selected cell carrying an error
+                            // propagates, before any arithmetic. This runs
+                            // whether or not `slice_numbers` produced a column:
+                            // it produces none when the range holds no numeric
+                            // cell at all, and a range of nothing but errors is
+                            // precisely the case that must propagate.
+                            if let Some(ref sv) = sum_view
+                                && let Some(e) = first_selected_error(
+                                    sv,
+                                    target_col.map(|tc| tc.as_ref()),
+                                    Some(&mask),
+                                    row_start,
+                                    row_len,
+                                    c,
+                                )
+                            {
+                                return Ok(crate::traits::CalcValue::Scalar(
+                                    LiteralValue::Error(e),
+                                ));
+                            }
                             if let Some(tc) = target_col {
-                                // ES-063: a selected cell carrying an error
-                                // propagates, before any arithmetic.
-                                if let Some(ref sv) = sum_view
-                                    && let Some(e) = first_selected_error(
-                                        sv,
-                                        tc.as_ref(),
-                                        Some(&mask),
-                                        row_start,
-                                        row_len,
-                                        c,
-                                    )
-                                {
-                                    return Ok(crate::traits::CalcValue::Scalar(
-                                        LiteralValue::Error(e),
-                                    ));
-                                }
                                 let filtered = filter_array(tc.as_ref(), &mask).unwrap();
                                 let f64_arr =
                                     filtered.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -725,17 +733,18 @@ fn eval_if_family<'a, 'b>(
                             let target_col = sum_slices
                                 .as_ref()
                                 .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
+                            // ES-063, with every cell selected.
+                            if let Some(ref sv) = sum_view
+                                && let Some(e) = first_selected_error(
+                                    sv, target_col.map(|tc| tc.as_ref()), None,
+                                    row_start, row_len, c,
+                                )
+                            {
+                                return Ok(crate::traits::CalcValue::Scalar(
+                                    LiteralValue::Error(e),
+                                ));
+                            }
                             if let Some(tc) = target_col {
-                                // ES-063, with every cell selected.
-                                if let Some(ref sv) = sum_view
-                                    && let Some(e) = first_selected_error(
-                                        sv, tc.as_ref(), None, row_start, row_len, c,
-                                    )
-                                {
-                                    return Ok(crate::traits::CalcValue::Scalar(
-                                        LiteralValue::Error(e),
-                                    ));
-                                }
                                 if let Some(s) = sum_array::<Float64Type, _>(tc.as_ref()) {
                                     total_sum += s;
                                 }

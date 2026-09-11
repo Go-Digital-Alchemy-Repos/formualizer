@@ -2812,3 +2812,52 @@ fn es063_two_argument_sumif_does_not_select_the_error_cell() {
     let wb = es063_workbook();
     assert_eq!(es063_number(&wb, "=SUMIF(B1:B4,\">4\")"), 21.0);
 }
+
+/// ES-063 on a sum range with NO numeric cell at all -- the shape the first
+/// draft of this fix could not see, found by measurement rather than review.
+///
+/// `RangeView::slice_numbers` renders a column with no numeric data as `None`,
+/// not as an all-null array, and the fix's first draft did its error scan
+/// inside `if let Some(tc) = target_col`. So `SUMIF` over a range of nothing
+/// but errors kept answering 0 even with ES-063 in.
+///
+/// That is not a corner case here: it is the exact Knighthead band-A shape.
+/// GOD-289 G3e read `Calc!BL5:BL1305` on captured rows 447 and 449 and
+/// measured 1,301 cells, ALL `#VALUE!`, with 93 of the 101 band-A criteria
+/// keys selecting at least one of them -- and the engine still answering 101
+/// zeros. The clean-room reproduction and the isolation of the cause from
+/// range length and error kind are the round's P4 probe
+/// (`p4_sumif_all_error_column_probe.py`).
+///
+/// Fixture: `A1:A4` = k, k, m, m; `F1:F4` = four `#VALUE!` cells with no
+/// numeric neighbour; `G1:G4` = three `#VALUE!` and one number, so that
+/// column DOES have numeric data and is the discriminating control.
+#[test]
+fn es063_propagates_from_a_sum_range_with_no_numeric_cell_at_all() {
+    let val = || LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+    let k = || LiteralValue::Text("k".into());
+    let m = || LiteralValue::Text("m".into());
+    let wb = TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![k(), val(), val()],
+            vec![k(), val(), val()],
+            vec![m(), val(), val()],
+            vec![m(), val(), LiteralValue::Int(4)],
+        ],
+    );
+    // column B is entirely #VALUE!; column C is #VALUE! except an UNMATCHED
+    // numeric row, so `slice_numbers` yields a column there and not here.
+    es063_error(&wb, "=SUMIF(A1:A4,\"k\",B1:B4)", ExcelErrorKind::Value);
+    es063_error(&wb, "=SUMIFS(B1:B4,A1:A4,\"k\")", ExcelErrorKind::Value);
+    es063_error(&wb, "=AVERAGEIF(A1:A4,\"k\",B1:B4)", ExcelErrorKind::Value);
+    es063_error(&wb, "=AVERAGEIFS(B1:B4,A1:A4,\"k\")", ExcelErrorKind::Value);
+    es063_error(&wb, "=SUMIF(A1:A4,\"k\",C1:C4)", ExcelErrorKind::Value);
+    // the unmatched half must still hold on an all-error column: a criteria
+    // that selects nothing reads nothing and answers 0.
+    assert_eq!(es063_number(&wb, "=SUMIF(A1:A4,\"z\",B1:B4)"), 0.0);
+    // and the leading unary minus the Knighthead leaf carries propagates too
+    es063_error(&wb, "=-SUMIF(A1:A4,\"k\",B1:B4)", ExcelErrorKind::Value);
+}
