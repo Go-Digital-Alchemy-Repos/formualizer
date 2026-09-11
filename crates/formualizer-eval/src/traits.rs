@@ -390,6 +390,39 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// CL-087 / ES-008: is this argument a LIVE MULTI-CELL RANGE REFERENCE?
+    ///
+    /// Used only by the interpreter's element-wise lifting sites, to enforce
+    /// `Function::elementwise_lift_refuses_range_reference` (the
+    /// Analysis-ToolPak lineage of EDATE/EOMONTH, which lifts over an array
+    /// VALUE but refuses a live range reference).
+    ///
+    /// The test is deliberately structural rather than value-based: only an
+    /// argument that IS a reference node, resolving to more than one cell,
+    /// counts. An array VALUE — a computed array, an inline array literal, or
+    /// a LET/LAMBDA local materialised to a value on this fork — is not a
+    /// reference node and therefore lifts. A projected handle (one carrying a
+    /// `value_override` from an enclosing lift) is a scalar and never counts.
+    /// A SINGLE-CELL reference resolves to `(1, 1)` and never counts.
+    pub(crate) fn is_multi_cell_range_reference(&self) -> bool {
+        if self.value_override.is_some() {
+            return false;
+        }
+        let is_reference_node = match &self.expr {
+            ArgumentExpr::Ast(node) => {
+                matches!(node.node_type, ASTNodeType::Reference { .. })
+            }
+            ArgumentExpr::Arena { id, data_store, .. } => matches!(
+                data_store.get_node(*id),
+                Some(crate::engine::arena::AstNodeData::Reference { .. })
+            ),
+        };
+        if !is_reference_node {
+            return false;
+        }
+        matches!(self.shape_hint(), Some((rows, cols)) if rows > 1 || cols > 1)
+    }
+
     pub(crate) fn value_at(&self, row: usize, col: usize) -> Result<LiteralValue, ExcelError> {
         if let Some(value) = &self.value_override {
             return Ok(value.clone().into_literal());

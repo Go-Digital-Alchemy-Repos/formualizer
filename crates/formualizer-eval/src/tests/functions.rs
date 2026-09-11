@@ -2262,6 +2262,13 @@ fn cl087_lifted_positions(name: &str, args_len: usize) -> Option<Vec<usize>> {
         .elementwise_lifted_positions(args_len)
 }
 
+fn cl087_lift_refuses_range_reference(name: &str) -> bool {
+    ensure_lifting_builtins();
+    crate::function_registry::get("", name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+        .elementwise_lift_refuses_range_reference()
+}
+
 #[test]
 fn cl087_date_parts_lift_over_a_range() {
     // Excel measured, 16.105.3, OT-198 receipt `g4d_excel_cse_probe.json`.
@@ -2424,12 +2431,49 @@ fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
     // entry only, 1 cell filled, so no spill. No array-entry row exists for
     // EDATE over a range.
     cl087_scalar_error(&wb, "=EDATE(A1:A3,0)", ExcelErrorKind::Value);
-    // NOT Excel measured: the receipt has NO row for EDATE reached through a
-    // LET local, in either entry mode. This assertion extends the measured
-    // EDATE(A1:A3,0) answer to the LET-local shape on the reasoning that a LET
-    // local binds the range unchanged (which rows Q19/Q29 show for YEAR). It
-    // is a declared residual for a later Excel oracle.
-    cl087_scalar_error(&wb, "=LET(r,A1:A3,EDATE(r,0))", ExcelErrorKind::Value);
+    // The LET-local shape is NOT asserted here. It used to be, extending the
+    // measured EDATE(A1:A3,0) answer to `=LET(r,A1:A3,EDATE(r,0))` on the
+    // reasoning that a LET local binds the range unchanged; on this fork it
+    // does not. See `cl087_atp_date_offsets_through_a_let_local_is_cl085`
+    // below, which PINS the measured behaviour and states why it diverges.
+}
+
+/// PINS a MEASURED divergence from desktop Excel that this change does not
+/// cause and must not be read as endorsing.
+///
+/// MEASURED on this fork after the CL-087 array-value lift (GOD-286, fork
+/// `lead/god286-cl087-array-lifting`):
+///   `=LET(r,A1:A3,EDATE(r,0))`   -> {45000;45001;45002}  (LIFTS, no error)
+///   `=LET(r,A1:A3,EOMONTH(r,0))` -> {45016;45016;45016}  (LIFTS, no error)
+///
+/// EXCEL EXPECTATION: `#VALUE!` for both, no spill. In desktop Excel a LET
+/// range local keeps its reference-ness — `LET(r,A1:A3,YEAR(r))` behaves
+/// exactly like `YEAR(A1:A3)` (OT-198 `g4d_excel_cse_probe.json`, row
+/// `Q29_let_local_range_year_dynamic` vs row `Q27_year_range_dynamic`) — so
+/// the ATP range-reference refusal Excel shows at rows Q32/Q33 would apply
+/// through the local too.
+///
+/// CAUSE OF THE DIVERGENCE: it is NOT the array-value lift added here, and NOT
+/// the range-reference refusal, which is enforced at every one of the
+/// interpreter's five lifting sites. It is CL-085, the missing
+/// reference-preserving LET binding: on this fork a LET local is materialised
+/// as a VALUE (measured: `ISREF` on a range-bound local is FALSE), so the
+/// refusal cannot see a reference to refuse and the argument presents as an
+/// array value, which this change lifts by design. CL-085 is fixed on a
+/// different candidate lineage (fork 6da35585) that is NOT in this round's
+/// base; when that binding lands, these two formulas should return to
+/// `#VALUE!` and this test is the one to update.
+#[test]
+fn cl087_atp_date_offsets_through_a_let_local_is_cl085() {
+    let wb = cl087_workbook();
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,A1:A3,EDATE(r,0))"),
+        vec![45000.0, 45001.0, 45002.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,A1:A3,EOMONTH(r,0))"),
+        vec![45016.0, 45016.0, 45016.0]
+    );
 }
 
 /// EDATE's SECOND slot (`months`) with a multi-cell range: the shape that
@@ -2496,8 +2540,105 @@ fn cl087_lookup_family_lifted_positions_are_unchanged() {
         assert!(!xlookup.contains(&slot), "XLOOKUP slot {slot}");
     }
 
-    // Reducers and the ATP date offsets do not lift at all.
+    // Reducers do not lift at all.
     assert_eq!(cl087_lifted_positions("SUM", 3), None);
-    assert_eq!(cl087_lifted_positions("EDATE", 2), None);
-    assert_eq!(cl087_lifted_positions("EOMONTH", 2), None);
+
+    // The ATP date offsets: this assertion CHANGED in GOD-286's second
+    // CL-087 commit. It read `None` for both while EDATE/EOMONTH carried no
+    // element-wise declaration at all. They now declare `FnCaps::ELEMENTWISE`
+    // (so both scalar slots lift over an ARRAY VALUE) PLUS the separate
+    // refusal `elementwise_lift_refuses_range_reference`, which keeps the
+    // Excel-measured `#VALUE!` over a live multi-cell RANGE REFERENCE
+    // (OT-198 `g4d_excel_cse_probe.json` rows Q32/Q33). The measured refusal
+    // is pinned by `cl087_atp_date_offsets_do_not_lift_over_a_range`; the
+    // positions below only say which slots the lift covers.
+    assert_eq!(cl087_lifted_positions("EDATE", 2), Some(vec![0, 1]));
+    assert_eq!(cl087_lifted_positions("EOMONTH", 2), Some(vec![0, 1]));
+    assert!(cl087_lift_refuses_range_reference("EDATE"));
+    assert!(cl087_lift_refuses_range_reference("EOMONTH"));
+    // Nothing else in the registry declares the refusal.
+    for name in ["YEAR", "DATE", "ROUNDUP", "ABS", "XLOOKUP", "IF", "SUM"] {
+        assert!(
+            !cl087_lift_refuses_range_reference(name),
+            "{name} must not declare the ATP range-reference refusal"
+        );
+    }
+}
+
+// ─────────── CL-087 / ES-008: the ATP pair lifts over an ARRAY VALUE ────────
+//
+// EDATE and EOMONTH now declare `FnCaps::ELEMENTWISE` AND
+// `Function::elementwise_lift_refuses_range_reference`. That third state is
+// "lifts element-wise over an array VALUE, refuses a live multi-cell RANGE
+// REFERENCE and keeps its existing scalar-coercion `#VALUE!` there".
+//
+// Provenance of the two halves:
+//  - the RANGE-REFERENCE refusal is Excel-measured (16.105.3, dynamic-array
+//    entry): OT-198 receipt `g4d_excel_cse_probe.json` rows
+//    `Q32_eomonth_range_dynamic` and `Q33_edate_range_dynamic`. It is pinned
+//    by `cl087_atp_date_offsets_do_not_lift_over_a_range` above and MUST NOT
+//    REGRESS.
+//  - the ARRAY-VALUE lift has NO DIRECT clean-room Excel row. It rests on the
+//    HELD-CALLER measurement: at the Knighthead producer cell EOMONTH receives
+//    an array value (TYPE 64, 10 elements, `ISREF` FALSE) produced by DATE and
+//    desktop Excel computes a NUMBER there (OT-198 g4c and GOD-286 receipt
+//    `g3c_producer_bisect.json`).
+//
+// Invented data only, from `cl087_workbook()`: A1:A3 are the serials
+// 45000/45001/45002 (2023-03-15/16/17), whose common month end 2023-03-31 is
+// serial 45016. B1 is the scalar control 45000.
+
+#[test]
+fn cl087_atp_date_offsets_lift_over_an_array_value() {
+    let wb = cl087_workbook();
+    // IF(...) produces an array VALUE, not a range reference, so the refusal
+    // does not fire and the pair lifts element-wise.
+    assert_eq!(
+        cl087_elementwise(&wb, "=EOMONTH(IF(ISNUMBER(A1:A3),A1:A3,0),0)"),
+        vec![45016.0, 45016.0, 45016.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=EDATE(IF(ISNUMBER(A1:A3),A1:A3,0),0)"),
+        vec![45000.0, 45001.0, 45002.0]
+    );
+}
+
+#[test]
+fn cl087_atp_date_offsets_lift_over_an_inline_array_literal() {
+    // An inline array literal is an array VALUE too: same lift, no refusal.
+    let wb = cl087_workbook();
+    assert_eq!(
+        cl087_elementwise(&wb, "=EOMONTH({45000,45001},0)"),
+        vec![45016.0, 45016.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=EDATE({45000,45001},0)"),
+        vec![45000.0, 45001.0]
+    );
+}
+
+#[test]
+fn cl087_atp_date_offsets_scalar_controls_are_unchanged() {
+    // B1 is a SINGLE-CELL reference. A single-cell reference is not a
+    // multi-cell range and must NOT trigger the refusal; it dispatches
+    // scalar-wise and answers a plain number, exactly as before this change.
+    let wb = cl087_workbook();
+    assert_eq!(cl087_scalar(&wb, "=EOMONTH(B1,0)"), 45016.0);
+    assert_eq!(cl087_scalar(&wb, "=EDATE(B1,0)"), 45000.0);
+    // Literal scalars, the pre-existing path.
+    assert_eq!(cl087_scalar(&wb, "=EOMONTH(45000,0)"), 45016.0);
+    assert_eq!(cl087_scalar(&wb, "=EDATE(45000,0)"), 45000.0);
+}
+
+#[test]
+fn cl087_single_cell_reference_does_not_trigger_the_range_refusal() {
+    // The refusal is a property of a MULTI-CELL range reference only. A
+    // single-cell reference resolves to (1,1) and lifts (a no-op lift), so a
+    // one-cell range used in an aggregation still computes rather than
+    // erroring, while the three-cell range still refuses.
+    let wb = cl087_workbook();
+    assert_eq!(cl087_scalar(&wb, "=SUM(EOMONTH(A1:A1,0))"), 45016.0);
+    assert_eq!(cl087_scalar(&wb, "=SUM(EDATE(A1:A1,0))"), 45000.0);
+    cl087_scalar_error(&wb, "=SUM(EOMONTH(A1:A3,0))", ExcelErrorKind::Value);
+    cl087_scalar_error(&wb, "=SUM(EDATE(A1:A3,0))", ExcelErrorKind::Value);
 }

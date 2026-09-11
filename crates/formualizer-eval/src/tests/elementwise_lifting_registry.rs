@@ -212,3 +212,42 @@ fn elementwise_lifted_positions_registry_anchor() {
         );
     }
 }
+
+/// CL-087: registry-wide anchor for the SECOND lifting declaration.
+///
+/// `elementwise_lifted_positions.txt` records WHICH slots lift, but not the
+/// Analysis-ToolPak asymmetry — "lifts over an array VALUE, refuses a live
+/// multi-cell RANGE REFERENCE" — which is declared separately by
+/// `Function::elementwise_lift_refuses_range_reference`. Exactly two functions
+/// may carry it, and both of them must also lift; anything else is a
+/// declaration that the table above would not show as a diff.
+#[test]
+fn only_the_atp_date_offsets_refuse_a_range_reference() {
+    static BUILTINS: std::sync::Once = std::sync::Once::new();
+    BUILTINS.call_once(crate::builtins::load_builtins);
+
+    let mut refusing: Vec<String> = crate::function_registry::snapshot_registered()
+        .into_iter()
+        .filter(|(_, name, _)| !HOSTILE_TEST_FIXTURES.contains(&name.as_str()))
+        .filter_map(|(namespace, name, function)| {
+            if !function.elementwise_lift_refuses_range_reference() {
+                return None;
+            }
+            // A refusal only means anything on a function that lifts at all.
+            assert!(
+                function
+                    .elementwise_lifted_positions(probe_arity(function.as_ref()))
+                    .is_some(),
+                "{name} declares the range-reference refusal but does not lift"
+            );
+            Some(if namespace.is_empty() {
+                name
+            } else {
+                format!("{namespace}::{name}")
+            })
+        })
+        .collect();
+    refusing.sort();
+
+    assert_eq!(refusing, vec!["EDATE".to_string(), "EOMONTH".to_string()]);
+}

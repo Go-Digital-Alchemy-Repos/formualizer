@@ -153,6 +153,26 @@ fn array_lifted_argument_positions(
     fun.elementwise_lifted_positions(args_len)
 }
 
+/// CL-087 / ES-008: does the callee's declared refusal of a LIVE MULTI-CELL
+/// RANGE REFERENCE fire for this call?
+///
+/// The Analysis-ToolPak pair EDATE/EOMONTH lifts element-wise over an array
+/// VALUE but keeps its scalar-coercion `#VALUE!` when a live multi-cell range
+/// reference arrives in a lifted slot (see `builtins/datetime/edate_eomonth.rs`
+/// for the measurement). When this returns `true` the caller must fall through
+/// to the ordinary scalar dispatch, which is what produces that error.
+fn elementwise_lift_refused_by_range_reference(
+    fun: &dyn crate::function::Function,
+    handles: &[ArgumentHandle<'_, '_>],
+    lifted_positions: &[usize],
+) -> bool {
+    fun.elementwise_lift_refuses_range_reference()
+        && lifted_positions
+            .iter()
+            .filter_map(|position| handles.get(*position))
+            .any(ArgumentHandle::is_multi_cell_range_reference)
+}
+
 #[derive(Clone)]
 pub enum LocalBinding {
     Value(LiteralValue),
@@ -567,6 +587,43 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// CL-087 / ES-008: is this AST argument a LIVE MULTI-CELL RANGE REFERENCE?
+    /// The AST-side twin of `ArgumentHandle::is_multi_cell_range_reference`,
+    /// used by the two shape-hint lifting sites, which see nodes rather than
+    /// argument handles.
+    fn ast_is_multi_cell_range_reference(&self, node: &ASTNode) -> bool {
+        let ASTNodeType::Reference { reference, .. } = &node.node_type else {
+            return false;
+        };
+        let Ok(reference) = self.effective_reference(reference) else {
+            return false;
+        };
+        matches!(
+            probe_range_dimensions(self.context, self.current_sheet, &reference),
+            Some((rows, cols)) if rows > 1 || cols > 1
+        )
+    }
+
+    /// Arena twin of [`Self::ast_is_multi_cell_range_reference`].
+    fn arena_is_multi_cell_range_reference(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> bool {
+        let Some(AstNodeData::Reference { ref_type, .. }) = data_store.get_node(node_id) else {
+            return false;
+        };
+        let reference = data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+        let Ok(reference) = self.effective_reference(&reference) else {
+            return false;
+        };
+        matches!(
+            probe_range_dimensions(self.context, self.current_sheet, &reference),
+            Some((rows, cols)) if rows > 1 || cols > 1
+        )
+    }
+
     pub(crate) fn ast_shape_hint(&self, node: &ASTNode) -> Option<(usize, usize)> {
         match &node.node_type {
             ASTNodeType::Literal(LiteralValue::Array(rows)) => {
@@ -587,6 +644,18 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::Function { name, args } => {
                 let function = self.context.get_function("", name)?;
                 let positions = array_lifted_argument_positions(function.as_ref(), args.len())?;
+                // CL-087: the callee refuses a live multi-cell range reference
+                // in a lifted slot. It will take the ordinary scalar path and
+                // answer a scalar error, so report the same "no lifted shape"
+                // an entirely unlifted callee reports on the line above.
+                if function.elementwise_lift_refuses_range_reference()
+                    && positions
+                        .iter()
+                        .filter_map(|position| args.get(*position))
+                        .any(|arg| self.ast_is_multi_cell_range_reference(arg))
+                {
+                    return None;
+                }
                 let shapes: Vec<_> = positions
                     .iter()
                     .filter_map(|position| args.get(*position))
@@ -876,6 +945,21 @@ impl<'a> Interpreter<'a> {
                 let function = self.context.get_function("", raw_name)?;
                 let args = data_store.get_args(node_id)?;
                 let positions = array_lifted_argument_positions(function.as_ref(), args.len())?;
+                // CL-087: see the twin check in `ast_shape_hint`.
+                if function.elementwise_lift_refuses_range_reference()
+                    && positions
+                        .iter()
+                        .filter_map(|position| args.get(*position))
+                        .any(|arg| {
+                            self.arena_is_multi_cell_range_reference(
+                                *arg,
+                                data_store,
+                                sheet_registry,
+                            )
+                        })
+                {
+                    return None;
+                }
                 let shapes: Vec<_> = positions
                     .iter()
                     .filter_map(|position| args.get(*position))
@@ -1759,6 +1843,11 @@ impl<'a> Interpreter<'a> {
         let Some(lifted_positions) = array_lifted_argument_positions(fun, handles.len()) else {
             return fun.dispatch(handles, fctx);
         };
+        // CL-087: the callee refuses a live multi-cell range reference in a
+        // lifted slot; fall through to the ordinary scalar dispatch.
+        if elementwise_lift_refused_by_range_reference(fun, handles, &lifted_positions) {
+            return fun.dispatch(handles, fctx);
+        }
         if fun.name().eq_ignore_ascii_case("IF") {
             return self.dispatch_if_block_at(fun, handles, fctx, row, col);
         }
@@ -1799,6 +1888,14 @@ impl<'a> Interpreter<'a> {
                 .dispatch(handles, fctx)
                 .map(|value| self.project_calc_value(value, row, col));
         };
+
+        // CL-087: the callee refuses a live multi-cell range reference in a
+        // lifted slot; fall through to the ordinary scalar dispatch.
+        if elementwise_lift_refused_by_range_reference(fun, handles, &lifted_positions) {
+            return fun
+                .dispatch(handles, fctx)
+                .map(|value| self.project_calc_value(value, row, col));
+        }
 
         if fun.name().eq_ignore_ascii_case("IF") {
             return self
@@ -1956,6 +2053,12 @@ impl<'a> Interpreter<'a> {
         let Some(lifted_positions) = array_lifted_argument_positions(fun, handles.len()) else {
             return fun.dispatch(handles, fctx);
         };
+
+        // CL-087: the callee refuses a live multi-cell range reference in a
+        // lifted slot; fall through to the ordinary scalar dispatch.
+        if elementwise_lift_refused_by_range_reference(fun, handles, &lifted_positions) {
+            return fun.dispatch(handles, fctx);
+        }
 
         if canonical_name == "IF" {
             if !(2..=3).contains(&handles.len()) {

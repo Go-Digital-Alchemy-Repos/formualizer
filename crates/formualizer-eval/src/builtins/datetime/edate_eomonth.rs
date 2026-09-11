@@ -73,7 +73,7 @@ pub struct EdateFn;
 /// Variadic: false
 /// Signature: EDATE(arg1: number@scalar, arg2: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for EdateFn {
     fn propagate_format(
@@ -83,19 +83,36 @@ impl Function for EdateFn {
         Some(crate::format::FormatId::DATE)
     }
 
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
 
     fn name(&self) -> &'static str {
         "EDATE"
     }
 
-    // ES-008 element-wise lifting (CL-087): deliberately NOT declared.
-    // Desktop Excel 16.105.3 answers `#VALUE!` to `EDATE(A1:A3,0)` under
-    // dynamic-array entry (Range.Formula2) -- the Analysis-ToolPak lineage of
-    // this function does not lift over a multi-cell range. Measured in OT-198
-    // receipt g4d_excel_cse_probe.json row Q33. The array-argument case (an
-    // ARRAY VALUE rather than a range reference) has NO live-Excel
-    // measurement; it is left unlifted as this round's declared residual.
+    // ES-008 element-wise lifting (CL-087), Analysis-ToolPak lineage.
+    //
+    // This function lifts element-wise over an ARRAY VALUE but REFUSES a live
+    // multi-cell RANGE REFERENCE, where it keeps its scalar-coercion `#VALUE!`.
+    //
+    //  - RANGE REFERENCE, measured: desktop Excel 16.105.3 answers `#VALUE!`
+    //    to `EDATE(A1:A3,0)` under dynamic-array entry (Range.Formula2), one
+    //    cell filled, no spill. OT-198 receipt `g4d_excel_cse_probe.json` row
+    //    `Q33_edate_range_dynamic` (EOMONTH is row `Q32`).
+    //  - ARRAY VALUE: there is NO DIRECT clean-room Excel row for this case.
+    //    It rests on the HELD-CALLER measurement instead: at the Knighthead
+    //    producer cell, `EOMONTH` receives an array value (TYPE 64, 10
+    //    elements, `ISREF` FALSE) produced by `DATE`, and desktop Excel
+    //    computes a NUMBER there rather than `#VALUE!` (OT-198 g4c and this
+    //    round's receipt `g3c_producer_bisect.json`). The same receipt
+    //    measured that rewriting those calls into the lifting identity
+    //    `DATE(YEAR(d),MONTH(d)+m+1,0)` makes the producer compute a number on
+    //    the candidate wheel. Excel must therefore lift over an array value.
+    //
+    // The refusal is declared by `elementwise_lift_refuses_range_reference`
+    // below and enforced at the interpreter's lifting sites.
+    fn elementwise_lift_refuses_range_reference(&self) -> bool {
+        true
+    }
 
     fn min_args(&self) -> usize {
         2
@@ -185,7 +202,7 @@ pub struct EomonthFn;
 /// Variadic: false
 /// Signature: EOMONTH(arg1: number@scalar, arg2: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for EomonthFn {
     fn propagate_format(
@@ -195,19 +212,36 @@ impl Function for EomonthFn {
         Some(crate::format::FormatId::DATE)
     }
 
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
 
     fn name(&self) -> &'static str {
         "EOMONTH"
     }
 
-    // ES-008 element-wise lifting (CL-087): deliberately NOT declared.
-    // Desktop Excel 16.105.3 answers `#VALUE!` to `EOMONTH(A1:A3,0)` under
-    // dynamic-array entry (Range.Formula2) -- the Analysis-ToolPak lineage of
-    // this function does not lift over a multi-cell range. Measured in OT-198
-    // receipt g4d_excel_cse_probe.json row Q32. The array-argument case (an
-    // ARRAY VALUE rather than a range reference) has NO live-Excel
-    // measurement; it is left unlifted as this round's declared residual.
+    // ES-008 element-wise lifting (CL-087), Analysis-ToolPak lineage.
+    //
+    // This function lifts element-wise over an ARRAY VALUE but REFUSES a live
+    // multi-cell RANGE REFERENCE, where it keeps its scalar-coercion `#VALUE!`.
+    //
+    //  - RANGE REFERENCE, measured: desktop Excel 16.105.3 answers `#VALUE!`
+    //    to `EOMONTH(A1:A3,0)` under dynamic-array entry (Range.Formula2), one
+    //    cell filled, no spill. OT-198 receipt `g4d_excel_cse_probe.json` row
+    //    `Q32_eomonth_range_dynamic` (EDATE is row `Q33`).
+    //  - ARRAY VALUE: there is NO DIRECT clean-room Excel row for this case.
+    //    It rests on the HELD-CALLER measurement instead: at the Knighthead
+    //    producer cell, `EOMONTH` receives an array value (TYPE 64, 10
+    //    elements, `ISREF` FALSE) produced by `DATE`, and desktop Excel
+    //    computes a NUMBER there rather than `#VALUE!` (OT-198 g4c and this
+    //    round's receipt `g3c_producer_bisect.json`). The same receipt
+    //    measured that rewriting those calls into the lifting identity
+    //    `DATE(YEAR(d),MONTH(d)+m+1,0)` makes the producer compute a number on
+    //    the candidate wheel. Excel must therefore lift over an array value.
+    //
+    // The refusal is declared by `elementwise_lift_refuses_range_reference`
+    // below and enforced at the interpreter's lifting sites.
+    fn elementwise_lift_refuses_range_reference(&self) -> bool {
+        true
+    }
 
     fn min_args(&self) -> usize {
         2

@@ -693,7 +693,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "datetime",
     "implementationSource": "crates/formualizer-eval/src/builtins/datetime/edate_eomonth.rs",
@@ -737,7 +738,8 @@
       }
     ],
     "caps": [
-      "PURE"
+      "PURE",
+      "ELEMENTWISE"
     ],
     "category": "datetime",
     "implementationSource": "crates/formualizer-eval/src/builtins/datetime/edate_eomonth.rs",

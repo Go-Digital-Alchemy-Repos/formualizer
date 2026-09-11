@@ -150,6 +150,21 @@ pub trait Function: Send + Sync + 'static {
         ))
     }
 
+    /// ES-008 / Analysis-ToolPak lineage (CL-087): this function lifts
+    /// element-wise over an array VALUE but refuses a live multi-cell RANGE
+    /// REFERENCE, where it keeps its ordinary scalar-coercion error.
+    ///
+    /// `false` (the default) means the lifted positions of
+    /// [`Function::elementwise_lifted_positions`] lift over both. A single-cell
+    /// reference is not a multi-cell range and never triggers the refusal.
+    ///
+    /// The only implementors are EDATE and EOMONTH; see
+    /// `builtins/datetime/edate_eomonth.rs` for the measurement that forces the
+    /// asymmetry.
+    fn elementwise_lift_refuses_range_reference(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str;
     fn namespace(&self) -> &'static str {
         ""

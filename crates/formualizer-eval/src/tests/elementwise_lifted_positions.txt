@@ -114,9 +114,9 @@ DSTDEVP	3	none
 DSUM	3	none
 DVAR	3	none
 DVARP	3	none
-EDATE	2	none
+EDATE	2	0,1
 EFFECT	2	none
-EOMONTH	2	none
+EOMONTH	2	0,1
 ERF	4	none
 ERF.PRECISE	1	none
 ERFC	1	none
