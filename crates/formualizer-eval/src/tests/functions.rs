@@ -2172,3 +2172,257 @@ fn binary_lifted_scalar_override_cannot_reenter_reference_resolution() {
         LiteralValue::Text("B".into())
     );
 }
+
+// ───────────────────────── CL-087 / ES-008 element-wise lifting ─────────────
+//
+// The lifted-argument set used to be a hard-coded function-NAME allowlist in
+// the interpreter. It is now owned by the callee via
+// `Function::elementwise_lifted_positions`, driven by `FnCaps::ELEMENTWISE`
+// and the declared argument schema. These tests pin the behaviour that change
+// is supposed to produce.
+//
+// Invented data only. A1:A3 hold the date serials 45000/45001/45002
+// (2023-03-15/16/17), B1 holds 45000 as a scalar control, and C1:C3 hold the
+// years 2021/2022/2023.
+
+fn cl087_workbook() -> TestWorkbook {
+    TestWorkbook::new().with_range(
+        "Sheet1",
+        1,
+        1,
+        vec![
+            vec![
+                LiteralValue::Int(45000),
+                LiteralValue::Int(45000),
+                LiteralValue::Int(2021),
+            ],
+            vec![
+                LiteralValue::Int(45001),
+                LiteralValue::Empty,
+                LiteralValue::Int(2022),
+            ],
+            vec![
+                LiteralValue::Int(45002),
+                LiteralValue::Empty,
+                LiteralValue::Int(2023),
+            ],
+        ],
+    )
+}
+
+fn cl087_number(value: &LiteralValue) -> f64 {
+    match value {
+        LiteralValue::Int(n) => *n as f64,
+        LiteralValue::Number(n) => *n,
+        LiteralValue::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        other => panic!("expected a number, got {other:?}"),
+    }
+}
+
+/// Flattens a lifted (spilled) result row-major into numbers.
+fn cl087_elementwise(wb: &TestWorkbook, formula: &str) -> Vec<f64> {
+    match evaluate_lifting_formula(wb, formula) {
+        LiteralValue::Array(rows) => rows
+            .iter()
+            .flat_map(|row| row.iter().map(cl087_number))
+            .collect(),
+        other => panic!("{formula}: expected an element-wise array, got {other:?}"),
+    }
+}
+
+fn cl087_scalar(wb: &TestWorkbook, formula: &str) -> f64 {
+    let value = evaluate_lifting_formula(wb, formula);
+    assert!(
+        !matches!(value, LiteralValue::Array(_)),
+        "{formula}: expected a scalar, got a spilled array"
+    );
+    cl087_number(&value)
+}
+
+/// Asserts a scalar error with NO spill.
+fn cl087_scalar_error(wb: &TestWorkbook, formula: &str, kind: ExcelErrorKind) {
+    match evaluate_lifting_formula(wb, formula) {
+        LiteralValue::Error(error) => assert_eq!(error.kind, kind, "{formula}"),
+        other => panic!("{formula}: expected a scalar {kind:?} error, got {other:?}"),
+    }
+}
+
+fn cl087_lifted_positions(name: &str, args_len: usize) -> Option<Vec<usize>> {
+    ensure_lifting_builtins();
+    crate::function_registry::get("", name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+        .elementwise_lifted_positions(args_len)
+}
+
+#[test]
+fn cl087_date_parts_lift_over_a_range() {
+    // Excel measured (16.105.3, dynamic-array entry via Range.Formula2).
+    let wb = cl087_workbook();
+    assert_eq!(
+        cl087_elementwise(&wb, "=YEAR(A1:A3)"),
+        vec![2023.0, 2023.0, 2023.0]
+    );
+    assert_eq!(cl087_elementwise(&wb, "=MONTH(A1:A3)"), vec![3.0, 3.0, 3.0]);
+    assert_eq!(
+        cl087_elementwise(&wb, "=DAY(A1:A3)"),
+        vec![15.0, 16.0, 17.0]
+    );
+}
+
+#[test]
+fn cl087_date_parts_lift_over_an_if_produced_array() {
+    // Excel measured. This is the producer shape that CL-087 was raised for.
+    let wb = cl087_workbook();
+    assert_eq!(
+        cl087_elementwise(&wb, "=YEAR(IF(ISNUMBER(A1:A3),A1:A3,0))"),
+        vec![2023.0, 2023.0, 2023.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=MONTH(IF(ISNUMBER(A1:A3),A1:A3,0))"),
+        vec![3.0, 3.0, 3.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=DAY(IF(ISNUMBER(A1:A3),A1:A3,0))"),
+        vec![15.0, 16.0, 17.0]
+    );
+}
+
+#[test]
+fn cl087_date_parts_lift_through_a_let_local() {
+    // Excel measured.
+    let wb = cl087_workbook();
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,A1:A3,YEAR(r))"),
+        vec![2023.0, 2023.0, 2023.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,A1:A3,MONTH(r))"),
+        vec![3.0, 3.0, 3.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,A1:A3,DAY(r))"),
+        vec![15.0, 16.0, 17.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,IF(ISNUMBER(A1:A3),A1:A3,0),YEAR(r))"),
+        vec![2023.0, 2023.0, 2023.0]
+    );
+}
+
+#[test]
+fn cl087_rounding_family_lifts_over_a_range() {
+    let wb = cl087_workbook();
+    let serials = vec![45000.0, 45001.0, 45002.0];
+    // Excel measured.
+    assert_eq!(cl087_elementwise(&wb, "=ROUNDUP(A1:A3,0)"), serials);
+    // Excel measured; must not regress (ROUND lifted before CL-087 too).
+    assert_eq!(cl087_elementwise(&wb, "=ROUND(A1:A3,0)"), serials);
+    // Specification, same rounding family.
+    assert_eq!(cl087_elementwise(&wb, "=ROUNDDOWN(A1:A3,0)"), serials);
+    assert_eq!(cl087_elementwise(&wb, "=TRUNC(A1:A3)"), serials);
+    assert_eq!(cl087_elementwise(&wb, "=INT(A1:A3)"), serials);
+    // Specification.
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,A1:A3,ROUNDUP(r,0))"),
+        serials
+    );
+}
+
+#[test]
+fn cl087_date_constructor_lifts_over_a_range() {
+    // Specification: DATE function page, 1900 date system.
+    let wb = cl087_workbook();
+    let expected = vec![44197.0, 44562.0, 44927.0];
+    assert_eq!(cl087_elementwise(&wb, "=DATE(C1:C3,1,1)"), expected);
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,C1:C3,DATE(r,1,1))"),
+        expected
+    );
+}
+
+#[test]
+fn cl087_preexisting_scalar_lifting_does_not_regress() {
+    let wb = cl087_workbook();
+    let serials = vec![45000.0, 45001.0, 45002.0];
+    assert_eq!(cl087_elementwise(&wb, "=ABS(A1:A3)"), serials);
+    assert_eq!(cl087_elementwise(&wb, "=LEN(A1:A3)"), vec![5.0, 5.0, 5.0]);
+    assert_eq!(
+        cl087_elementwise(&wb, "=SQRT(A1:A3)"),
+        vec![45000f64.sqrt(), 45001f64.sqrt(), 45002f64.sqrt()]
+    );
+    assert_eq!(cl087_elementwise(&wb, "=MOD(A1:A3,2)"), vec![0.0, 1.0, 0.0]);
+    assert_eq!(
+        cl087_elementwise(&wb, "=ISNUMBER(A1:A3)*1"),
+        vec![1.0, 1.0, 1.0]
+    );
+    assert_eq!(
+        cl087_elementwise(&wb, "=LET(r,IF(ISNUMBER(A1:A3),A1:A3,0),ABS(r))"),
+        serials
+    );
+}
+
+#[test]
+fn cl087_aggregation_over_a_lifted_result() {
+    let wb = cl087_workbook();
+    // ES-008 aggregation shape.
+    assert_eq!(cl087_scalar(&wb, "=SUM(YEAR(A1:A3))"), 6069.0);
+    // SUM is a reducer and must NOT start lifting.
+    assert_eq!(cl087_scalar(&wb, "=SUM(A1:A3)"), 135003.0);
+}
+
+#[test]
+fn cl087_atp_date_offsets_do_not_lift_over_a_range() {
+    // Excel measured (16.105.3): the Analysis-ToolPak lineage answers #VALUE!
+    // to a multi-cell range in a scalar-shaped slot, with no spill.
+    // EDATE is a BEHAVIOUR CHANGE: it lifted before CL-087.
+    let wb = cl087_workbook();
+    cl087_scalar_error(&wb, "=EOMONTH(A1:A3,0)", ExcelErrorKind::Value);
+    cl087_scalar_error(&wb, "=EDATE(A1:A3,0)", ExcelErrorKind::Value);
+    cl087_scalar_error(&wb, "=LET(r,A1:A3,EDATE(r,0))", ExcelErrorKind::Value);
+}
+
+#[test]
+fn cl087_scalar_controls() {
+    let wb = cl087_workbook();
+    assert_eq!(cl087_scalar(&wb, "=YEAR(B1)"), 2023.0);
+    assert_eq!(cl087_scalar(&wb, "=LET(r,B1,YEAR(r))"), 2023.0);
+    cl087_scalar_error(&wb, "=YEAR(-1)", ExcelErrorKind::Num);
+    cl087_scalar_error(&wb, "=IF(\"abc\",1,0)", ExcelErrorKind::Value);
+    assert_eq!(cl087_scalar(&wb, "=IF(1,1,0)"), 1.0);
+}
+
+#[test]
+fn cl087_lookup_family_lifted_positions_are_unchanged() {
+    // Exactly the positions the retired name allowlist returned.
+    assert_eq!(cl087_lifted_positions("XLOOKUP", 6), Some(vec![0]));
+    assert_eq!(cl087_lifted_positions("XMATCH", 4), Some(vec![0]));
+    assert_eq!(cl087_lifted_positions("MATCH", 3), Some(vec![0]));
+    assert_eq!(cl087_lifted_positions("LOOKUP", 3), Some(vec![0]));
+    assert_eq!(cl087_lifted_positions("INDEX", 3), Some(vec![1, 2]));
+    assert_eq!(cl087_lifted_positions("VLOOKUP", 4), Some(vec![0, 2]));
+    assert_eq!(cl087_lifted_positions("HLOOKUP", 4), Some(vec![0, 2]));
+    assert_eq!(cl087_lifted_positions("IF", 3), Some(vec![0, 1, 2]));
+    assert_eq!(cl087_lifted_positions("SWITCH", 4), Some(vec![0, 1]));
+    assert_eq!(cl087_lifted_positions("SWITCH", 6), Some(vec![0, 1, 3]));
+
+    // The scalar-shaped mode/flag slots are NOT lifted, and this round does
+    // not change that: MATCH's match_type (index 2), VLOOKUP's range_lookup
+    // (index 3), XLOOKUP's if_not_found/match_mode/search_mode (3, 4, 5).
+    assert!(!cl087_lifted_positions("MATCH", 3).unwrap().contains(&2));
+    assert!(!cl087_lifted_positions("VLOOKUP", 4).unwrap().contains(&3));
+    let xlookup = cl087_lifted_positions("XLOOKUP", 6).unwrap();
+    for slot in [3usize, 4, 5] {
+        assert!(!xlookup.contains(&slot), "XLOOKUP slot {slot}");
+    }
+
+    // Reducers and the ATP date offsets do not lift at all.
+    assert_eq!(cl087_lifted_positions("SUM", 3), None);
+    assert_eq!(cl087_lifted_positions("EDATE", 2), None);
+    assert_eq!(cl087_lifted_positions("EOMONTH", 2), None);
+}

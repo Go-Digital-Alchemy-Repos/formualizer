@@ -137,23 +137,20 @@ pub(crate) fn implicit_intersection_calc_at<'a>(
     }
 }
 
-fn array_lifted_argument_positions(name: &str, args_len: usize) -> Option<Vec<usize>> {
-    match name.to_ascii_uppercase().as_str() {
-        "XLOOKUP" | "XMATCH" | "MATCH" | "LOOKUP" => Some(vec![0]),
-        "INDEX" => Some(vec![1, 2]),
-        "VLOOKUP" | "HLOOKUP" => Some(vec![0, 2]),
-        "ABS" | "LEN" | "ISNUMBER" | "SQRT" => Some(vec![0]),
-        "ROUND" | "MOD" | "EDATE" => Some(vec![0, 1]),
-        "IF" => Some(vec![0, 1, 2]),
-        "SWITCH" => {
-            let rest = args_len.saturating_sub(1);
-            let paired = rest - usize::from(rest % 2 == 1);
-            let mut positions = vec![0];
-            positions.extend((1..1 + paired).step_by(2));
-            Some(positions)
-        }
-        _ => None,
-    }
+/// ES-008 element-wise lifting: which argument positions of `fun` are lifted
+/// element-wise when a range or array arrives in a scalar-shaped slot.
+///
+/// CL-087: this used to be a hard-coded function-NAME allowlist local to the
+/// interpreter, which was wrong in both directions (it omitted YEAR/MONTH/DAY/
+/// DATE/ROUNDUP/ROUNDDOWN/TRUNC/INT, and it lifted EDATE where desktop Excel
+/// answers `#VALUE!`). The lifted set is now owned by the callee: it is
+/// schema-driven off `FnCaps::ELEMENTWISE`, with explicit overrides on the
+/// functions whose lifted positions are not simply "all scalar slots".
+fn array_lifted_argument_positions(
+    fun: &dyn crate::function::Function,
+    args_len: usize,
+) -> Option<Vec<usize>> {
+    fun.elementwise_lifted_positions(args_len)
 }
 
 #[derive(Clone)]
@@ -589,8 +586,7 @@ impl<'a> Interpreter<'a> {
             .ok(),
             ASTNodeType::Function { name, args } => {
                 let function = self.context.get_function("", name)?;
-                let canonical = function.name();
-                let positions = array_lifted_argument_positions(canonical, args.len())?;
+                let positions = array_lifted_argument_positions(function.as_ref(), args.len())?;
                 let shapes: Vec<_> = positions
                     .iter()
                     .filter_map(|position| args.get(*position))
@@ -878,9 +874,8 @@ impl<'a> Interpreter<'a> {
             AstNodeData::Function { name_id, .. } => {
                 let raw_name = data_store.resolve_ast_string(*name_id);
                 let function = self.context.get_function("", raw_name)?;
-                let canonical = function.name();
                 let args = data_store.get_args(node_id)?;
-                let positions = array_lifted_argument_positions(canonical, args.len())?;
+                let positions = array_lifted_argument_positions(function.as_ref(), args.len())?;
                 let shapes: Vec<_> = positions
                     .iter()
                     .filter_map(|position| args.get(*position))
@@ -1761,8 +1756,7 @@ impl<'a> Interpreter<'a> {
         row: usize,
         col: usize,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len())
-        else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun, handles.len()) else {
             return fun.dispatch(handles, fctx);
         };
         if fun.name().eq_ignore_ascii_case("IF") {
@@ -1800,8 +1794,7 @@ impl<'a> Interpreter<'a> {
         row: usize,
         col: usize,
     ) -> Result<LiteralValue, ExcelError> {
-        let Some(lifted_positions) = array_lifted_argument_positions(fun.name(), handles.len())
-        else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun, handles.len()) else {
             return fun
                 .dispatch(handles, fctx)
                 .map(|value| self.project_calc_value(value, row, col));
@@ -1960,8 +1953,7 @@ impl<'a> Interpreter<'a> {
         }
 
         let canonical_name = fun.name();
-        let Some(lifted_positions) = array_lifted_argument_positions(canonical_name, handles.len())
-        else {
+        let Some(lifted_positions) = array_lifted_argument_positions(fun, handles.len()) else {
             return fun.dispatch(handles, fctx);
         };
 

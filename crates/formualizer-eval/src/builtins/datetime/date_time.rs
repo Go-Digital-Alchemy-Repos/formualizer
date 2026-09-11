@@ -66,7 +66,7 @@ pub struct DateFn;
 /// Variadic: false
 /// Signature: DATE(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for DateFn {
     fn propagate_format(
@@ -76,7 +76,7 @@ impl Function for DateFn {
         Some(crate::format::FormatId::DATE)
     }
 
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
 
     fn name(&self) -> &'static str {
         "DATE"

@@ -304,6 +304,16 @@ impl Function for XLookupFn {
     fn name(&self) -> &'static str {
         "XLOOKUP"
     }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. Only the lookup_value slot lifts;
+    /// if_not_found, match_mode and search_mode are scalar-shaped but are NOT
+    /// lifted.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0])
+    }
     fn min_args(&self) -> usize {
         3
     }
@@ -740,6 +750,15 @@ impl Function for XMatchFn {
     func_caps!(PURE, LOOKUP, MAY_SPILL);
     fn name(&self) -> &'static str {
         "XMATCH"
+    }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. Only the lookup_value slot lifts; match_mode
+    /// and search_mode are scalar-shaped but are NOT lifted.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0])
     }
     fn min_args(&self) -> usize {
         2

@@ -410,6 +410,16 @@ impl Function for IfFn {
     fn name(&self) -> &'static str {
         "IF"
     }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. All three slots lift, but lazily: the
+    /// interpreter routes IF through a dedicated per-cell path that never
+    /// evaluates the untaken arm.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0, 1, 2])
+    }
     fn min_args(&self) -> usize {
         2
     }

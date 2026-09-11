@@ -572,10 +572,10 @@ pub struct YearFn;
 /// Variadic: false
 /// Signature: YEAR(arg1: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for YearFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
 
     fn name(&self) -> &'static str {
         "YEAR"
@@ -646,10 +646,10 @@ pub struct MonthFn;
 /// Variadic: false
 /// Signature: MONTH(arg1: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for MonthFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
 
     fn name(&self) -> &'static str {
         "MONTH"
@@ -720,10 +720,10 @@ pub struct DayFn;
 /// Variadic: false
 /// Signature: DAY(arg1: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for DayFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
 
     fn name(&self) -> &'static str {
         "DAY"

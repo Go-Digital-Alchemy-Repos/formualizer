@@ -129,6 +129,14 @@ impl Function for LookupFn {
     fn name(&self) -> &'static str {
         "LOOKUP"
     }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. Only the lookup_value slot lifts.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0])
+    }
     fn min_args(&self) -> usize {
         2
     }

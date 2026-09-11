@@ -756,6 +756,18 @@ impl Function for SwitchFn {
     fn name(&self) -> &'static str {
         "SWITCH"
     }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. The expression slot plus the odd (case) slots
+    /// lift; the result slots and the trailing default do NOT.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let rest = args_len.saturating_sub(1);
+        let paired = rest - usize::from(rest % 2 == 1);
+        let mut positions = vec![0];
+        positions.extend((1..1 + paired).step_by(2));
+        Some(positions)
+    }
     fn min_args(&self) -> usize {
         3
     }

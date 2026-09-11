@@ -197,6 +197,15 @@ impl Function for MatchFn {
     fn name(&self) -> &'static str {
         "MATCH"
     }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. Only the lookup_value slot lifts; the
+    /// match_type slot is scalar-shaped but is NOT lifted.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0])
+    }
     fn min_args(&self) -> usize {
         2
     }
@@ -535,6 +544,15 @@ impl Function for VLookupFn {
     fn name(&self) -> &'static str {
         "VLOOKUP"
     }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. Only lookup_value and col_index_num lift; the
+    /// range_lookup slot is scalar-shaped but is NOT lifted.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0, 2])
+    }
     fn min_args(&self) -> usize {
         3
     }
@@ -793,6 +811,15 @@ pub struct HLookupFn;
 impl Function for HLookupFn {
     fn name(&self) -> &'static str {
         "HLOOKUP"
+    }
+
+    /// ES-008 element-wise lifting (CL-087). Explicit override: this function's
+    /// lifted positions are NOT simply "all scalar slots", so it does not use
+    /// the schema-driven default. Only lookup_value and row_index_num lift; the
+    /// range_lookup slot is scalar-shaped but is NOT lifted.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        let _ = args_len;
+        Some(vec![0, 2])
     }
     fn min_args(&self) -> usize {
         3

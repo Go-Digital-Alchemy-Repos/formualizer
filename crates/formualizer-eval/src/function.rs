@@ -100,6 +100,32 @@ bitflags::bitflags! {
     }
 }
 
+/// ES-008 element-wise lifting: derive the lifted argument positions from a
+/// function's declared argument schema.
+///
+/// Returns the indices below `args_len` whose schema slot is scalar-shaped and
+/// not by-ref. Slots beyond the end of `schema` resolve through the repeating
+/// tail slot (the same rule `args::validate_and_prepare` uses), so a variadic
+/// scalar tail expands correctly.
+pub fn elementwise_positions_from_schema(schema: &[ArgSchema], args_len: usize) -> Vec<usize> {
+    if schema.is_empty() {
+        return Vec::new();
+    }
+    let repeating = schema.iter().find(|slot| slot.repeating.is_some());
+    (0..args_len)
+        .filter(|index| {
+            let slot = if schema.len() == 1 {
+                Some(&schema[0])
+            } else if *index < schema.len() {
+                Some(&schema[*index])
+            } else {
+                repeating
+            };
+            slot.is_some_and(|slot| slot.shape == crate::args::ShapeKind::Scalar && !slot.by_ref)
+        })
+        .collect()
+}
+
 /// Revised, object-safe trait for all Excel-style functions.
 ///
 /// This trait uses a capability-based model (`FnCaps`) to declare function
@@ -109,6 +135,19 @@ pub trait Function: Send + Sync + 'static {
     /// Capability flags for this function
     fn caps(&self) -> FnCaps {
         FnCaps::PURE
+    }
+
+    /// ES-008 element-wise lifting. Which of THIS function's argument
+    /// positions are lifted element-wise when a range or array arrives in a
+    /// scalar-shaped slot. `None` means the function does not lift.
+    fn elementwise_lifted_positions(&self, args_len: usize) -> Option<Vec<usize>> {
+        if !self.caps().contains(FnCaps::ELEMENTWISE) {
+            return None;
+        }
+        Some(elementwise_positions_from_schema(
+            self.arg_schema(),
+            args_len,
+        ))
     }
 
     fn name(&self) -> &'static str;

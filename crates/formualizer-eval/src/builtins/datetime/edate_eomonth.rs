@@ -89,6 +89,14 @@ impl Function for EdateFn {
         "EDATE"
     }
 
+    // ES-008 element-wise lifting (CL-087): deliberately NOT declared.
+    // Desktop Excel 16.105.3 answers `#VALUE!` to `EDATE(A1:A3,0)` under
+    // dynamic-array entry (Range.Formula2) -- the Analysis-ToolPak lineage of
+    // this function does not lift over a multi-cell range. Measured in OT-198
+    // receipt g4d_excel_cse_probe.json row Q33. The array-argument case (an
+    // ARRAY VALUE rather than a range reference) has NO live-Excel
+    // measurement; it is left unlifted as this round's declared residual.
+
     fn min_args(&self) -> usize {
         2
     }
@@ -192,6 +200,14 @@ impl Function for EomonthFn {
     fn name(&self) -> &'static str {
         "EOMONTH"
     }
+
+    // ES-008 element-wise lifting (CL-087): deliberately NOT declared.
+    // Desktop Excel 16.105.3 answers `#VALUE!` to `EOMONTH(A1:A3,0)` under
+    // dynamic-array entry (Range.Formula2) -- the Analysis-ToolPak lineage of
+    // this function does not lift over a multi-cell range. Measured in OT-198
+    // receipt g4d_excel_cse_probe.json row Q32. The array-argument case (an
+    // ARRAY VALUE rather than a range reference) has NO live-Excel
+    // measurement; it is left unlifted as this round's declared residual.
 
     fn min_args(&self) -> usize {
         2

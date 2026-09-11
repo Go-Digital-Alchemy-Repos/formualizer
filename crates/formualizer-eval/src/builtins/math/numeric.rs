@@ -50,10 +50,10 @@ pub struct AbsFn;
 /// Variadic: false
 /// Signature: ABS(arg1: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for AbsFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "ABS"
     }
@@ -198,10 +198,10 @@ pub struct IntFn; // floor toward -inf
 /// Variadic: false
 /// Signature: INT(arg1: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for IntFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "INT"
     }
@@ -265,10 +265,10 @@ pub struct TruncFn; // truncate toward zero
 /// Variadic: true
 /// Signature: TRUNC(arg1: number@scalar, arg2...: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for TruncFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "TRUNC"
     }
@@ -475,10 +475,10 @@ fn excel_round_with_mode(number: f64, requested_digits: i32, mode: DecimalRoundi
 /// Variadic: false
 /// Signature: ROUND(arg1: number@scalar, arg2: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for RoundFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "ROUND"
     }
@@ -549,10 +549,10 @@ pub struct RoundDownFn; // toward zero
 /// Variadic: false
 /// Signature: ROUNDDOWN(arg1: number@scalar, arg2: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for RoundDownFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "ROUNDDOWN"
     }
@@ -623,10 +623,10 @@ pub struct RoundUpFn; // away from zero
 /// Variadic: false
 /// Signature: ROUNDUP(arg1: number@scalar, arg2: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for RoundUpFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "ROUNDUP"
     }
@@ -705,10 +705,10 @@ pub struct ModFn; // MOD(a,b)
 /// Variadic: false
 /// Signature: MOD(arg1: number@scalar, arg2: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for ModFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "MOD"
     }
@@ -1207,10 +1207,10 @@ pub struct SqrtFn; // SQRT(number)
 /// Variadic: false
 /// Signature: SQRT(arg1: number@scalar)
 /// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
-/// Caps: PURE
+/// Caps: PURE, ELEMENTWISE
 /// [formualizer-docgen:schema:end]
 impl Function for SqrtFn {
-    func_caps!(PURE);
+    func_caps!(PURE, ELEMENTWISE);
     fn name(&self) -> &'static str {
         "SQRT"
     }
