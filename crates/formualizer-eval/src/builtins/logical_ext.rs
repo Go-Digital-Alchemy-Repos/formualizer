@@ -837,6 +837,10 @@ fn switch_values_equal(a: &LiteralValue, b: &LiteralValue) -> bool {
         (LiteralValue::Int(x), LiteralValue::Number(y)) => (*x as f64 - y).abs() < 1e-12,
         (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
         (LiteralValue::Text(x), LiteralValue::Text(y)) => x.eq_ignore_ascii_case(y),
+        // A blank selector is numeric zero for SWITCH's numeric cases.
+        // Keep empty text distinct, as the current Coherent input probe does.
+        (LiteralValue::Empty, LiteralValue::Int(value)) => *value == 0,
+        (LiteralValue::Empty, LiteralValue::Number(value)) => *value == 0.0,
         (LiteralValue::Empty, LiteralValue::Empty) => true,
         _ => false,
     }
@@ -1124,6 +1128,47 @@ mod tests {
         ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
             Err(ExcelError::new_name())
         }
+    }
+
+    // GOD-305: current Knighthead parent Input!C11, fresh Coherent null-input
+    // direct-address witness selects the numeric-zero arm. Empty text stays distinct.
+    #[test]
+    fn switch_blank_selector_matches_numeric_zero() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(SwitchFn));
+        let ctx = interp(&wb);
+        let nodes = [
+            ASTNode::new(ASTNodeType::Literal(LiteralValue::Empty), None),
+            ASTNode::new(ASTNodeType::Literal(LiteralValue::Int(0)), None),
+            ASTNode::new(ASTNodeType::Literal(LiteralValue::Int(1)), None),
+        ];
+        let args: Vec<_> = nodes.iter().map(|n| ArgumentHandle::new(n, &ctx)).collect();
+        let f = ctx.context.get_function("", "SWITCH").unwrap();
+        assert_eq!(
+            f.dispatch(&args, &ctx.function_context(None))
+                .unwrap()
+                .into_literal(),
+            LiteralValue::Int(1)
+        );
+    }
+
+    #[test]
+    fn switch_blank_selector_keeps_empty_text_and_nonzero_distinct() {
+        assert!(!switch_values_equal(
+            &LiteralValue::Empty,
+            &LiteralValue::Text(String::new())
+        ));
+        assert!(!switch_values_equal(
+            &LiteralValue::Empty,
+            &LiteralValue::Int(1)
+        ));
+        assert!(!switch_values_equal(
+            &LiteralValue::Empty,
+            &LiteralValue::Number(1e-13)
+        ));
+        assert!(switch_values_equal(
+            &LiteralValue::Empty,
+            &LiteralValue::Number(-0.0)
+        ));
     }
 
     #[test]
