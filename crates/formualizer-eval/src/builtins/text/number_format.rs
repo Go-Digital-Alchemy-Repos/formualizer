@@ -293,6 +293,9 @@ fn rendered_affix(units: &[Unit]) -> Option<String> {
         match unit {
             Unit::Literal(ch) => out.push(*ch),
             Unit::Percent => out.push('%'),
+            // A period after the percent suffix is punctuation, not another
+            // decimal separator (GOD-308 captured report format 0.00%.).
+            Unit::Decimal if out.ends_with('%') => out.push('.'),
             Unit::Comma => {}
             _ => return None,
         }
@@ -437,6 +440,13 @@ fn group_thousands(integer: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // GOD-308: captured DirectGrowth UAT report footnote is 0.10%.
+    #[test]
+    fn percent_suffix_preserves_trailing_period() {
+        assert_eq!(format_number(0.001, "0.00%."), Ok("0.10%.".into()));
+        assert_eq!(format_number(0.001, "0.00%"), Ok("0.10%".into()));
+    }
 
     #[test]
     fn quoted_semicolons_do_not_split_sections() {
