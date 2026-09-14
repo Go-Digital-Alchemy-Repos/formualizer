@@ -4,7 +4,7 @@ use crate::function_contract::{
     FunctionResultSemantics, FunctionSemanticContract, FunctionSemanticIdentity,
 };
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -682,6 +682,7 @@ pub(crate) struct RegistryPlanningSnapshot {
     requests: Arc<Vec<(String, String, usize)>>,
     functions: Arc<HashMap<RegistryKey, Arc<dyn Function>>>,
     capabilities: Arc<HashMap<RegistryKey, FnCaps>>,
+    trusted_builtins: Arc<HashSet<RegistryKey>>,
     identities: Arc<HashMap<(String, String, usize), FunctionSemanticIdentity>>,
 }
 
@@ -692,6 +693,10 @@ pub(crate) enum PlanningSnapshotError {
 }
 
 impl RegistryPlanningSnapshot {
+    pub(crate) fn is_trusted_builtin(&self, ns: &str, name: &str) -> bool {
+        self.trusted_builtins.contains(&(norm(ns), norm(name)))
+    }
+
     const CAPTURE_ATTEMPTS: usize = 16;
 
     pub(crate) fn capture_for_requests(
@@ -760,6 +765,7 @@ impl RegistryPlanningSnapshot {
             after_registry_copy(attempt);
 
             let mut capabilities = HashMap::new();
+            let mut trusted_builtins = HashSet::new();
             let mut identities = HashMap::new();
             for (namespace, name, arity) in requests {
                 let request_key = (norm(namespace), norm(name));
@@ -773,6 +779,9 @@ impl RegistryPlanningSnapshot {
                 };
                 if !Arc::ptr_eq(runtime, &registration.function) {
                     continue;
+                }
+                if registration.trusted_builtin {
+                    trusted_builtins.insert(request_key.clone());
                 }
                 let (semantics, identity_metadata) = inspect_semantics_with_identity_metadata(
                     &registration.function,
@@ -845,6 +854,7 @@ impl RegistryPlanningSnapshot {
                     requests: Arc::new(requests.to_vec()),
                     functions: Arc::new(runtime_functions),
                     capabilities: Arc::new(capabilities),
+                    trusted_builtins: Arc::new(trusted_builtins),
                     identities: Arc::new(identities),
                 });
             }

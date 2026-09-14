@@ -10272,22 +10272,26 @@ where
 
     // IF may return references in general, but literal result branches cannot.
     // Keep conditions subject to ordinary dependency/opacity analysis.
-    fn scalar_if_literal_results(ast: &ASTNode) -> bool {
+    fn scalar_if_literal_results(
+        ast: &ASTNode,
+        provider: &crate::function_registry::RegistryPlanningSnapshot,
+    ) -> bool {
         let ASTNodeType::Function { name, args } = &ast.node_type else {
             return false;
         };
         name.eq_ignore_ascii_case("IF")
+            && provider.is_trusted_builtin("", name)
             && (2..=3).contains(&args.len())
             && args.iter().skip(1).all(|arg| {
                 matches!(&arg.node_type, ASTNodeType::Literal(_) | ASTNodeType::Omitted)
-                    || Self::scalar_if_literal_results(arg)
+                    || Self::scalar_if_literal_results(arg, provider)
             })
     }
 
-    fn opaque_reason_in_ast(
+    pub(super) fn opaque_reason_in_ast(
         &self,
         ast: &ASTNode,
-        provider: &dyn crate::traits::FunctionProvider,
+        provider: &crate::function_registry::RegistryPlanningSnapshot,
     ) -> Option<crate::engine::OpaqueReason> {
         match &ast.node_type {
             ASTNodeType::Function { name, args } => {
@@ -10301,7 +10305,7 @@ where
                 let caps = function.caps();
                 if caps.contains(FnCaps::DYNAMIC_DEPENDENCY)
                     || (caps.contains(FnCaps::RETURNS_REFERENCE)
-                        && !Self::scalar_if_literal_results(ast))
+                        && !Self::scalar_if_literal_results(ast, provider))
                 {
                     return Some(crate::engine::OpaqueReason::DynamicReference);
                 }
@@ -11086,7 +11090,7 @@ where
                         }
                         let opaque = self.opaque_reason_in_ast(&ast, &snapshot);
                         if let Some(reason) =
-                            opaque.or((vertex_is_dynamic && !Self::scalar_if_literal_results(&ast))
+                            opaque.or((vertex_is_dynamic && !Self::scalar_if_literal_results(&ast, &snapshot))
                                 .then_some(OpaqueReason::DynamicReference))
                         {
                             if reason == OpaqueReason::DynamicReference

@@ -2253,3 +2253,21 @@ fn reference_returning_if_and_dynamic_conditions_still_widen() {
         assert_eq!(report.widened_scope, PrepareScope::Workbook, "{formula}");
     }
 }
+
+
+#[test]
+fn provider_if_override_keeps_reference_opacity_despite_literal_branches() {
+    struct Override;
+    impl crate::traits::FunctionProvider for Override {
+        fn planning_semantic_revision(&self) -> Option<u64> { Some(0) }
+        fn get_function(&self, ns: &str, name: &str) -> Option<Arc<dyn crate::function::Function>> {
+            crate::function_registry::get_for_planning(ns, if name.eq_ignore_ascii_case("IF") { "OFFSET" } else { name })
+        }
+        fn get_function_for_planning(&self, ns: &str, name: &str) -> Option<Arc<dyn crate::function::Function>> { self.get_function(ns, name) }
+    }
+    let engine = engine(FormulaPlaneMode::Off);
+    let snapshot = crate::function_registry::RegistryPlanningSnapshot::capture_for_requests(&Override, [("".into(), "IF".into(), 3)]).unwrap();
+    let ast = formualizer_parse::parser::parse("=IF(TRUE,4,1)").unwrap();
+    assert!(!snapshot.is_trusted_builtin("", "IF"));
+    assert_eq!(engine.opaque_reason_in_ast(&ast, &snapshot), Some(OpaqueReason::DynamicReference));
+}
