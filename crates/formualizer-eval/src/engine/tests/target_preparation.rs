@@ -2223,3 +2223,33 @@ fn one_cancellation_token_covers_preparation_and_evaluation() {
         )
         .expect("an uncancelled token must not cancel the call");
 }
+
+
+#[test]
+fn scalar_if_literal_branches_keep_target_preparation_exact() {
+    for committed in [false, true] {
+        let mut engine = engine(FormulaPlaneMode::Off);
+        engine.set_cell_value("Inputs", 1, 1, LiteralValue::Number(1.0)).unwrap();
+        engine.stage_formula_text("Outputs", 1, 1, "=IF(Inputs!A1=1,4,IF(Inputs!A1=2,3,1))".into());
+        engine.stage_formula_text("Middle", 10, 10, "=99".into());
+        if committed { engine.build_graph_for_sheets(["Outputs"]).unwrap(); }
+        let report = engine.prepare_graph_for_targets(&[cell("Outputs", 1, 1)], Default::default()).unwrap();
+        assert_eq!(report.widened_scope, PrepareScope::Exact);
+        assert!(engine.get_staged_formula_text("Middle", 10, 10).is_some());
+        engine.config.defer_graph_building = false;
+        assert_eq!(engine.evaluate_cell("Outputs", 1, 1).unwrap(), Some(LiteralValue::Number(4.0)));
+        engine.set_cell_value("Inputs", 1, 1, LiteralValue::Number(2.0)).unwrap();
+        assert_eq!(engine.evaluate_cell("Outputs", 1, 1).unwrap(), Some(LiteralValue::Number(3.0)));
+    }
+}
+
+#[test]
+fn reference_returning_if_and_dynamic_conditions_still_widen() {
+    for formula in ["=IF(TRUE,Inputs!A1,0)", "=IF(INDIRECT(\"Inputs!A1\")=1,4,1)", "=IF(TRUE,4,IF(FALSE,Inputs!A1,1))"] {
+        let mut engine = engine(FormulaPlaneMode::Off);
+        engine.set_cell_value("Inputs", 1, 1, LiteralValue::Number(1.0)).unwrap();
+        engine.stage_formula_text("Outputs", 1, 1, formula.into());
+        let report = engine.prepare_graph_for_targets(&[cell("Outputs", 1, 1)], Default::default()).unwrap();
+        assert_eq!(report.widened_scope, PrepareScope::Workbook, "{formula}");
+    }
+}
