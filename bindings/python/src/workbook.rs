@@ -1332,6 +1332,19 @@ impl PyWorkbook {
         Ok(())
     }
 
+    /// Apply ordered literal updates, propagating dirtiness once on exit.
+    /// The callback may read stored cells and write values, but must not evaluate.
+    /// The scope is flushed even when the callback raises an exception.
+    pub fn with_deferred_updates(&self, py: Python<'_>, callback: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        self.write_inner()?.engine_mut().begin_deferred_dirty();
+        // Release the workbook lock before invoking Python: callback operations
+        // acquire it independently, preserving normal ordered read/write behavior.
+        let result = callback.call0().map(|value| value.unbind());
+        self.write_inner()?.engine_mut().end_deferred_dirty();
+        let _ = py;
+        result
+    }
+
     // Batch ops
     pub fn set_values_batch(
         &self,
