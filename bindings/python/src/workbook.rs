@@ -968,6 +968,13 @@ impl PyWorkbook {
         Ok(())
     }
 
+    /// Materialize the workbook dependency graph without evaluating formulas.
+    /// Reusable services can perform this input-independent preparation once.
+    pub fn prepare_graph(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.write_inner_detached()?.prepare_graph_all())
+            .map_err(workbook_error_to_pyerr)
+    }
+
     pub fn evaluate_all(&self, py: Python<'_>) -> PyResult<()> {
         // Ensure flag is reset before starting
         self.cancel_flag
