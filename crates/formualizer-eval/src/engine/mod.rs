@@ -136,6 +136,8 @@ impl FormulaFence {
 pub struct FormulaAuthorship {
     pub kind: AuthoredFormulaKind,
     pub cse_fence: Option<FormulaFence>,
+    /// Last saved dynamic extent: soft discovery hint, never a clipping fence.
+    pub saved_dynamic_extent: Option<FormulaFence>,
 }
 
 impl FormulaAuthorship {
@@ -143,6 +145,7 @@ impl FormulaAuthorship {
         Self {
             kind: AuthoredFormulaKind::LegacyScalar,
             cse_fence: None,
+            saved_dynamic_extent: None,
         }
     }
 
@@ -150,13 +153,27 @@ impl FormulaAuthorship {
         Self {
             kind: AuthoredFormulaKind::DynamicArray,
             cse_fence: None,
+            saved_dynamic_extent: None,
         }
+    }
+
+    pub const fn dynamic_array_with_saved_extent(extent: FormulaFence) -> Self {
+        Self {
+            kind: AuthoredFormulaKind::DynamicArray,
+            cse_fence: None,
+            saved_dynamic_extent: Some(extent),
+        }
+    }
+
+    pub(crate) fn planning_extent(self) -> Option<FormulaFence> {
+        self.cse_fence.or(self.saved_dynamic_extent)
     }
 
     pub const fn cse_array(fence: FormulaFence) -> Self {
         Self {
             kind: AuthoredFormulaKind::CseArray,
             cse_fence: Some(fence),
+            saved_dynamic_extent: None,
         }
     }
 

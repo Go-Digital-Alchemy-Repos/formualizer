@@ -938,7 +938,7 @@ impl DependencyGraph {
     fn update_formula_authorship(&mut self, vertex: VertexId, authorship: FormulaAuthorship) {
         let sheet_id = self.get_vertex_sheet_id(vertex);
         if let Some(old) = self.formula_authorship.insert(vertex, authorship)
-            && let Some(fence) = old.cse_fence
+            && let Some(fence) = old.planning_extent()
             && let Some(rows) = self.declared_output_rows.get_mut(&sheet_id)
         {
             rows.remove(
@@ -947,7 +947,7 @@ impl DependencyGraph {
                 &vertex,
             );
         }
-        if let Some(fence) = authorship.cse_fence {
+        if let Some(fence) = authorship.planning_extent() {
             self.declared_output_rows
                 .entry(sheet_id)
                 .or_default()
@@ -1680,6 +1680,59 @@ impl DependencyGraph {
         anchors.sort_unstable();
         anchors.dedup();
         anchors
+    }
+
+    /// Soft producer admission, including saved dynamic extents without adding ordering edges.
+    pub(crate) fn potential_output_anchors_in_region(
+        &self,
+        sheet: SheetId,
+        sr: u32,
+        sc: u32,
+        er: u32,
+        ec: u32,
+    ) -> Vec<VertexId> {
+        let mut out = self.output_anchors_in_region(sheet, sr, sc, er, ec);
+        for vertex in self
+            .declared_output_rows
+            .get(&sheet)
+            .into_iter()
+            .flat_map(|rows| rows.query(sr, er))
+            .flat_map(|(_, _, vertices)| vertices.into_iter())
+        {
+            if let Some(hint) = self.formula_authorship(vertex).saved_dynamic_extent {
+                if matches!(
+                    self.get_vertex_kind(vertex),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                ) && hint.start_col.saturating_sub(1) <= ec
+                    && hint.end_col.saturating_sub(1) >= sc
+                {
+                    out.push(vertex);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Actual changed output cells invalidate all direct/range/name consumers and their closure.
+    pub(crate) fn invalidate_changed_output_cells(&mut self, cells: &[CellRef]) -> Vec<VertexId> {
+        let vertices = cells
+            .iter()
+            .filter_map(|cell| self.cell_to_vertex.get(cell).copied())
+            .collect::<Vec<_>>();
+        self.mark_dirty_many(&vertices)
+            .into_iter()
+            .filter(|&v| {
+                matches!(
+                    self.get_vertex_kind(v),
+                    VertexKind::FormulaScalar
+                        | VertexKind::FormulaArray
+                        | VertexKind::NamedScalar
+                        | VertexKind::NamedArray
+                )
+            })
+            .collect()
     }
 
     /// Producers whose declared or committed output footprint intersects a read.
@@ -3957,7 +4010,7 @@ impl DependencyGraph {
     fn collect_output_dependents(&self, producer: VertexId) -> Vec<VertexId> {
         let sheet = self.get_vertex_sheet_id(producer);
         let mut rectangles = Vec::new();
-        if let Some(fence) = self.formula_authorship(producer).cse_fence {
+        if let Some(fence) = self.formula_authorship(producer).planning_extent() {
             rectangles.push((
                 fence.start_row.saturating_sub(1),
                 fence.start_col.saturating_sub(1),

@@ -292,3 +292,293 @@ fn existing_declared_output_consumers_enter_dirty_closure_before_evaluation() {
         }
     }
 }
+
+#[test]
+fn dynamic_saved_hints_do_not_clip_and_new_readers_settle_in_one_public_call() {
+    for cross_sheet in [false, true] {
+        for hint_rows in [None, Some(1), Some(8)] {
+            for targeted in [false, true] {
+                if targeted && matches!(hint_rows, None | Some(1)) {
+                    continue;
+                } // unknown target footprint deliberately unqualified
+                let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+                let sheet = if cross_sheet { "Child" } else { "Sheet1" };
+                engine
+                    .set_cell_value(sheet, 1, 8, LiteralValue::Number(4.0))
+                    .unwrap();
+                engine
+                    .set_cell_formula(sheet, 15, 2, parse("=SEQUENCE(H1,1,10,10)").unwrap())
+                    .unwrap();
+                engine.stage_loaded_formula_authorship(
+                    sheet,
+                    15,
+                    2,
+                    match hint_rows {
+                        Some(n) => FormulaAuthorship::dynamic_array_with_saved_extent(
+                            FormulaFence::new(15, 2, 14 + n, 2),
+                        ),
+                        None => FormulaAuthorship::dynamic_array(),
+                    },
+                );
+                let prefix = if cross_sheet { "Child!" } else { "" };
+                for (col, f) in [
+                    (1, format!("=SUM({prefix}B17:B18)")),
+                    (4, format!("={prefix}B18")),
+                    (5, "=A1+D1".into()),
+                    (6, "=E1*2".into()),
+                    (9, format!("={prefix}B20")),
+                    (10, "=I1*2".into()),
+                ] {
+                    engine
+                        .set_cell_formula("Sheet1", 1, col, parse(&f).unwrap())
+                        .unwrap();
+                }
+                for (height, sum, last) in [
+                    (4.0, 70.0, 40.0),
+                    (2.0, 0.0, 0.0),
+                    (6.0, 70.0, 40.0),
+                    (1.0, 0.0, 0.0),
+                ] {
+                    engine
+                        .set_cell_value(sheet, 1, 8, LiteralValue::Number(height))
+                        .unwrap();
+                    if targeted {
+                        engine.evaluate_until(&[("Sheet1", 1, 6)]).unwrap();
+                    } else {
+                        engine.evaluate_all().unwrap();
+                    }
+                    for (col, n) in [
+                        (1, sum),
+                        (4, last),
+                        (5, sum + last),
+                        (6, (sum + last) * 2.0),
+                    ] {
+                        assert_eq!(
+                            engine.get_cell_value("Sheet1", 1, col),
+                            Some(LiteralValue::Number(n)),
+                            "cross={cross_sheet} hint={hint_rows:?} target={targeted} height={height} col={col}"
+                        );
+                    }
+                    if !targeted {
+                        let expanded = if height >= 6.0 { 60.0 } else { 0.0 };
+                        for (col, n) in [(9, expanded), (10, expanded * 2.0)] {
+                            assert_eq!(
+                                engine.read_cell_value("Sheet1", 1, col),
+                                Some(LiteralValue::Number(n))
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        engine.get_cell_value(sheet, 14 + height as u32, 2),
+                        Some(LiteralValue::Number(height * 10.0))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_dynamic_hint_does_not_create_a_phantom_cycle_and_overwrite_clears_hint() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("={1;2}").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        1,
+        FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(1, 1, 8, 1)),
+    );
+    engine
+        .set_cell_formula("Sheet1", 5, 1, parse("=SUM(A1:A2)").unwrap())
+        .unwrap();
+    // The stale saved extent intersects this real formula; it is not an actual output/cycle edge.
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 5, 1),
+        Some(LiteralValue::Number(3.0))
+    );
+    let sheet = engine.graph.sheet_id("Sheet1").unwrap();
+    assert!(
+        !engine
+            .graph
+            .potential_output_anchors_in_region(sheet, 7, 0, 7, 0)
+            .is_empty()
+    );
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=9").unwrap())
+        .unwrap();
+    assert!(
+        engine
+            .graph
+            .potential_output_anchors_in_region(sheet, 7, 0, 7, 0)
+            .is_empty()
+    );
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        1,
+        FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(1, 1, 8, 1)),
+    );
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(9.0))
+        .unwrap();
+    assert!(
+        engine
+            .graph
+            .potential_output_anchors_in_region(sheet, 7, 0, 7, 0)
+            .is_empty()
+    );
+}
+
+#[test]
+fn dynamic_error_recovery_and_runtime_reads_preserve_pending_downstream_work() {
+    for parallel in [false, true] {
+        for cross in [false, true] {
+            let mut engine = Engine::new(
+                TestWorkbook::new(),
+                EvalConfig {
+                    enable_parallel: parallel,
+                    ..EvalConfig::default()
+                },
+            );
+            let sheet = if cross { "Child" } else { "Sheet1" };
+            engine
+                .set_cell_value(sheet, 1, 8, LiteralValue::Number(3.0))
+                .unwrap();
+            engine
+                .set_cell_formula(
+                    sheet,
+                    15,
+                    2,
+                    parse("=IF(H1<0,NA(),SEQUENCE(H1,1,10,10))").unwrap(),
+                )
+                .unwrap();
+            engine.stage_loaded_formula_authorship(
+                sheet,
+                15,
+                2,
+                FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(15, 2, 18, 2)),
+            );
+            let prefix = if cross { "Child!" } else { "" };
+            for (col, f) in [
+                (1, format!("=SUM({prefix}B16:B18)")),
+                (4, format!("={prefix}B17")),
+                (5, "=IFERROR(A1+D1,-1)".into()),
+                (6, "=E1*2".into()),
+                (7, "=INDIRECT(\"E1\")*3".into()),
+            ] {
+                engine
+                    .set_cell_formula("Sheet1", 1, col, parse(&f).unwrap())
+                    .unwrap();
+            }
+            for (height, sum, direct, sink) in [
+                (3.0, 50.0, 30.0, 160.0),
+                (-1.0, 0.0, 0.0, 0.0),
+                (4.0, 90.0, 30.0, 240.0),
+                (2.0, 20.0, 0.0, 40.0),
+            ] {
+                engine
+                    .set_cell_value(sheet, 1, 8, LiteralValue::Number(height))
+                    .unwrap();
+                engine.evaluate_all().unwrap();
+                for (col, n) in [(1, sum), (4, direct), (6, sink), (7, sink * 1.5)] {
+                    assert_eq!(
+                        engine.read_cell_value("Sheet1", 1, col),
+                        Some(LiteralValue::Number(n)),
+                        "parallel={parallel} cross={cross} height={height} col={col}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_dynamic_hint_yields_to_real_input_dependencies() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 5, 1, parse("=7").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=SEQUENCE(2,1,A5,1)").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        1,
+        FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(1, 1, 8, 1)),
+    );
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.read_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(7.0))
+    );
+    assert_eq!(
+        engine.read_cell_value("Sheet1", 2, 1),
+        Some(LiteralValue::Number(8.0))
+    );
+}
+
+#[test]
+fn actual_dynamic_self_and_cross_producer_cycles_remain_circular() {
+    for two in [false, true] {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                15,
+                2,
+                parse(if two {
+                    "={1,2;3,4}+0*F16"
+                } else {
+                    "={1,2;3,4}+0*C16"
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        engine.stage_loaded_formula_authorship(
+            "Sheet1",
+            15,
+            2,
+            FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(15, 2, 16, 3)),
+        );
+        if two {
+            engine
+                .set_cell_formula("Sheet1", 15, 5, parse("={1,2;3,4}+0*C16").unwrap())
+                .unwrap();
+            engine.stage_loaded_formula_authorship(
+                "Sheet1",
+                15,
+                5,
+                FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(15, 5, 16, 6)),
+            );
+        }
+        engine
+            .set_cell_formula("Sheet1", 1, 1, parse("=IFERROR(B15,-1)").unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_eq!(
+            engine.read_cell_value("Sheet1", 1, 1),
+            Some(LiteralValue::Number(-1.0))
+        );
+        assert!(
+            matches!(engine.read_cell_value("Sheet1",15,2),Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Circ)
+        );
+        engine
+            .set_cell_formula("Sheet1", 15, 2, parse("={1,2;3,4}").unwrap())
+            .unwrap();
+        engine.stage_loaded_formula_authorship(
+            "Sheet1",
+            15,
+            2,
+            FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(15, 2, 16, 3)),
+        );
+        engine.evaluate_all().unwrap();
+        assert_eq!(
+            engine.read_cell_value("Sheet1", 1, 1),
+            Some(LiteralValue::Number(1.0))
+        );
+    }
+}

@@ -1461,6 +1461,9 @@ pub struct Engine<R> {
     /// not exist or settles as phantom, nothing re-registers, and the
     /// redirty chain stops by itself.
     pending_iterative_redirty: Vec<VertexId>,
+    pending_output_invalidations: std::sync::Mutex<FxHashSet<VertexId>>,
+    output_invalidation_epoch: std::sync::atomic::AtomicU64,
+    finalized_output_cycle_vertices: FxHashSet<VertexId>,
 
     /// Formula results persisted in the source workbook. Excel uses these as
     /// the initial values for the first iterative calculation after load.
@@ -3273,6 +3276,9 @@ where
             evaluation_resource_config_diagnostic: resolved_resources.diagnostic,
             active_resource_ledger: None,
             pending_iterative_redirty: Vec::new(),
+            pending_output_invalidations: std::sync::Mutex::new(FxHashSet::default()),
+            output_invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
+            finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             spill_error_details: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
@@ -3420,6 +3426,9 @@ where
             evaluation_resource_config_diagnostic: resolved_resources.diagnostic,
             active_resource_ledger: None,
             pending_iterative_redirty: Vec::new(),
+            pending_output_invalidations: std::sync::Mutex::new(FxHashSet::default()),
+            output_invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
+            finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             spill_error_details: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
@@ -4207,6 +4216,8 @@ where
         // Defensive: consumed at the end of the previous request; a request
         // that errored out mid-walk must not leak its members into this one.
         self.pending_iterative_redirty.clear();
+        self.pending_output_invalidations.get_mut().unwrap().clear();
+        self.finalized_output_cycle_vertices.clear();
         // Spec §7.11: NOW()/TODAY() sample the clock ONCE per recalc; every
         // read within this request (including SCC iteration passes) observes
         // this sample.
@@ -10283,8 +10294,10 @@ where
             && provider.is_trusted_builtin("", name)
             && (2..=3).contains(&args.len())
             && args.iter().skip(1).all(|arg| {
-                matches!(&arg.node_type, ASTNodeType::Literal(_) | ASTNodeType::Omitted)
-                    || Self::scalar_if_literal_results(arg, provider)
+                matches!(
+                    &arg.node_type,
+                    ASTNodeType::Literal(_) | ASTNodeType::Omitted
+                ) || Self::scalar_if_literal_results(arg, provider)
             })
     }
 
@@ -10638,7 +10651,7 @@ where
                         .map_err(|_| target_root_allocation_error(roots.len() + 1, request_id))?;
                 }
             }
-            for anchor in engine.graph.spill_anchors_in_region(
+            for anchor in engine.graph.potential_output_anchors_in_region(
                 region.sheet_id(),
                 region.axis_ranges().0.query_bounds().0,
                 region.axis_ranges().1.query_bounds().0,
@@ -11089,9 +11102,9 @@ where
                             ));
                         }
                         let opaque = self.opaque_reason_in_ast(&ast, &snapshot);
-                        if let Some(reason) =
-                            opaque.or((vertex_is_dynamic && !Self::scalar_if_literal_results(&ast, &snapshot))
-                                .then_some(OpaqueReason::DynamicReference))
+                        if let Some(reason) = opaque.or((vertex_is_dynamic
+                            && !Self::scalar_if_literal_results(&ast, &snapshot))
+                        .then_some(OpaqueReason::DynamicReference))
                         {
                             if reason == OpaqueReason::DynamicReference
                                 && Self::ast_has_proven_sheet_local_dynamic(&ast, &snapshot)
@@ -18404,6 +18417,7 @@ where
             return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Ref)
                 .with_message(format!("Vertex not found: {vertex_id:?}")));
         }
+        let invalidation_token = self.output_invalidation_token(vertex_id);
         if self.active_resource_ledger.is_some()
             && matches!(
                 self.graph.get_vertex_kind(vertex_id),
@@ -18458,10 +18472,12 @@ where
             }
             VertexKind::NamedScalar => {
                 let value = self.evaluate_named_scalar(vertex_id, sheet_id)?;
+                self.retire_output_invalidation(vertex_id, invalidation_token);
                 return Ok(value);
             }
             VertexKind::NamedArray => {
                 let value = self.evaluate_named_array(vertex_id, sheet_id)?;
+                self.retire_output_invalidation(vertex_id, invalidation_token);
                 return Ok(value);
             }
             VertexKind::InfiniteRange
@@ -18484,6 +18500,7 @@ where
 
         let result =
             interpreter.evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg());
+        self.retire_output_invalidation(vertex_id, invalidation_token);
 
         // If array result, perform spill from the anchor cell
         match result {
@@ -18780,7 +18797,7 @@ where
                                 }
                             }
                         }
-                        self.graph.clear_spill_region(vertex_id);
+                        self.clear_spill_projection_and_mirror(vertex_id, None);
                         if let Some(scope) = Self::formula_plane_region_from_cells(&spill_cells) {
                             self.record_formula_plane_structural_change(scope);
                         }
@@ -18866,7 +18883,7 @@ where
                         }
                     }
                 }
-                self.graph.clear_spill_region(vertex_id);
+                self.clear_spill_projection_and_mirror(vertex_id, None);
                 if let Some(scope) = Self::formula_plane_region_from_cells(&spill_cells) {
                     self.record_formula_plane_structural_change(scope);
                 }
@@ -19388,7 +19405,7 @@ where
             }
             let changed = self.changed_virtual_dep_vertices(&precedents_to_eval, &old_vdeps);
             self.resource_checkpoint(0)?;
-            self.graph.clear_dirty_flags(&precedents_to_eval);
+            self.clear_scheduled_dirty_flags(&schedule, &precedents_to_eval);
             for vertex in &changed {
                 self.graph.set_dirty(*vertex, true);
             }
@@ -22150,7 +22167,7 @@ where
                 }
             }
         }
-        self.graph.clear_dirty_flags(vertices);
+        self.clear_scheduled_dirty_flags(&schedule, vertices);
         Ok((computed, cycles))
     }
 
@@ -22206,7 +22223,7 @@ where
             }
 
             self.resource_checkpoint(0)?;
-            self.graph.clear_dirty_flags(&to_evaluate);
+            self.clear_scheduled_dirty_flags(&schedule, &to_evaluate);
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
@@ -22351,7 +22368,7 @@ where
                 t.changed_vdeps_total += changed_vertices.len();
             }
             self.resource_checkpoint(0)?;
-            self.graph.clear_dirty_flags(&to_evaluate);
+            self.clear_scheduled_dirty_flags(&schedule, &to_evaluate);
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
@@ -22756,7 +22773,7 @@ where
         to_evaluate: &[VertexId],
     ) -> Result<ScheduleBuildOutput, ExcelError> {
         let builder = VirtualDepBuilder::new(self);
-        let (vdeps, augmented, builder_elapsed_ms, vdeps_edges) =
+        let (mut vdeps, augmented, builder_elapsed_ms, vdeps_edges) =
             if self.config.enable_virtual_dep_telemetry {
                 let build_started = crate::instant::FzInstant::now();
                 let (vdeps, augmented) = builder.build(to_evaluate);
@@ -22770,9 +22787,12 @@ where
 
         let mut final_evaluate = to_evaluate.to_vec();
         if !augmented.is_empty() {
+            let (admitted, _) = self.build_demand_subgraph(&augmented);
+            final_evaluate.extend(admitted);
             final_evaluate.extend(augmented);
             final_evaluate.sort_unstable();
             final_evaluate.dedup();
+            vdeps = builder.build(&final_evaluate).0;
         }
 
         let use_virtual = !vdeps.is_empty();
@@ -22891,6 +22911,20 @@ where
         Ok(())
     }
 
+    fn clear_scheduled_dirty_flags(&mut self, schedule: &crate::engine::scheduler::Schedule, requested: &[VertexId]) {
+        let mut completed = requested.to_vec();
+        completed.extend(
+            schedule
+                .layers
+                .iter()
+                .flat_map(|layer| layer.vertices.iter().copied()),
+        );
+        completed.extend(schedule.cycles.iter().flatten().copied());
+        completed.sort_unstable();
+        completed.dedup();
+        self.graph.clear_dirty_flags(&completed);
+    }
+
     fn changed_virtual_dep_vertices(
         &mut self,
         to_evaluate: &[VertexId],
@@ -22903,16 +22937,12 @@ where
             self.force_virtual_dep_changes_remaining_for_test -= 1;
             return vec![vertex];
         }
-        if !to_evaluate
-            .iter()
-            .copied()
-            .any(|v| self.graph.is_dynamic(v))
-        {
-            return Vec::new();
-        }
-
         let builder = VirtualDepBuilder::new(self);
-        let (new_vdeps, _) = builder.build(to_evaluate);
+        let mut comparison_domain = to_evaluate.to_vec();
+        comparison_domain.extend(old_vdeps.keys().copied());
+        comparison_domain.sort_unstable();
+        comparison_domain.dedup();
+        let (new_vdeps, _) = builder.build(&comparison_domain);
 
         let mut candidates = FxHashSet::default();
         candidates.extend(old_vdeps.keys().copied());
@@ -22924,6 +22954,28 @@ where
                 changed.push(v);
             }
         }
+        changed.extend(std::mem::take(
+            self.pending_output_invalidations.get_mut().unwrap(),
+        ));
+        changed.retain(|&v| {
+            if !self.graph.vertex_exists(v)
+                || !matches!(
+                    self.graph.get_vertex_kind(v),
+                    VertexKind::FormulaScalar
+                        | VertexKind::FormulaArray
+                        | VertexKind::NamedScalar
+                        | VertexKind::NamedArray
+                )
+            {
+                return false;
+            }
+            // A confirmed circular component has already been finalized. Clearing its
+            // spill removes its virtual edges; that removal must not restart discovery.
+            !self.finalized_output_cycle_vertices.contains(&v)
+        });
+        changed.sort_unstable();
+        changed.dedup();
+
         changed
     }
 
@@ -23003,7 +23055,8 @@ where
                 }
             } // Virtual dependencies (compressed ranges + dynamic like INDIRECT)
             let builder = VirtualDepBuilder::new(self);
-            let (vdeps_map, _) = builder.build(&[v]);
+            let (vdeps_map, soft_producers) = builder.build(&[v]);
+            stack.extend(soft_producers.into_iter().filter(|u| !visited.contains(u)));
             if let Some(deps) = vdeps_map.get(&v) {
                 for &u in deps {
                     vdeps.entry(v).or_default().push(u);
@@ -23157,7 +23210,7 @@ where
                 t.changed_vdeps_total += changed_vertices.len();
             }
             self.resource_checkpoint(0)?;
-            self.graph.clear_dirty_flags(&to_evaluate);
+            self.clear_scheduled_dirty_flags(&schedule, &to_evaluate);
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
@@ -23565,7 +23618,7 @@ where
             }
         }
 
-        self.graph.clear_spill_region(vertex_id);
+        self.clear_spill_projection_and_mirror(vertex_id, None);
         if let Some(scope) = Self::formula_plane_region_from_cells(&spill_cells) {
             self.record_formula_plane_structural_change(scope);
         }
@@ -23763,6 +23816,16 @@ where
 
     /// Evaluate a single vertex without mutating the graph (for parallel evaluation)
     fn evaluate_vertex_immutable(&self, vertex_id: VertexId) -> Result<LiteralValue, ExcelError> {
+        let invalidation_token = self.output_invalidation_token(vertex_id);
+        let result = self.evaluate_vertex_immutable_inner(vertex_id);
+        self.retire_output_invalidation(vertex_id, invalidation_token);
+        result
+    }
+
+    fn evaluate_vertex_immutable_inner(
+        &self,
+        vertex_id: VertexId,
+    ) -> Result<LiteralValue, ExcelError> {
         // Check if vertex exists
         if !self.graph.vertex_exists(vertex_id) {
             return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Ref)
@@ -25599,6 +25662,79 @@ impl<R> Engine<R>
 where
     R: EvaluationContext,
 {
+    fn output_invalidation_token(&self, vertex: VertexId) -> Option<u64> {
+        let pending = self.pending_output_invalidations.lock().unwrap();
+        if !pending.contains(&vertex) {
+            return None;
+        }
+        // Runtime reference formulas may read precedents absent from static range edges.
+        // Conservatively retain their work for the next confirmed dependency schedule.
+        if self.graph.is_dynamic(vertex) {
+            return None;
+        }
+        let deps = self.graph.get_dependencies(vertex);
+        let virtual_deps =
+            crate::engine::virtual_deps::RangeVirtualDepProvider::get_virtual_deps(self, vertex);
+        if deps
+            .iter()
+            .chain(virtual_deps.iter())
+            .any(|v| pending.contains(v))
+        {
+            return None;
+        }
+        Some(
+            self.output_invalidation_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    fn retire_output_invalidation(&self, vertex: VertexId, token: Option<u64>) {
+        let Some(epoch) = token else {
+            return;
+        };
+        let mut pending = self.pending_output_invalidations.lock().unwrap();
+        if self
+            .output_invalidation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            == epoch
+        {
+            pending.remove(&vertex);
+        }
+    }
+
+    fn record_changed_output_invalidations(&mut self, anchor: VertexId, cells: &[CellRef]) {
+        // A new committed footprint can add hard virtual edges without changing graph CSR.
+        self.cached_static_schedule = None;
+        let affected = self.graph.invalidate_changed_output_cells(cells);
+        if !affected.is_empty() {
+            self.output_invalidation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.pending_output_invalidations
+            .get_mut()
+            .unwrap()
+            .extend(affected.into_iter().filter(|&v| v != anchor));
+    }
+
+    fn nonempty_spill_followers(&self, anchor: VertexId, cells: &[CellRef]) -> Vec<CellRef> {
+        let anchor_cell = self.graph.get_cell_ref(anchor);
+        cells
+            .iter()
+            .copied()
+            .filter(|cell| {
+                Some(*cell) != anchor_cell
+                    && !matches!(
+                        self.read_cell_value(
+                            self.graph.sheet_name(cell.sheet_id),
+                            cell.coord.row() + 1,
+                            cell.coord.col() + 1
+                        ),
+                        None | Some(LiteralValue::Empty)
+                    )
+            })
+            .collect()
+    }
+
     fn clear_spill_projection_and_mirror(
         &mut self,
         anchor_vertex: VertexId,
@@ -25628,6 +25764,7 @@ where
             }
         }
 
+        let changed_followers = self.nonempty_spill_followers(anchor_vertex, &spill_cells);
         self.graph.clear_spill_region(anchor_vertex);
         if let Some(scope) = Self::formula_plane_region_from_cells(&spill_cells) {
             self.record_formula_plane_structural_change(scope);
@@ -25648,6 +25785,7 @@ where
                 );
             }
         }
+        self.record_changed_output_invalidations(anchor_vertex, &changed_followers);
     }
 
     /// Apply the evaluation outcome for one cyclic SCC: stamp `#CIRC!` on its
@@ -25706,6 +25844,7 @@ where
         circ_error: &LiteralValue,
         mut delta: Option<&mut DeltaCollector>,
     ) {
+        self.finalized_output_cycle_vertices.insert(vertex_id);
         // Tear down any previous spill projection/region before overwriting the anchor.
         if self.graph.spill_registry_has_anchor(vertex_id) {
             self.clear_spill_projection_and_mirror(vertex_id, delta.as_deref_mut());
@@ -27084,6 +27223,18 @@ classify_calls={} classify_skipped={}",
         ctx: &RecordingContext<'_, R>,
         collector: &LiveEdgeCollector,
     ) -> Result<LiteralValue, ExcelError> {
+        let invalidation_token = self.output_invalidation_token(vertex_id);
+        let result = self.evaluate_vertex_recorded_inner(vertex_id, ctx, collector);
+        self.retire_output_invalidation(vertex_id, invalidation_token);
+        result
+    }
+
+    fn evaluate_vertex_recorded_inner(
+        &self,
+        vertex_id: VertexId,
+        ctx: &RecordingContext<'_, R>,
+        collector: &LiveEdgeCollector,
+    ) -> Result<LiteralValue, ExcelError> {
         if !self.graph.vertex_exists(vertex_id) {
             return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Ref)
                 .with_message(format!("Vertex not found: {vertex_id:?}")));
@@ -27194,8 +27345,6 @@ classify_calls={} classify_skipped={}",
             .unwrap_or_default();
 
         let mut changed_cells = Vec::new();
-        if let Some(delta) = delta.as_deref()
-            && delta.mode != DeltaMode::Off
         {
             let target_set: std::collections::HashSet<CellRef, CoordBuildHasher> =
                 targets.iter().copied().collect();
@@ -27208,7 +27357,7 @@ classify_calls={} classify_skipped={}",
                 }
                 let sheet_name = self.graph.sheet_name(cell.sheet_id);
                 let old = self
-                    .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                    .read_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                     .unwrap_or(LiteralValue::Empty);
                 if old != empty {
                     changed_cells.push(*cell);
@@ -27228,7 +27377,7 @@ classify_calls={} classify_skipped={}",
                         .unwrap_or(LiteralValue::Empty);
                     let sheet_name = self.graph.sheet_name(cell.sheet_id);
                     let old = self
-                        .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                        .read_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                         .unwrap_or(LiteralValue::Empty);
                     if old != new {
                         changed_cells.push(*cell);
@@ -27239,7 +27388,7 @@ classify_calls={} classify_skipped={}",
                 for cell in targets.iter() {
                     let sheet_name = self.graph.sheet_name(cell.sheet_id);
                     let old = self
-                        .get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                        .read_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                         .unwrap_or(LiteralValue::Empty);
                     if !matches!(old, LiteralValue::Empty) {
                         changed_cells.push(*cell);
@@ -27272,7 +27421,7 @@ classify_calls={} classify_skipped={}",
         )?;
 
         if let Some(delta) = delta.as_deref_mut() {
-            for cell in changed_cells {
+            for cell in &changed_cells {
                 delta.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
             }
         }
@@ -27322,6 +27471,7 @@ classify_calls={} classify_skipped={}",
                 );
             }
         }
+        self.record_changed_output_invalidations(anchor_vertex, &changed_cells);
         Ok(())
     }
 }
@@ -27734,6 +27884,7 @@ where
             }
         }
 
+        let changed_followers = self.nonempty_spill_followers(anchor_vertex, &spill_cells);
         self.graph.clear_spill_region(anchor_vertex);
         if let Some(scope) = Self::formula_plane_region_from_cells(&spill_cells) {
             self.record_formula_plane_structural_change(scope);
@@ -27765,6 +27916,7 @@ where
                 old,
             });
         }
+        self.record_changed_output_invalidations(anchor_vertex, &changed_followers);
         Ok(())
     }
 
@@ -28599,7 +28751,7 @@ where
                     t.changed_vdeps_total += changed_vertices.len();
                 }
                 self.resource_checkpoint(0)?;
-                self.graph.clear_dirty_flags(&to_evaluate);
+                self.clear_scheduled_dirty_flags(&schedule, &to_evaluate);
                 for v in &changed_vertices {
                     self.graph.set_dirty(*v, true);
                 }
@@ -28679,5 +28831,47 @@ where
         }
         self.flush_computed_write_buffer(&mut computed_writes)?;
         Ok(layer.vertices.len())
+    }
+}
+
+#[cfg(test)]
+mod dynamic_output_schedule_cache_tests {
+    use super::*;
+    use crate::test_workbook::TestWorkbook;
+    use formualizer_parse::parser::parse;
+
+    #[test]
+    fn empty_spill_geometry_invalidates_initial_static_schedule() {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine
+            .set_cell_formula("Sheet1", 1, 1, parse("=1").unwrap())
+            .unwrap();
+        let anchor_cell = engine.graph.make_cell_ref("Sheet1", 1, 1);
+        let anchor = *engine
+            .graph
+            .get_vertex_id_for_address(&anchor_cell)
+            .unwrap();
+        let (_, deps, _) = engine.create_evaluation_schedule(&[anchor]).unwrap();
+        assert!(deps.is_empty());
+        assert!(engine.cached_static_schedule.is_some());
+        let cells = [anchor_cell, engine.graph.make_cell_ref("Sheet1", 2, 1)];
+        engine
+            .commit_spill_and_mirror(
+                anchor,
+                &cells,
+                vec![vec![LiteralValue::Empty], vec![LiteralValue::Empty]],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(engine.cached_static_schedule.is_none());
+        assert!(
+            engine
+                .pending_output_invalidations
+                .get_mut()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(engine.graph.spill_registry_has_anchor(anchor));
     }
 }

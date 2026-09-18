@@ -399,6 +399,51 @@ impl RangeVirtualDepProvider {
         )
     }
 
+    pub(crate) fn get_soft_producers<R: EvaluationContext>(
+        engine: &Engine<R>,
+        v: VertexId,
+    ) -> Vec<VertexId> {
+        let mut out = Vec::new();
+        for target in engine.graph.get_dependencies(v) {
+            if let Some(cell) = engine.graph.get_cell_ref(target) {
+                out.extend(engine.graph.potential_output_anchors_in_region(
+                    cell.sheet_id,
+                    cell.coord.row(),
+                    cell.coord.col(),
+                    cell.coord.row(),
+                    cell.coord.col(),
+                ));
+            }
+        }
+        if let Some(ranges) = engine.graph.get_range_dependencies(v) {
+            for range in ranges {
+                let sheet = engine
+                    .graph
+                    .sheet_reg()
+                    .resolve_locator(&range.sheet, engine.graph.get_vertex_sheet_id(v));
+                let Ok(sheet) = sheet else {
+                    continue;
+                };
+                let Some(extent) =
+                    Self::resolve_range(engine, engine.graph.sheet_name(sheet), range)
+                else {
+                    continue;
+                };
+                out.extend(engine.graph.potential_output_anchors_in_region(
+                    sheet,
+                    extent.start_row.saturating_sub(1),
+                    extent.start_column.saturating_sub(1),
+                    extent.end_row.saturating_sub(1),
+                    extent.end_column.saturating_sub(1),
+                ));
+            }
+        }
+        out.retain(|&u| u != v && (engine.graph.is_dirty(u) || engine.graph.is_volatile(u)));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     pub fn get_virtual_deps<R: EvaluationContext>(
         engine: &Engine<R>,
         v: VertexId,
@@ -503,9 +548,10 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
     ) {
         let mut vdeps: rustc_hash::FxHashMap<VertexId, Vec<VertexId>> =
             rustc_hash::FxHashMap::default();
-        let augmented_vertices: Vec<VertexId> = Vec::new(); // Will be populated in Phase 3
+        let mut augmented_vertices: Vec<VertexId> = Vec::new();
 
         for &v in candidates {
+            augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers(self.engine, v));
             let mut deps = RangeVirtualDepProvider::get_virtual_deps(self.engine, v);
             let dynamic_deps = DynamicRefVirtualDepProvider::get_virtual_deps(self.engine, v);
 
@@ -518,6 +564,8 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             }
         }
 
+        augmented_vertices.sort_unstable();
+        augmented_vertices.dedup();
         (vdeps, augmented_vertices)
     }
 }

@@ -1952,7 +1952,7 @@ impl CalamineAdapter {
                     let authorship = if current_cell_metadata
                         .is_some_and(|index| dynamic_cell_metadata.contains(&index))
                     {
-                        FormulaAuthorship::dynamic_array()
+                        FormulaAuthorship::dynamic_array_with_saved_extent(fence)
                     } else {
                         FormulaAuthorship::cse_array(fence)
                     };

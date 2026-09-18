@@ -144,7 +144,7 @@ impl<'a> Scheduler<'a> {
         #[cfg(feature = "tracing")]
         drop(_scc_span);
         // 2. Separate cycles and acyclic components
-        let (cycles, acyclic_sccs) = self.separate_cycles(sccs);
+        let (cycles, acyclic_sccs) = self.separate_cycles_with_virtual(sccs, Some(vdeps));
         // 3. Build layers over combined adjacency (graph + vdeps)
         #[cfg(feature = "tracing")]
         let _layers_span = tracing::info_span!("build_layers_with_virtual").entered();
@@ -649,11 +649,25 @@ impl<'a> Scheduler<'a> {
         &self,
         sccs: Vec<Vec<VertexId>>,
     ) -> (Vec<Vec<VertexId>>, Vec<Vec<VertexId>>) {
+        self.separate_cycles_with_virtual(sccs, None)
+    }
+
+    fn separate_cycles_with_virtual(
+        &self,
+        sccs: Vec<Vec<VertexId>>,
+        vdeps: Option<&rustc_hash::FxHashMap<VertexId, Vec<VertexId>>>,
+    ) -> (Vec<Vec<VertexId>>, Vec<Vec<VertexId>>) {
         let mut cycles = Vec::new();
         let mut acyclic = Vec::new();
 
         for scc in sccs {
-            if scc.len() > 1 || (scc.len() == 1 && self.has_self_loop(scc[0])) {
+            if scc.len() > 1
+                || (scc.len() == 1
+                    && (self.has_self_loop(scc[0])
+                        || vdeps
+                            .and_then(|deps| deps.get(&scc[0]))
+                            .is_some_and(|deps| deps.contains(&scc[0]))))
+            {
                 cycles.push(scc);
             } else {
                 acyclic.push(scc);
