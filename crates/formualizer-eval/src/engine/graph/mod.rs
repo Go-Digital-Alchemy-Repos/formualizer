@@ -2881,6 +2881,7 @@ impl DependencyGraph {
                 to_visit.extend(dependents);
             }
             to_visit.extend(self.collect_range_dependents_for_vertex(id));
+            to_visit.extend(self.collect_output_dependents(id));
         }
 
         // Add to dirty set
@@ -3944,10 +3945,61 @@ impl DependencyGraph {
             self.store.set_dirty(id, true);
             to_visit.extend(self.edges.in_edges(id));
             to_visit.extend(self.collect_range_dependents_for_vertex(id));
+            to_visit.extend(self.collect_output_dependents(id));
         }
 
         self.formula_dirty.legacy_extend(affected.iter().copied());
         affected.into_iter().collect()
+    }
+
+    /// Admit output consumers to the dirty closure before evaluation snapshots it.
+    /// Virtual scheduling edges alone do not propagate edits through spill followers.
+    fn collect_output_dependents(&self, producer: VertexId) -> Vec<VertexId> {
+        let sheet = self.get_vertex_sheet_id(producer);
+        let mut rectangles = Vec::new();
+        if let Some(fence) = self.formula_authorship(producer).cse_fence {
+            rectangles.push((
+                fence.start_row.saturating_sub(1),
+                fence.start_col.saturating_sub(1),
+                fence.end_row.saturating_sub(1),
+                fence.end_col.saturating_sub(1),
+            ));
+        }
+        if let Some(cells) = self.spill_cells_for_anchor(producer) {
+            if let Some(first) = cells.first() {
+                let mut rect = (
+                    first.coord.row(),
+                    first.coord.col(),
+                    first.coord.row(),
+                    first.coord.col(),
+                );
+                for cell in cells {
+                    rect.0 = rect.0.min(cell.coord.row());
+                    rect.1 = rect.1.min(cell.coord.col());
+                    rect.2 = rect.2.max(cell.coord.row());
+                    rect.3 = rect.3.max(cell.coord.col());
+                }
+                rectangles.push(rect);
+            }
+        }
+        let mut dependents = FxHashSet::default();
+        for (sr, sc, er, ec) in rectangles {
+            dependents.extend(self.collect_range_dependents_for_rect(sheet, sr, sc, er, ec));
+            if let Some(index) = self.sheet_index(sheet) {
+                for vertex in index.vertices_in_col_range(sc, ec) {
+                    if self
+                        .vertex_grid_addr(vertex)
+                        .is_some_and(|addr| addr.row() >= sr && addr.row() <= er)
+                    {
+                        dependents.extend(self.get_dependents(vertex));
+                        if let Some(names) = self.cell_to_name_dependents.get(&vertex) {
+                            dependents.extend(names.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        dependents.into_iter().collect()
     }
 
     fn collect_range_dependents_for_vertex(&self, vertex_id: VertexId) -> Vec<VertexId> {

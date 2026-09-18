@@ -1,5 +1,6 @@
 """Declared XLSX CSE callback outputs order follower consumers on first calculation."""
 import json
+import struct
 
 import formualizer as fz
 import openpyxl
@@ -44,5 +45,10 @@ def test_loaded_callback_first_calculation_and_existing_consumer_mutations(tmp_p
             else:
                 assert observed == expected
             typed = json.loads(wb.get_typed_value_json(sheet, row, col))
-            assert typed['kind'] == ('error' if value < 0 else 'number')
+            if value < 0:
+                assert typed['type'] == 'Error' and typed['kind'] == 'Na'
+            elif typed['type'] == 'Number':
+                assert struct.unpack('!d', struct.pack('!Q', typed['bits']))[0] == expected
+            else:
+                assert typed == {'type': 'Int', 'value': expected}
     assert calls == [30, 60, -1, 90]

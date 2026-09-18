@@ -216,3 +216,79 @@ fn declared_self_follower_dependency_is_a_cycle() {
         "expected cycle, got {result:?}"
     );
 }
+
+#[test]
+fn existing_declared_output_consumers_enter_dirty_closure_before_evaluation() {
+    for cross_sheet in [false, true] {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        let producer_sheet = if cross_sheet { "Child" } else { "Sheet1" };
+        engine
+            .set_cell_value(producer_sheet, 1, 8, LiteralValue::Number(30.0))
+            .unwrap();
+        engine
+            .set_cell_formula(producer_sheet, 15, 2, parse("={1,10;2,20;3,H1}").unwrap())
+            .unwrap();
+        engine.stage_loaded_formula_authorship(
+            producer_sheet,
+            15,
+            2,
+            FormulaAuthorship::cse_array(FormulaFence::new(15, 2, 17, 3)),
+        );
+        let prefix = if cross_sheet { "Child!" } else { "" };
+        for (col, formula) in [
+            (1, format!("=VLOOKUP(3,{prefix}B16:C17,2,FALSE)")),
+            (4, format!("={prefix}C17")),
+            (5, "=IFERROR(A1,-1)".into()),
+            (6, "=E1*2".into()),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", 1, col, parse(&formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for input in [
+            LiteralValue::Number(60.0),
+            LiteralValue::Error(formualizer_common::ExcelError::new(
+                formualizer_common::ExcelErrorKind::Na,
+            )),
+            LiteralValue::Number(90.0),
+        ] {
+            engine
+                .set_cell_value(producer_sheet, 1, 8, input.clone())
+                .unwrap();
+            let producer = vertex(&engine, producer_sheet, 15, 2);
+            assert!(engine.graph.is_dirty(producer));
+            for col in [1, 4, 5, 6] {
+                assert!(
+                    engine.graph.is_dirty(vertex(&engine, "Sheet1", 1, col)),
+                    "consumer {col} absent from pre-evaluation dirty closure"
+                );
+                if col == 1 || col == 4 {
+                    assert!(
+                        RangeVirtualDepProvider::get_virtual_deps(
+                            &engine,
+                            vertex(&engine, "Sheet1", 1, col)
+                        )
+                        .contains(&producer)
+                    );
+                }
+            }
+            engine.evaluate_all().unwrap();
+            for col in [1, 4] {
+                assert_eq!(engine.get_cell_value("Sheet1", 1, col), Some(input.clone()));
+            }
+            let expected = match input {
+                LiteralValue::Number(n) => n,
+                _ => -1.0,
+            };
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 1, 5),
+                Some(LiteralValue::Number(expected))
+            );
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 1, 6),
+                Some(LiteralValue::Number(expected * 2.0))
+            );
+        }
+    }
+}
