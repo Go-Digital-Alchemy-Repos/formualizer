@@ -241,14 +241,22 @@ impl<'a> SheetPort<'a> {
     }
 
     fn apply_writes(&mut self, writes: Vec<PreparedWrite>) -> Result<(), SheetPortError> {
-        self.workbook
+        // Keep the atomic action (including rollback) inside the scope so both
+        // successful writes and restored cells contribute to one dirty union.
+        // Match Workbook's bulk setters: always close after the action returns,
+        // including errors, and leave any caller-owned outer scope active.
+        self.workbook.engine_mut().begin_deferred_dirty();
+        let result = self
+            .workbook
             .action("sheetport.write_inputs", move |action| {
                 for write in writes {
                     action.set_value(&write.sheet, write.row, write.col, write.value)?;
                 }
                 Ok(())
             })
-            .map_err(SheetPortError::from)
+            .map_err(SheetPortError::from);
+        self.workbook.engine_mut().end_deferred_dirty();
+        result
     }
 
     fn request_checkpoint(
@@ -1508,6 +1516,143 @@ impl<'a> SheetPort<'a> {
             self.workbook
                 .engine_mut()
                 .set_evaluation_resource_budgets(restore.budgets);
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_batch_tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        Manifest::from_yaml_str(
+            r#"
+spec: fio
+spec_version: "0.3.0"
+manifest: { id: dirty-batch, name: Dirty Batch }
+ports:
+  - id: inputs
+    dir: in
+    shape: range
+    location: { a1: S!A1:A32 }
+    schema: { cell_type: number }
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn input_batch_coalesces_shared_dependents_and_preserves_history() {
+        for changelog in [false, true] {
+            let mut wb = Workbook::new();
+            wb.add_sheet("S").unwrap();
+            for row in 1..=32 {
+                wb.set_value("S", row, 1, LiteralValue::Number(1.0))
+                    .unwrap();
+            }
+            wb.set_formula("S", 1, 2, "=SUM(A1:A32)").unwrap();
+            for row in 2..=64 {
+                wb.set_formula("S", row, 2, &format!("=B{}+1", row - 1))
+                    .unwrap();
+            }
+            wb.evaluate_all().unwrap();
+            wb.set_changelog_enabled(changelog);
+            let mut port = SheetPort::new(&mut wb, manifest()).unwrap();
+            let before = port.workbook().engine().dirty_propagation_visits();
+            let mut update = InputUpdate::new();
+            update.insert(
+                "inputs",
+                PortValue::Range(vec![vec![LiteralValue::Number(2.0)]; 32]),
+            );
+            port.write_inputs(update).unwrap();
+            let visits = port.workbook().engine().dirty_propagation_visits() - before;
+            assert!(
+                visits <= 96,
+                "one union should visit at most 32 inputs + 64 formulas, got {visits}"
+            );
+            assert_eq!(
+                port.workbook_mut().evaluate_cell("S", 64, 2).unwrap(),
+                LiteralValue::Number(127.0)
+            );
+            port.workbook_mut().undo().unwrap();
+            assert_eq!(
+                port.workbook_mut().evaluate_cell("S", 64, 2).unwrap(),
+                LiteralValue::Number(95.0)
+            );
+            port.workbook_mut().redo().unwrap();
+            assert_eq!(
+                port.workbook_mut().evaluate_cell("S", 64, 2).unwrap(),
+                LiteralValue::Number(127.0)
+            );
+        }
+    }
+
+    #[test]
+    fn input_batch_closes_on_mutation_failure_and_keeps_outer_scope() {
+        for changelog in [false, true] {
+            for nested in [false, true] {
+                let mut wb = Workbook::new();
+                wb.add_sheet("S").unwrap();
+                wb.set_value("S", 1, 1, LiteralValue::Number(1.0)).unwrap();
+                wb.set_formula("S", 1, 2, "=A1+1").unwrap();
+                wb.evaluate_all().unwrap();
+                wb.set_changelog_enabled(changelog);
+                // New vertices exceed admission; editing existing A1 is allowed.
+                let mut budgets = wb.engine().evaluation_resource_budgets().clone();
+                budgets.admission.graph_vertex_hard_limit = Some(2);
+                wb.engine_mut().set_evaluation_resource_budgets(budgets);
+                let mut port = SheetPort::new(&mut wb, manifest()).unwrap();
+                let log_len = port.workbook().changelog().len();
+                if nested {
+                    port.workbook_mut().engine_mut().begin_deferred_dirty();
+                }
+                let err = port
+                    .apply_writes(vec![
+                        PreparedWrite::new("S".into(), 1, 1, LiteralValue::Number(9.0)),
+                        PreparedWrite::new("S".into(), 2, 1, LiteralValue::Number(9.0)),
+                    ])
+                    .expect_err("second write must exceed graph admission");
+                assert!(matches!(err, SheetPortError::Workbook { .. }));
+                assert_eq!(
+                    port.workbook().get_value("S", 1, 1),
+                    Some(LiteralValue::Number(1.0))
+                );
+                assert_eq!(port.workbook().changelog().len(), log_len);
+                if nested {
+                    // The inner failed action must not flush the caller's scope.
+                    let before = port.workbook().engine().dirty_propagation_visits();
+                    port.apply_writes(vec![PreparedWrite::new(
+                        "S".into(),
+                        1,
+                        1,
+                        LiteralValue::Number(1.0),
+                    )])
+                    .unwrap();
+                    assert_eq!(port.workbook().engine().dirty_propagation_visits(), before);
+                    port.workbook_mut().engine_mut().end_deferred_dirty();
+                }
+                assert_eq!(
+                    port.workbook_mut().evaluate_cell("S", 1, 2).unwrap(),
+                    LiteralValue::Number(2.0)
+                );
+                // A subsequent mutation must still propagate after the failure.
+                port.apply_writes(vec![PreparedWrite::new(
+                    "S".into(),
+                    1,
+                    1,
+                    LiteralValue::Number(4.0),
+                )])
+                .unwrap();
+                assert_eq!(
+                    port.workbook_mut().evaluate_cell("S", 1, 2).unwrap(),
+                    LiteralValue::Number(5.0)
+                );
+                port.workbook_mut().undo().unwrap();
+                assert_eq!(
+                    port.workbook_mut().evaluate_cell("S", 1, 2).unwrap(),
+                    LiteralValue::Number(2.0)
+                );
+            }
         }
     }
 }
