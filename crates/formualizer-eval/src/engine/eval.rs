@@ -12979,11 +12979,11 @@ where
         }
     }
 
-    fn remap_saved_formula_values(
+    fn remap_rich_error_details(
         &mut self,
         sheet_id: SheetId,
         mut remap: impl FnMut(u32, u32) -> Option<(u32, u32)>,
-    ) -> Vec<crate::engine::ChangeEvent> {
+    ) {
         let errors: Vec<_> = self.rich_error_details.iter()
             .filter(|(cell, _)| cell.sheet_id == sheet_id)
             .map(|(cell, error)| (*cell, error.clone())).collect();
@@ -12993,6 +12993,14 @@ where
                 self.rich_error_details.insert(CellRef::new(sheet_id, Coord::new(row, col, true, true)), error);
             }
         }
+    }
+
+    fn remap_saved_formula_values(
+        &mut self,
+        sheet_id: SheetId,
+        mut remap: impl FnMut(u32, u32) -> Option<(u32, u32)>,
+    ) -> Vec<crate::engine::ChangeEvent> {
+        self.remap_rich_error_details(sheet_id, &mut remap);
         let before: BTreeMap<CellRef, LiteralValue> = self
             .saved_formula_values
             .iter()
@@ -16786,6 +16794,13 @@ where
                             asheet.insert_rows(*before0 as usize, *count as usize);
                         }
                     }
+                    self.remap_rich_error_details(*sheet_id, |row, col| {
+                        if undo {
+                            if row < *before0 { Some((row, col)) }
+                            else if row < before0.saturating_add(*count) { None }
+                            else { Some((row - count, col)) }
+                        } else { Some((if row >= *before0 { row + count } else { row }, col)) }
+                    });
                     self.purge_derived_formats_after_row(*sheet_id, *before0);
                 }
                 ArrowOp::InsertCols {
@@ -16802,6 +16817,13 @@ where
                             asheet.insert_columns(*before0 as usize, *count as usize);
                         }
                     }
+                    self.remap_rich_error_details(*sheet_id, |row, col| {
+                        if undo {
+                            if col < *before0 { Some((row, col)) }
+                            else if col < before0.saturating_add(*count) { None }
+                            else { Some((row, col - count)) }
+                        } else { Some((row, if col >= *before0 { col + count } else { col })) }
+                    });
                     self.purge_derived_formats_after_col(*sheet_id, *before0);
                 }
             }
@@ -28962,6 +28984,25 @@ mod rich_error_projection_tests {
         engine.commit_spill_and_mirror(anchor, &[cell, follower], vec![vec![rich_error()], vec![rich_error()]], None, None).unwrap();
         engine.clear_spill_projection_and_mirror(anchor, None);
         assert!(engine.rich_error_details.is_empty());
+    }
+
+    #[test]
+    fn rich_error_structural_action_undo_redo() {
+        use crate::engine::graph::editor::undo_engine::UndoEngine;
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine.set_cell_value("Sheet1", 2, 2, rich_error()).unwrap();
+        let mut undo = UndoEngine::new();
+        let (_, journal) = engine.action_atomic_journal("insert".to_string(), |tx| {
+            tx.insert_rows("Sheet1", 1, 2)?;
+            tx.insert_columns("Sheet1", 1, 2)?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 4, 4), Some(rich_error()));
+        undo.push_action(journal);
+        engine.undo_action(&mut undo).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 2, 2), Some(rich_error()));
+        engine.redo_action(&mut undo).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 4, 4), Some(rich_error()));
     }
 
     #[test]

@@ -101,3 +101,19 @@ def test_native_error_projection_rejects_invalid_extras_and_preserves_nested_val
     native = LiteralValue.array([[LiteralValue.pending(), LiteralValue.from_object(error)]])
     assert native.to_python() == [[{'type': 'Pending'}, error]]
     assert LiteralValue.from_object(native).to_python() == native.to_python()
+
+
+def test_native_error_action_undo_redo_preserves_same_kind_metadata():
+    wb = Workbook()
+    wb.add_sheet('Data')
+    first = {'type': 'Error', 'kind': 'Na', 'message': 'first'}
+    second = {'type': 'Error', 'kind': 'Na', 'message': 'second'}
+    wb.set_value('Data', 1, 1, LiteralValue.from_object(first))
+    wb.begin_action('replace error')
+    wb.set_value('Data', 1, 1, LiteralValue.from_object(second))
+    wb.end_action()
+    assert wb.read_typed_range('Data', 1, 1, 1, 1)[0][0].to_python() == second
+    wb.undo()
+    assert wb.read_typed_range('Data', 1, 1, 1, 1)[0][0].to_python() == first
+    wb.redo()
+    assert wb.read_typed_range('Data', 1, 1, 1, 1)[0][0].to_python() == second
