@@ -213,3 +213,5 @@ mod lookup_vector_sheetread;
 mod temporal_lookup_semantics;
 mod xlookup_declared_length_guard;
 mod xlookup_excel_parity;
+
+mod output_footprint_dependencies;

@@ -52,11 +52,20 @@ impl<'a, R: EvaluationContext> DynamicRefCollector<'a, R> {
             .lock()
             .unwrap()
             .insert(Region::rect(sheet_id, sr0, er0, sc0, ec0).normalized());
+        let mut out = self.collected.lock().unwrap();
+        for anchor in self
+            .engine
+            .graph
+            .output_anchors_in_region(sheet_id, sr0, sc0, er0, ec0)
+        {
+            if self.engine.graph.is_dirty(anchor) || self.engine.graph.is_volatile(anchor) {
+                out.insert(anchor);
+            }
+        }
         let Some(index) = self.engine.graph.sheet_index(sheet_id) else {
             return;
         };
 
-        let mut out = self.collected.lock().unwrap();
         for u in index.vertices_in_col_range(sc0, ec0) {
             let Some(row0) = self.engine.graph.vertex_grid_addr(u).map(|addr| addr.row()) else {
                 continue;
@@ -129,6 +138,16 @@ impl<'a, R: EvaluationContext> ReferenceResolver for DynamicRefCollector<'a, R> 
     ) -> Result<LiteralValue, ExcelError> {
         let sheet_name = sheet.unwrap_or(self.current_sheet);
         if let Some(sheet_id) = self.engine.graph.sheet_id(sheet_name) {
+            self.collected
+                .lock()
+                .unwrap()
+                .extend(self.engine.graph.output_anchors_in_region(
+                    sheet_id,
+                    row.saturating_sub(1),
+                    col.saturating_sub(1),
+                    row.saturating_sub(1),
+                    col.saturating_sub(1),
+                ));
             self.collected_regions.lock().unwrap().insert(Region::point(
                 sheet_id,
                 row.saturating_sub(1),
@@ -385,6 +404,25 @@ impl RangeVirtualDepProvider {
         v: VertexId,
     ) -> Vec<VertexId> {
         let mut deps = Vec::new();
+        // Direct cell reads have physical placeholder dependencies before a spill.
+        // Resolve those points to their output producer as well.
+        for target in engine.graph.get_dependencies(v) {
+            if let Some(cell) = engine.graph.get_cell_ref(target) {
+                deps.extend(
+                    engine
+                        .graph
+                        .output_anchors_in_region(
+                            cell.sheet_id,
+                            cell.coord.row(),
+                            cell.coord.col(),
+                            cell.coord.row(),
+                            cell.coord.col(),
+                        )
+                        .into_iter()
+                        .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
+                );
+            }
+        }
         if let Some(ranges) = engine.graph.get_range_dependencies(v) {
             let current_sheet_id = engine.graph.get_vertex_sheet_id(v);
             for r in ranges {
@@ -402,6 +440,19 @@ impl RangeVirtualDepProvider {
                 let er = extent.end_row;
                 let ec = extent.end_column;
 
+                deps.extend(
+                    engine
+                        .graph
+                        .output_anchors_in_region(
+                            sheet_id,
+                            sr.saturating_sub(1),
+                            sc.saturating_sub(1),
+                            er.saturating_sub(1),
+                            ec.saturating_sub(1),
+                        )
+                        .into_iter()
+                        .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
+                );
                 if let Some(index) = engine.graph.sheet_index(sheet_id) {
                     let sr0 = sr.saturating_sub(1);
                     let er0 = er.saturating_sub(1);
@@ -429,6 +480,8 @@ impl RangeVirtualDepProvider {
                 }
             }
         }
+        deps.sort_unstable();
+        deps.dedup();
         deps
     }
 }

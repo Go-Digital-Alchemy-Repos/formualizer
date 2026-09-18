@@ -200,6 +200,7 @@ pub struct DependencyGraph {
     formula_dirty: FormulaDirtyState,
     volatile_vertices: FxHashSet<VertexId>,
     formula_authorship: FxHashMap<VertexId, FormulaAuthorship>,
+    declared_output_rows: FxHashMap<SheetId, crate::engine::interval_tree::IntervalTree<VertexId>>,
     pending_formula_authorship: FxHashMap<(String, u32, u32), FormulaAuthorship>,
 
     /// Monotonic count of vertices processed by dirty-propagation BFS loops
@@ -934,6 +935,30 @@ impl DependencyGraph {
         self.formula_authorship.reserve(additional);
     }
 
+    fn update_formula_authorship(&mut self, vertex: VertexId, authorship: FormulaAuthorship) {
+        let sheet_id = self.get_vertex_sheet_id(vertex);
+        if let Some(old) = self.formula_authorship.insert(vertex, authorship)
+            && let Some(fence) = old.cse_fence
+            && let Some(rows) = self.declared_output_rows.get_mut(&sheet_id)
+        {
+            rows.remove(
+                fence.start_row.saturating_sub(1),
+                fence.end_row.saturating_sub(1),
+                &vertex,
+            );
+        }
+        if let Some(fence) = authorship.cse_fence {
+            self.declared_output_rows
+                .entry(sheet_id)
+                .or_default()
+                .insert(
+                    fence.start_row.saturating_sub(1),
+                    fence.end_row.saturating_sub(1),
+                    vertex,
+                );
+        }
+    }
+
     pub(crate) fn stage_formula_authorship(
         &mut self,
         sheet: &str,
@@ -944,7 +969,7 @@ impl DependencyGraph {
         if let Some(sheet_id) = self.sheet_id(sheet) {
             let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
             if let Some(&vertex) = self.cell_to_vertex.get(&cell) {
-                self.formula_authorship.insert(vertex, authorship);
+                self.update_formula_authorship(vertex, authorship);
                 return;
             }
         }
@@ -962,13 +987,16 @@ impl DependencyGraph {
             cell.coord.col() + 1,
         );
         if let Some(authorship) = self.pending_formula_authorship.remove(&key) {
-            self.formula_authorship.insert(vertex, authorship);
+            self.update_formula_authorship(vertex, authorship);
         } else {
             let row = cell.coord.row() + 1;
             let col = cell.coord.col() + 1;
-            self.formula_authorship.entry(vertex).or_insert_with(|| {
-                FormulaAuthorship::for_api(self.config.api_created_formula_kind, row, col)
-            });
+            if !self.formula_authorship.contains_key(&vertex) {
+                self.update_formula_authorship(
+                    vertex,
+                    FormulaAuthorship::for_api(self.config.api_created_formula_kind, row, col),
+                );
+            }
         }
     }
 
@@ -982,7 +1010,7 @@ impl DependencyGraph {
             cell.coord.col() + 1,
         );
         self.pending_formula_authorship.remove(&key);
-        self.formula_authorship.insert(
+        self.update_formula_authorship(
             vertex,
             FormulaAuthorship::for_api(
                 self.config.api_created_formula_kind,
@@ -1302,6 +1330,7 @@ impl DependencyGraph {
             load_packed_to_vertex: std::collections::HashMap::with_hasher(CoordBuildHasher),
             formula_dirty: FormulaDirtyState::default(),
             formula_authorship: FxHashMap::default(),
+            declared_output_rows: FxHashMap::default(),
             pending_formula_authorship: FxHashMap::default(),
             dirty_propagation_visits: 0,
             deferred_dirty_depth: 0,
@@ -1653,6 +1682,51 @@ impl DependencyGraph {
         anchors
     }
 
+    /// Producers whose declared or committed output footprint intersects a read.
+    /// Declared CSE fences are available before the first evaluation, when no
+    /// physical spill followers exist yet. Unknown dynamic extents deliberately
+    /// remain unknown until committed; this never evaluates a producer to plan it.
+    pub(crate) fn output_anchors_in_region(
+        &self,
+        sheet_id: SheetId,
+        start_row0: u32,
+        start_col0: u32,
+        end_row0: u32,
+        end_col0: u32,
+    ) -> Vec<VertexId> {
+        let mut anchors =
+            self.spill_anchors_in_region(sheet_id, start_row0, start_col0, end_row0, end_col0);
+        for vertex in self
+            .declared_output_rows
+            .get(&sheet_id)
+            .into_iter()
+            .flat_map(|rows| rows.query(start_row0, end_row0))
+            .flat_map(|(_, _, vertices)| vertices.into_iter())
+        {
+            let Some(fence) = self.formula_authorship(vertex).cse_fence else {
+                continue;
+            };
+            if self.get_vertex_sheet_id(vertex) != sheet_id
+                || !matches!(
+                    self.get_vertex_kind(vertex),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                )
+            {
+                continue;
+            }
+            if fence.start_row.saturating_sub(1) <= end_row0
+                && fence.end_row.saturating_sub(1) >= start_row0
+                && fence.start_col.saturating_sub(1) <= end_col0
+                && fence.end_col.saturating_sub(1) >= start_col0
+            {
+                anchors.push(vertex);
+            }
+        }
+        anchors.sort_unstable();
+        anchors.dedup();
+        anchors
+    }
+
     /// Get mutable access to a sheet's index, creating it if it doesn't exist
     /// This is the primary way VertexEditor and internal operations access the index
     pub fn sheet_index_mut(&mut self, sheet_id: SheetId) -> &mut SheetIndex {
@@ -1965,6 +2039,8 @@ impl DependencyGraph {
                 self.detach_vertex_from_names(existing_id);
                 self.clear_pending_name_references(existing_id);
                 self.vertex_formulas.remove(&existing_id);
+                self.update_formula_authorship(existing_id, FormulaAuthorship::legacy_scalar());
+                self.formula_authorship.remove(&existing_id);
             }
 
             // Update to value kind
