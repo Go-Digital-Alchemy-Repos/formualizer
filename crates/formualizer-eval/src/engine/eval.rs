@@ -1470,6 +1470,8 @@ pub struct Engine<R> {
     /// They stay separate from the ordinary graph cache because canonical
     /// mode intentionally disables that cache for grid-backed formulas.
     saved_formula_values: FxHashMap<CellRef, LiteralValue>,
+    // Rich errors accompany Arrow error codes without changing their numeric lanes.
+    rich_error_details: FxHashMap<CellRef, ExcelError>,
 
     /// Detailed spill errors keyed by formula vertex. Arrow's compact error encoding
     /// stores only the Excel error kind, so message, context, and typed extra
@@ -3280,6 +3282,7 @@ where
             output_invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
+            rich_error_details: FxHashMap::default(),
             spill_error_details: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
@@ -3430,6 +3433,7 @@ where
             output_invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
+            rich_error_details: FxHashMap::default(),
             spill_error_details: FxHashMap::default(),
             iterative_state_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
@@ -4692,6 +4696,7 @@ where
             .map_err(Self::editor_error_to_excel)?;
         self.purge_derived_formats_for_sheet(sheet_id);
         self.graph.remove_sheet(sheet_id)?;
+        self.rich_error_details.retain(|cell, _| cell.sheet_id != sheet_id);
         self.arrow_sheets.sheets.retain(|s| s.name.as_ref() != name);
         // Sheet removal can change cross-sheet refs, names, and default-sheet
         // resolution. Until those domains have a complete exact dependency
@@ -12979,6 +12984,15 @@ where
         sheet_id: SheetId,
         mut remap: impl FnMut(u32, u32) -> Option<(u32, u32)>,
     ) -> Vec<crate::engine::ChangeEvent> {
+        let errors: Vec<_> = self.rich_error_details.iter()
+            .filter(|(cell, _)| cell.sheet_id == sheet_id)
+            .map(|(cell, error)| (*cell, error.clone())).collect();
+        self.rich_error_details.retain(|cell, _| cell.sheet_id != sheet_id);
+        for (cell, error) in errors {
+            if let Some((row, col)) = remap(cell.coord.row(), cell.coord.col()) {
+                self.rich_error_details.insert(CellRef::new(sheet_id, Coord::new(row, col, true, true)), error);
+            }
+        }
         let before: BTreeMap<CellRef, LiteralValue> = self
             .saved_formula_values
             .iter()
@@ -16227,6 +16241,7 @@ where
     /// Mirror a single cell value into the Arrow overlay if enabled.
     /// Handles capacity growth, per-chunk overlay set, and heuristic compaction.
     fn mirror_value_to_overlay(&mut self, sheet: &str, row: u32, col: u32, value: &LiteralValue) {
+        self.record_rich_error(sheet, row, col, Some(value));
         if !(self.config.arrow_storage_enabled && self.config.delta_overlay_enabled) {
             return;
         }
@@ -16600,6 +16615,7 @@ where
         col: u32,
         value: Option<LiteralValue>,
     ) {
+        self.record_rich_error(sheet, row, col, value.as_ref());
         if !(self.config.arrow_storage_enabled && self.config.delta_overlay_enabled) {
             return;
         }
@@ -16648,6 +16664,7 @@ where
         col: u32,
         value: Option<LiteralValue>,
     ) {
+        self.record_rich_error(sheet, row, col, value.as_ref());
         if !(self.config.arrow_storage_enabled
             && self.config.delta_overlay_enabled
             && self.config.write_formula_overlay_enabled)
@@ -16854,6 +16871,16 @@ where
         }
     }
 
+    fn record_rich_error(&mut self, sheet: &str, row: u32, col: u32, value: Option<&LiteralValue>) {
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else { return; };
+        let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        if let Some(LiteralValue::Error(error)) = value {
+            self.rich_error_details.insert(cell, error.clone());
+        } else {
+            self.rich_error_details.remove(&cell);
+        }
+    }
+
     /// Mirror a value into the computed overlay (formula/spill outputs).
     ///
     /// This path is subject to `EvalConfig.max_overlay_memory_bytes`.
@@ -16865,6 +16892,7 @@ where
         col: u32,
         value: &LiteralValue,
     ) {
+        self.record_rich_error(sheet, row, col, Some(value));
         if !(self.config.arrow_storage_enabled
             && self.config.delta_overlay_enabled
             && self.config.write_formula_overlay_enabled)
@@ -17560,6 +17588,7 @@ where
             return Ok(());
         };
         let sheet_name = self.graph.sheet_name(cell.sheet_id).to_string();
+        self.record_rich_error(&sheet_name, cell.coord.row() + 1, cell.coord.col() + 1, Some(value));
         let date_system = self.arrow_sheet_date_system(&sheet_name);
         let ov = Self::literal_to_overlay_value(value, date_system);
         if let Some(buffer) = computed_writes {
@@ -17956,6 +17985,7 @@ where
         )?;
         self.clear_cell_format_state(sheet, placement);
         self.saved_formula_values.remove(&placement);
+        self.rich_error_details.remove(&placement);
         if let Some(vertex_id) = self.graph.get_vertex_id_for_address(&placement) {
             self.spill_error_details.remove(vertex_id);
         }
@@ -18018,6 +18048,7 @@ where
             let cell = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
             self.clear_cell_format_state(sheet, cell);
             self.saved_formula_values.remove(&cell);
+            self.rich_error_details.remove(&cell);
             if let Some(vertex_id) = self.graph.get_vertex_id_for_address(&cell) {
                 self.spill_error_details.remove(vertex_id);
             }
@@ -18185,6 +18216,14 @@ where
         let r0 = row.saturating_sub(1) as usize;
         let c0 = col.saturating_sub(1) as usize;
         let v = asheet.get_cell_value(r0, c0);
+        if let LiteralValue::Error(ref stored_error) = v
+            && let Some(sheet_id) = self.graph.sheet_id(sheet)
+            && let Some(error) = self.rich_error_details.get(&CellRef::new(
+                sheet_id, Coord::from_excel(row, col, true, true)))
+            && error.kind == stored_error.kind
+        {
+            return Some(LiteralValue::Error(error.clone()));
+        }
         if let LiteralValue::Error(ref stored_error) = v
             && let Some(sheet_id) = self.graph.sheet_id(sheet)
             && let Some(vertex_id) = self.graph.get_vertex_id_for_address(&CellRef::new(
@@ -28873,5 +28912,63 @@ mod dynamic_output_schedule_cache_tests {
                 .is_empty()
         );
         assert!(engine.graph.spill_registry_has_anchor(anchor));
+    }
+}
+
+#[cfg(test)]
+mod rich_error_projection_tests {
+    use super::*;
+    use crate::test_workbook::TestWorkbook;
+    use formualizer_parse::parser::parse;
+
+    fn rich_error() -> LiteralValue {
+        LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)
+            .with_message("child diagnostic")
+            .with_extra(formualizer_common::ExcelErrorExtra::Spill { expected_rows: 2, expected_cols: 3 }))
+    }
+
+    #[test]
+    fn rich_error_survives_structural_moves_and_replacement() {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        let error = rich_error();
+        engine.set_cell_value("Sheet1", 2, 2, error.clone()).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 2, 2), Some(error.clone()));
+        engine.insert_rows("Sheet1", 1, 2).unwrap();
+        engine.insert_columns("Sheet1", 1, 2).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 4, 4), Some(error.clone()));
+        engine.delete_rows("Sheet1", 1, 1).unwrap();
+        engine.delete_columns("Sheet1", 1, 1).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 3, 3), Some(error));
+        engine.set_cell_value("Sheet1", 3, 3, LiteralValue::Number(7.0)).unwrap();
+        engine.set_cell_value("Sheet1", 3, 3, LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 3, 3), Some(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))));
+        assert_eq!(engine.rich_error_details.len(), 1);
+        engine.delete_rows("Sheet1", 3, 1).unwrap();
+        assert!(engine.rich_error_details.is_empty());
+    }
+
+    #[test]
+    fn rich_error_spill_followers_clear_and_shrink() {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine.set_cell_formula("Sheet1", 1, 1, parse("=1").unwrap()).unwrap();
+        let cell = engine.graph.make_cell_ref("Sheet1", 1, 1);
+        let anchor = *engine.graph.get_vertex_id_for_address(&cell).unwrap();
+        let follower = engine.graph.make_cell_ref("Sheet1", 2, 1);
+        engine.commit_spill_and_mirror(anchor, &[cell, follower], vec![vec![rich_error()], vec![rich_error()]], None, None).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 2, 1), Some(rich_error()));
+        engine.commit_spill_and_mirror(anchor, &[cell], vec![vec![LiteralValue::Number(4.0)]], None, None).unwrap();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 2, 1), None);
+        assert!(engine.rich_error_details.is_empty());
+        engine.commit_spill_and_mirror(anchor, &[cell, follower], vec![vec![rich_error()], vec![rich_error()]], None, None).unwrap();
+        engine.clear_spill_projection_and_mirror(anchor, None);
+        assert!(engine.rich_error_details.is_empty());
+    }
+
+    #[test]
+    fn rich_error_survives_overlay_compaction() {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine.set_cell_value("Sheet1", 1, 1, rich_error()).unwrap();
+        engine.compact_all_computed_overlays();
+        assert_eq!(engine.get_typed_cell_value("Sheet1", 1, 1), Some(rich_error()));
     }
 }

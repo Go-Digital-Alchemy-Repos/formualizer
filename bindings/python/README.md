@@ -386,3 +386,18 @@ The Python wheel links directly against the Rust crates — there is no runtime 
 ## License
 
 Dual-licensed under [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE), at your option.
+
+### Native typed snapshots
+
+`Workbook.read_typed_range(sheet, start_row, start_col, end_row, end_col)`
+reads an inclusive, 1-based rectangle under one workbook lock without evaluating.
+It returns `LiteralValue` objects and preserves Pending versus Empty and rich
+spreadsheet error kind/message/context/extra. The values reflect native workbook
+storage: integer inputs and temporal inputs may already be normalized into Excel
+numeric/serial values; this method does not reconstruct their input types.
+`SheetPortSession.read_inputs(typed=True)` and `read_outputs(typed=True)` retain
+native leaves while using the same schema-defined port reading/validation.
+Native values can be returned directly from a callback or written back to inputs.
+`LiteralValue.to_python()` represents Pending as `{"type": "Pending"}` and
+structured error extras using the native serde tagged shape; `from_object` accepts
+these projections. Native object roundtrips retain the original literal payload.
