@@ -194,14 +194,16 @@ impl PySheetPortSession {
         Ok(list.into_pyobject(py)?.into_any().unbind())
     }
 
-    pub fn read_inputs<'py>(&mut self, py: Python<'py>) -> PyResult<PyObject> {
+    #[pyo3(signature = (typed=false))]
+    pub fn read_inputs<'py>(&mut self, py: Python<'py>, typed: bool) -> PyResult<PyObject> {
         self.with_sheetport(py, |sheetport| sheetport.read_inputs())
-            .and_then(|snapshot| snapshot_to_py(py, snapshot.inner()))
+            .and_then(|snapshot| snapshot_to_py_mode(py, snapshot.inner(), typed))
     }
 
-    pub fn read_outputs<'py>(&mut self, py: Python<'py>) -> PyResult<PyObject> {
+    #[pyo3(signature = (typed=false))]
+    pub fn read_outputs<'py>(&mut self, py: Python<'py>, typed: bool) -> PyResult<PyObject> {
         self.with_sheetport(py, |sheetport| sheetport.read_outputs())
-            .and_then(|snapshot| snapshot_to_py(py, snapshot.inner()))
+            .and_then(|snapshot| snapshot_to_py_mode(py, snapshot.inner(), typed))
     }
 
     /// Write input values into the bound workbook.
@@ -540,6 +542,63 @@ fn py_to_port_value(binding: &PortBinding, value: &Bound<'_, PyAny>) -> PyResult
     }
 }
 
+fn port_value_to_typed_py(py: Python<'_>, value: &PortValue) -> PyResult<PyObject> {
+    let scalar = |value: &formualizer::common::LiteralValue| -> PyResult<PyObject> {
+        Ok(Py::new(py, crate::value::PyLiteralValue::from(value.clone()))?.into_any())
+    };
+    match value {
+        PortValue::Scalar(value) => scalar(value),
+        PortValue::Record(values) => {
+            let dict = PyDict::new(py);
+            for (key, value) in values {
+                dict.set_item(key, scalar(value)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+        PortValue::Range(rows) => {
+            let outer = PyList::empty(py);
+            for row in rows {
+                let inner = PyList::empty(py);
+                for value in row {
+                    inner.append(scalar(value)?)?;
+                }
+                outer.append(inner)?;
+            }
+            Ok(outer.into_any().unbind())
+        }
+        PortValue::Table(table) => {
+            let outer = PyList::empty(py);
+            for row in &table.rows {
+                let dict = PyDict::new(py);
+                for (key, value) in &row.values {
+                    dict.set_item(key, scalar(value)?)?;
+                }
+                outer.append(dict)?;
+            }
+            Ok(outer.into_any().unbind())
+        }
+    }
+}
+
+fn snapshot_to_py_mode(
+    py: Python<'_>,
+    map: &BTreeMap<String, PortValue>,
+    typed: bool,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    for (key, value) in map {
+        dict.set_item(
+            key,
+            if typed {
+                port_value_to_typed_py(py, value)?
+            } else {
+                port_value_to_py(py, value)?
+            },
+        )?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
 fn snapshot_to_py(py: Python<'_>, map: &BTreeMap<String, PortValue>) -> PyResult<PyObject> {
     let dict = PyDict::new(py);
     for (port_id, value) in map {
@@ -668,7 +727,7 @@ fn range_address_to_py(
     Ok(dict.into_pyobject(py)?.into_any().unbind())
 }
 
-fn json_to_py(py: Python<'_>, value: &JsonValue) -> PyResult<PyObject> {
+pub(crate) fn json_to_py(py: Python<'_>, value: &JsonValue) -> PyResult<PyObject> {
     match value {
         JsonValue::Null => Ok(py.None()),
         JsonValue::Bool(b) => (*b).into_py_any(py),

@@ -940,6 +940,43 @@ impl PyWorkbook {
             .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))
     }
 
+    /// Read a rectangular native-value snapshot without evaluating or applying temporal egress.
+    /// Coordinates are inclusive and 1-based. Unpopulated cells are Empty.
+    pub fn read_typed_range(
+        &self,
+        sheet: &str,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> PyResult<Vec<Vec<crate::value::PyLiteralValue>>> {
+        validate_cell_coords(start_row, start_col)?;
+        validate_cell_coords(end_row, end_col)?;
+        if end_row < start_row || end_col < start_col {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Range bounds are reversed",
+            ));
+        }
+        let wb = self.read_inner()?;
+        if wb.engine().sheet_id(sheet).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown sheet: {sheet}"
+            )));
+        }
+        Ok((start_row..=end_row)
+            .map(|row| {
+                (start_col..=end_col)
+                    .map(|col| {
+                        wb.engine()
+                            .get_typed_cell_value(sheet, row, col)
+                            .unwrap_or(LiteralValue::Empty)
+                            .into()
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
     /// Pin the evaluation clock to a caller-supplied instant, so the
     /// volatile date/time builtins (TODAY, NOW) evaluate deterministically
     /// on the next recalculation. Takes effect on a live workbook; no
@@ -1335,7 +1372,11 @@ impl PyWorkbook {
     /// Apply ordered literal updates, propagating dirtiness once on exit.
     /// The callback may read stored cells and write values, but must not evaluate.
     /// The scope is flushed even when the callback raises an exception.
-    pub fn with_deferred_updates(&self, py: Python<'_>, callback: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    pub fn with_deferred_updates(
+        &self,
+        py: Python<'_>,
+        callback: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
         self.write_inner()?.engine_mut().begin_deferred_dirty();
         // Release the workbook lock before invoking Python: callback operations
         // acquire it independently, preserving normal ordered read/write behavior.

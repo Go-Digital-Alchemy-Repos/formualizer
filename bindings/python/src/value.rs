@@ -104,6 +104,14 @@ impl PyLiteralValue {
         }
     }
 
+    /// Create an unresolved value, distinct from a blank cell.
+    #[staticmethod]
+    pub fn pending() -> Self {
+        Self {
+            inner: LiteralValue::Pending,
+        }
+    }
+
     /// Create a Date value
     #[staticmethod]
     pub fn date(year: i32, month: u32, day: u32) -> PyResult<Self> {
@@ -552,9 +560,18 @@ pub(crate) fn literal_to_py(py: Python<'_>, value: &LiteralValue) -> PyResult<Py
                     dict.set_item("origin_col", origin_col)?;
                 }
             }
+            if err.extra != formualizer::common::error::ExcelErrorExtra::None {
+                let extra = serde_json::to_value(&err.extra)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                dict.set_item("extra", crate::sheetport::json_to_py(py, &extra)?)?;
+            }
             Ok(dict.into_pyobject(py)?.into_any().unbind())
         }
-        LiteralValue::Pending => Ok(py.None()),
+        LiteralValue::Pending => {
+            let dict = PyDict::new(py);
+            dict.set_item("type", "Pending")?;
+            Ok(dict.into_any().unbind())
+        }
     }
 }
 
@@ -715,6 +732,19 @@ pub(crate) fn py_to_literal(value: &Bound<'_, PyAny>) -> PyResult<LiteralValue> 
                             origin_col,
                             origin_sheet,
                         });
+                    }
+                    if let Some(extra) = dict.get_item("extra")? {
+                        let json: String = value
+                            .py()
+                            .import("json")?
+                            .getattr("dumps")?
+                            .call1((extra,))?
+                            .extract()?;
+                        error.extra = serde_json::from_str(&json).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid error extra: {e}"
+                            ))
+                        })?;
                     }
                     return Ok(LiteralValue::Error(error));
                 }
