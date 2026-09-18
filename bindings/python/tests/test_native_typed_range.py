@@ -117,3 +117,16 @@ def test_native_error_action_undo_redo_preserves_same_kind_metadata():
     assert wb.read_typed_range('Data', 1, 1, 1, 1)[0][0].to_python() == first
     wb.redo()
     assert wb.read_typed_range('Data', 1, 1, 1, 1)[0][0].to_python() == second
+
+
+def test_resource_error_extras_preserve_full_unsigned_integer_range():
+    error = {'type': 'Error', 'kind': 'Calc', 'extra': {'Resource': {'detail': {
+        'reason': 'WorkUnits', 'limit': 2**64 - 1, 'observed': 2**63,
+        'request_id': 2**64 - 2}}}}
+    native = LiteralValue.from_object(error)
+    assert native.to_python() == error
+    assert LiteralValue.from_object(native.to_python()).to_python() == error
+    wb = Workbook()
+    wb.add_sheet('Data')
+    wb.set_value('Data', 1, 1, native)
+    assert wb.read_typed_range('Data', 1, 1, 1, 1)[0][0].to_python() == error

@@ -735,7 +735,7 @@ pub(crate) fn json_to_py(py: Python<'_>, value: &JsonValue) -> PyResult<PyObject
             if let Some(int) = num.as_i64() {
                 Ok(int.into_pyobject(py)?.into_any().unbind())
             } else if let Some(uint) = num.as_u64() {
-                Ok((uint as i64).into_pyobject(py)?.into_any().unbind())
+                Ok(uint.into_pyobject(py)?.into_any().unbind())
             } else if let Some(f) = num.as_f64() {
                 Ok(f.into_pyobject(py)?.into_any().unbind())
             } else {
