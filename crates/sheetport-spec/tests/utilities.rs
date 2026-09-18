@@ -136,3 +136,22 @@ fn crate_version_tracks_protocol_line_without_lagging_it() {
         "crate patch releases may advance validator behavior but must not lag the protocol"
     );
 }
+
+#[test]
+fn any_type_is_explicit_and_in_canonical_schema() {
+    let manifest = Manifest::from_yaml_str(r#"spec: fio
+spec_version: "0.3.0"
+manifest: { id: any-test, name: Any Test }
+ports:
+  - id: value
+    dir: in
+    shape: scalar
+    location: { a1: Sheet!A1 }
+    schema: { type: any }
+    constraints: { nullable: true, min: 0 }
+"#).unwrap();
+    manifest.validate().unwrap();
+    let schema: serde_json::Value = serde_json::from_str(sheetport_spec::schema_json()).unwrap();
+    assert!(schema["$defs"]["ValueType"]["enum"].as_array().unwrap().contains(&json!("any")));
+    assert_eq!(schema["$defs"]["ValueType"], sheetport_spec::generate_schema_value()["$defs"]["ValueType"]);
+}

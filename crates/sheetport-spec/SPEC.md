@@ -280,3 +280,17 @@ Example paths:
 - `ports[0].location`
 - `ports[1].schema.fields.month.constraints.min`
 - `capabilities.profile`
+
+### Explicit dynamic scalar type
+
+`type: any` (or `cell_type: any` / a field or column's `type: any`)
+is an explicit opt-in for scalar spreadsheet literals whose type can change.
+It accepts numeric, text, boolean, temporal and spreadsheet error values without
+coercing them to a declared type. Empty still requires `nullable: true`. Pending
+is incomplete and rejected; an array is not a scalar cell value. This declaration
+does not recover types already normalized by native workbook storage. Numeric,
+pattern and exact enumeration constraints remain enforced by the normal validator;
+a value incompatible with a requested constraint is rejected. Enumeration entries
+for `any` are JSON scalars; rich errors are not JSON enumeration values. Existing
+strict type declarations retain their behavior. JSON defaults keep their original
+scalar type; a numeric default is not converted into text.

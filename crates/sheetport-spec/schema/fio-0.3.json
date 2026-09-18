@@ -956,6 +956,7 @@
       "description": "Scalar value types.",
       "type": "string",
       "enum": [
+        "any",
         "string",
         "number",
         "integer",

@@ -276,6 +276,11 @@ fn validate_literal(
 
 fn ensure_type(value_type: ValueType, value: &LiteralValue) -> Result<(), String> {
     match value_type {
+        ValueType::Any => match value {
+            LiteralValue::Pending => Err("pending value is incomplete".into()),
+            LiteralValue::Array(_) => Err("expected scalar spreadsheet value".into()),
+            _ => Ok(()),
+        },
         ValueType::String => {
             if matches!(value, LiteralValue::Text(_)) {
                 Ok(())
@@ -488,7 +493,7 @@ fn coerce_literal_to_declared(
                 .unwrap_or(LiteralValue::Number(n)),
             other => other,
         },
-        ValueType::String | ValueType::Boolean => value,
+        ValueType::Any | ValueType::String | ValueType::Boolean => value,
     }
 }
 
@@ -546,6 +551,20 @@ mod coerce_tests {
             DateSystem::Excel1900,
         );
         assert_eq!(v, LiteralValue::Date(d(2026, 8, 20)));
+    }
+
+    #[test]
+    fn any_preserves_scalar_kinds_and_rejects_incomplete_or_array_values() {
+        let values = vec![LiteralValue::Text("0".into()), LiteralValue::Number(0.0),
+            LiteralValue::Int(4), LiteralValue::Boolean(false),
+            LiteralValue::Date(chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap()),
+            LiteralValue::Error(formualizer_common::ExcelError::new(formualizer_common::ExcelErrorKind::Na))];
+        for value in values {
+            assert!(ensure_type(ValueType::Any, &value).is_ok());
+            assert_eq!(coerce_literal_to_declared(ValueType::Any, value.clone(), DateSystem::Excel1900), value);
+        }
+        assert!(ensure_type(ValueType::Any, &LiteralValue::Pending).is_err());
+        assert!(ensure_type(ValueType::Any, &LiteralValue::Array(vec![vec![LiteralValue::Number(1.0)]])).is_err());
     }
 
     #[test]

@@ -18195,7 +18195,10 @@ where
             for rr in 0..height {
                 let mut row = Vec::with_capacity(width);
                 for cc in 0..width {
-                    row.push(view.get_cell(rr, cc));
+                    let raw = view.get_cell(rr, cc);
+                    row.push(if matches!(raw, LiteralValue::Error(_)) {
+                        self.read_cell_value(sheet, sr + rr as u32, sc + cc as u32).unwrap_or(raw)
+                    } else { raw });
                 }
                 out.push(row);
             }
@@ -18206,6 +18209,9 @@ where
             let mut row = Vec::with_capacity(width);
             for cc in 0..width {
                 let raw = view.get_cell(rr, cc);
+                let raw = if matches!(raw, LiteralValue::Error(_)) {
+                    self.read_cell_value(sheet, sr + rr as u32, sc + cc as u32).unwrap_or(raw)
+                } else { raw };
                 let row0 = sr.saturating_sub(1).saturating_add(rr as u32);
                 let col0 = sc.saturating_sub(1).saturating_add(cc as u32);
                 let format = asheet.format_id(row0 as usize, col0 as usize).or_else(|| {
@@ -28955,6 +28961,7 @@ mod rich_error_projection_tests {
         let error = rich_error();
         engine.set_cell_value("Sheet1", 2, 2, error.clone()).unwrap();
         assert_eq!(engine.get_typed_cell_value("Sheet1", 2, 2), Some(error.clone()));
+        assert_eq!(engine.get_range_values("Sheet1", 2, 2, 2, 2), vec![vec![error.clone()]]);
         engine.insert_rows("Sheet1", 1, 2).unwrap();
         engine.insert_columns("Sheet1", 1, 2).unwrap();
         assert_eq!(engine.get_typed_cell_value("Sheet1", 4, 4), Some(error.clone()));

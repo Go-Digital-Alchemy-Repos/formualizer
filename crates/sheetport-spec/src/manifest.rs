@@ -658,6 +658,7 @@ pub struct TableColumn {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ValueType {
+    Any,
     String,
     Number,
     Integer,
@@ -865,13 +866,13 @@ fn validate_constraints(
     }
 
     if let Some(vt) = value_type {
-        if constraints.min.is_some() && !is_numeric_type(vt) {
+        if constraints.min.is_some() && !matches!(vt, ValueType::Any) && !is_numeric_type(vt) {
             issues.push(ManifestIssue::new(
                 format!("{}.min", base_path),
                 format!("`min` constraint requires numeric type, found `{vt:?}`"),
             ));
         }
-        if constraints.max.is_some() && !is_numeric_type(vt) {
+        if constraints.max.is_some() && !matches!(vt, ValueType::Any) && !is_numeric_type(vt) {
             issues.push(ManifestIssue::new(
                 format!("{}.max", base_path),
                 format!("`max` constraint requires numeric type, found `{vt:?}`"),
@@ -914,6 +915,10 @@ fn is_numeric_type(vt: ValueType) -> bool {
 fn validate_enum_candidate(vt: ValueType, candidate: &JsonValue) -> Result<(), String> {
     use serde_json::Value as J;
     match vt {
+        ValueType::Any => match candidate {
+            J::Null | J::Bool(_) | J::Number(_) | J::String(_) => Ok(()),
+            _ => Err("any enum entries must be JSON scalar values".into()),
+        },
         ValueType::String => match candidate {
             J::String(_) => Ok(()),
             other => Err(format!(

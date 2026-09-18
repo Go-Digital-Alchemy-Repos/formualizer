@@ -382,11 +382,11 @@ fn literal_from_json(
     match value {
         JsonValue::Null => Ok(L::Empty),
         JsonValue::Bool(b) => match value_type {
-            ValueType::Boolean => Ok(L::Boolean(*b)),
+            ValueType::Any | ValueType::Boolean => Ok(L::Boolean(*b)),
             _ => Err(default_type_error(port_id, path, "boolean", value_type)),
         },
         JsonValue::Number(n) => match value_type {
-            ValueType::Number => {
+            ValueType::Any | ValueType::Number => {
                 if let Some(num) = n.as_f64() {
                     Ok(L::Number(num))
                 } else {
@@ -423,7 +423,7 @@ fn literal_from_json(
             }
         },
         JsonValue::String(s) => match value_type {
-            ValueType::String => Ok(L::Text(s.clone())),
+            ValueType::Any | ValueType::String => Ok(L::Text(s.clone())),
             ValueType::Number => s
                 .parse::<f64>()
                 .map(L::Number)

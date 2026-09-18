@@ -401,3 +401,9 @@ Native values can be returned directly from a callback or written back to inputs
 `LiteralValue.to_python()` represents Pending as `{"type": "Pending"}` and
 structured error extras using the native serde tagged shape; `from_object` accepts
 these projections. Native object roundtrips retain the original literal payload.
+
+FIO ports may explicitly declare `type: any` for dynamic scalar spreadsheet
+inputs/outputs (and `cell_type: any` for ranges). Native scalar values and errors
+retain their types, Empty needs nullable permission, and Pending/arrays are rejected
+as cell values. Other constraints continue to apply; existing strict schemas are
+unchanged.
