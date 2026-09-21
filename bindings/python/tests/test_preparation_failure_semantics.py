@@ -107,4 +107,9 @@ def test_other_existing_error_phases_are_not_reclassified(
 ) -> None:
     wb = imported({"A1": formula})
     wb.evaluate_all()
-    assert wb.get_value("S", 1, 1) == {"type": "Error", "kind": kind}
+    value = wb.get_value("S", 1, 1)
+    # This fork carries rich error metadata (GOD-338), so an error value may
+    # also report `message` and its location. The classification under test is
+    # the type/kind pair; compare that projection rather than the whole dict.
+    assert isinstance(value, dict)
+    assert (value["type"], value["kind"]) == ("Error", kind)

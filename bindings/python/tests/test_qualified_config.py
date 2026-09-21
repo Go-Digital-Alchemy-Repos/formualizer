@@ -21,6 +21,18 @@ PHANTOM_B1 = "=A1"
 CIRC = {"type": "Error", "kind": "Circ"}
 
 
+def classification(value):
+    """Project an error value onto its type/kind pair.
+
+    This fork carries rich error metadata (GOD-338): a `#CIRC!` value also
+    reports `message` (and, where known, its location). The subject of these
+    tests is which regions are judged circular, so they compare the
+    classification and leave the metadata alone.
+    """
+    assert isinstance(value, dict), value
+    return {"type": value["type"], "kind": value["kind"]}
+
+
 def _phantom_workbook(config):
     wb = fz.Workbook(config=config)
     wb.add_sheet("S")
@@ -52,7 +64,7 @@ def test_static_detection_still_stamps_a_phantom_scc():
     cfg = fz.EvaluationConfig()
     cfg.cycle_detection = "static"
     wb = _phantom_workbook(fz.WorkbookConfig(eval_config=cfg))
-    assert wb.get_value("S", 1, 1) == CIRC
+    assert classification(wb.get_value("S", 1, 1)) == CIRC
 
 
 # --------------------------------------------------------------------------
@@ -120,7 +132,7 @@ def test_qualified_config_honours_an_explicit_eval_config():
     wb = _phantom_workbook(
         fz.qualified_config(eval_config=explicit, cycle_detection="runtime")
     )
-    assert wb.get_value("S", 1, 1) == CIRC
+    assert classification(wb.get_value("S", 1, 1)) == CIRC
 
 
 def test_qualified_config_with_a_genuine_cycle_stamps_circ():
@@ -134,8 +146,8 @@ def test_qualified_config_with_a_genuine_cycle_stamps_circ():
     wb.set_formula("S", 1, 2, "=A1+1")
     wb.evaluate_all()
 
-    assert wb.get_value("S", 1, 1) == CIRC
-    assert wb.get_value("S", 1, 2) == CIRC
+    assert classification(wb.get_value("S", 1, 1)) == CIRC
+    assert classification(wb.get_value("S", 1, 2)) == CIRC
 
     # And nothing was iterated, because the policy is "error".
     telemetry = wb.last_cycle_telemetry()
