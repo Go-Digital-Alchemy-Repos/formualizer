@@ -635,6 +635,10 @@ export interface CycleTelemetry {
   maxAbsDeltaAtStop: number;
   /** Identical-bit NaN comparisons treated as converged (spec §6 NaN rule). */
   nanConverged: number;
+  /** Retained exactly-converged SCCs served without a re-run this request. */
+  reusedSccs: number;
+  /** Members of the SCCs counted in `reusedSccs`. */
+  reusedSccMembers: number;
   /** Wall-clock milliseconds spent inside Runtime SCC tasks. */
   elapsedMs: number;
 }
@@ -656,6 +660,48 @@ export interface WorkbookApi extends wasm.Workbook {
 }
 
 export type XlsxBytesSource = Uint8Array | ArrayBufferLike;
+
+/** Summary returned by cache-only XLSX recalculation. */
+export interface XlsxRecalculateSummary {
+  status: 'success' | 'errors_found';
+  evaluated: number;
+  errors: number;
+  total_formulas: number;
+  total_errors: number;
+  sheets: Record<string, { evaluated: number; errors: number }>;
+  error_summary?: Record<string, {
+    count: number;
+    locations: string[];
+    locations_truncated?: number;
+  }>;
+}
+
+/** Output from cache-only XLSX recalculation. */
+export interface XlsxRecalculateResult {
+  /** Recalculated XLSX package bytes. */
+  bytes: Uint8Array;
+  summary: XlsxRecalculateSummary;
+  formula_cells: number;
+  cache_cells_changed: number;
+  worksheet_parts_changed: number;
+}
+
+/**
+ * Recalculate XLSX formula caches without rewriting unrelated package members.
+ *
+ * The input accepts a typed-array view or `ArrayBuffer`; the output `bytes` is a
+ * real `Uint8Array`. `errorLocationLimit` optionally caps locations retained per
+ * error token while safe core resource limits remain in effect.
+ */
+export async function recalculateXlsxBytes(
+  bytes: XlsxBytesSource,
+  errorLocationLimit?: number,
+): Promise<XlsxRecalculateResult> {
+  return ensureInitialized(() => wasm.recalculateXlsxBytes(
+    bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
+    errorLocationLimit,
+  ) as XlsxRecalculateResult);
+}
 
 export type WorkbookConstructor = {
   new (options?: WorkbookLoadOptions): WorkbookApi;

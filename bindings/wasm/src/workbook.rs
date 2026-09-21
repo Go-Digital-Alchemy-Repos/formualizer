@@ -1385,6 +1385,12 @@ impl Workbook {
             "nanConverged",
             JsValue::from_f64(t.nan_converged as f64),
         )?;
+        set(&obj, "reusedSccs", JsValue::from_f64(t.reused_sccs as f64))?;
+        set(
+            &obj,
+            "reusedSccMembers",
+            JsValue::from_f64(t.reused_scc_members as f64),
+        )?;
         // u128 -> u64 saturation mirrors the Python binding; the u64 -> f64
         // conversion is then lossless for any realistic duration.
         set(

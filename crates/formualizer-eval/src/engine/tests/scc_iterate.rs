@@ -987,15 +987,19 @@ fn one_delta_per_member_per_recalc_under_iteration() {
     assert_eq!(delta.changed_cells, expected);
     assert_eq!(num(&engine, "Sheet1", 1, 1), 39.0);
 
-    // A converged-and-stable SCC re-runs each recalc but produces NO deltas
-    // when the final values don't move.
+    // A converged-and-stable SCC produces NO deltas when the final values
+    // don't move: the exact fixed point is retained (#368) and the SCC does
+    // not run at all on the next recalc.
     let mut engine = iterate_engine(100, 0.001);
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1>2,7,B1+1)");
     set_formula(&mut engine, "Sheet1", 1, 2, "=A1");
     let (_res, delta) = engine.evaluate_all_with_delta().unwrap();
     assert_eq!(delta.changed_cells.len(), 2);
     let (_res, delta) = engine.evaluate_all_with_delta().unwrap();
-    assert_eq!(engine.last_cycle_telemetry().iterated_sccs, 1);
+    let t = engine.last_cycle_telemetry();
+    assert_eq!(t.iterated_sccs, 0, "retained fixed point must not re-run");
+    assert_eq!(t.reused_sccs, 1);
+    assert_eq!(t.reused_scc_members, 2);
     assert!(
         delta.changed_cells.is_empty(),
         "stable values must not re-delta: {:?}",

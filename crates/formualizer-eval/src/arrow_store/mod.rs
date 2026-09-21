@@ -158,11 +158,18 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn numbers_or_null(&self) -> Arc<Float64Array> {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[0] += 1);
         if let Some(a) = &self.numbers {
             return a.clone();
         }
         self.lazy_null_numbers
             .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[0] += 1;
+                    w.provider_slots[0] += self.len();
+                });
                 let arr = new_null_array(&DataType::Float64, self.len());
                 Arc::new(arr.as_any().downcast_ref::<Float64Array>().unwrap().clone())
             })
@@ -170,11 +177,18 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn booleans_or_null(&self) -> Arc<BooleanArray> {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[1] += 1);
         if let Some(a) = &self.booleans {
             return a.clone();
         }
         self.lazy_null_booleans
             .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[1] += 1;
+                    w.provider_slots[1] += self.len();
+                });
                 let arr = new_null_array(&DataType::Boolean, self.len());
                 Arc::new(arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone())
             })
@@ -182,11 +196,18 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn errors_or_null(&self) -> Arc<UInt8Array> {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[2] += 1);
         if let Some(a) = &self.errors {
             return a.clone();
         }
         self.lazy_null_errors
             .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[2] += 1;
+                    w.provider_slots[2] += self.len();
+                });
                 let arr = new_null_array(&DataType::UInt8, self.len());
                 Arc::new(arr.as_any().downcast_ref::<UInt8Array>().unwrap().clone())
             })
@@ -194,11 +215,20 @@ impl ColumnChunk {
     }
     #[inline]
     pub fn text_or_null(&self) -> ArrayRef {
+        #[cfg(test)]
+        crate::engine::range_view::range_work::record(|w| w.provider_requests[3] += 1);
         if let Some(a) = &self.text {
             return a.clone();
         }
         self.lazy_null_text
-            .get_or_init(|| new_null_array(&DataType::Utf8, self.len()))
+            .get_or_init(|| {
+                #[cfg(test)]
+                crate::engine::range_view::range_work::record(|w| {
+                    w.provider_builds[3] += 1;
+                    w.provider_slots[3] += self.len();
+                });
+                new_null_array(&DataType::Utf8, self.len())
+            })
             .clone()
     }
 
@@ -2018,7 +2048,7 @@ impl Overlay {
     }
 
     #[inline]
-    fn has_formats(&self) -> bool {
+    pub(crate) fn has_formats(&self) -> bool {
         !self.format_points.is_empty()
     }
 
@@ -2031,6 +2061,26 @@ impl Overlay {
             None => {
                 self.format_points.remove(&off);
             }
+        }
+    }
+
+    /// Clear computed formats in `[start, end)`. Empty lanes return in O(1);
+    /// populated lanes pay for existing formatted entries, not range length.
+    pub(crate) fn clear_format_range(&mut self, start: usize, end: usize) {
+        if self.format_points.is_empty() || start >= end {
+            return;
+        }
+        self.format_points
+            .retain(|off, _| *off < start || *off >= end);
+    }
+
+    /// Clear exact computed-format offsets for a sparse computed write.
+    pub(crate) fn clear_format_offsets(&mut self, offsets: &[usize]) {
+        if self.format_points.is_empty() {
+            return;
+        }
+        for off in offsets {
+            self.format_points.remove(off);
         }
     }
 
@@ -3677,7 +3727,12 @@ impl ArrowSheet {
         let ch = self.columns.get(abs_col)?.chunk(ch_idx)?;
         ch.overlay
             .get_format(in_off)
-            .or_else(|| ch.format.as_ref().map(|runs| runs.get(in_off)))
+            .or_else(|| {
+                ch.format
+                    .as_ref()
+                    .map(|runs| runs.get(in_off))
+                    .filter(|id| *id != FormatId::GENERAL)
+            })
             .or_else(|| ch.computed_overlay.get_format(in_off))
             .filter(|id| *id != FormatId::GENERAL)
     }

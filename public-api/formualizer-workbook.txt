@@ -15,9 +15,25 @@ pub use formualizer_workbook::TargetEvalOptions
 pub use formualizer_workbook::WorkbookLoadLimits
 pub mod formualizer_workbook::backends
 pub mod formualizer_workbook::backends::calamine
+pub enum formualizer_workbook::backends::calamine::XlsxPathSource
+pub formualizer_workbook::backends::calamine::XlsxPathSource::DirectMmap
+pub formualizer_workbook::backends::calamine::XlsxPathSource::SharedFile
+impl core::clone::Clone for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::clone(&self) -> formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::cmp::Eq for formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::cmp::PartialEq for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::eq(&self, &formualizer_workbook::backends::calamine::XlsxPathSource) -> bool
+impl core::default::Default for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::default() -> formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::fmt::Debug for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::marker::StructuralPartialEq for formualizer_workbook::backends::calamine::XlsxPathSource
 pub struct formualizer_workbook::backends::calamine::CalamineAdapter
 impl formualizer_workbook::backends::calamine::CalamineAdapter
 pub fn formualizer_workbook::backends::calamine::CalamineAdapter::external_link_target(&self, u32) -> core::option::Option<&str>
+pub fn formualizer_workbook::backends::calamine::CalamineAdapter::open_bytes_cancellable(alloc::vec::Vec<u8>, formualizer_eval::engine::cancel::CancelToken) -> core::result::Result<Self, calamine::errors::Error>
+pub fn formualizer_workbook::backends::calamine::CalamineAdapter::open_path_with_source<P: core::convert::AsRef<std::path::Path>>(P, formualizer_workbook::backends::calamine::XlsxPathSource) -> core::result::Result<Self, calamine::errors::Error>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::calamine::CalamineAdapter
 pub type formualizer_workbook::backends::calamine::CalamineAdapter::Error = calamine::errors::Error
 pub fn formualizer_workbook::backends::calamine::CalamineAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -262,30 +278,31 @@ pub formualizer_workbook::backends::umya::FormulaCacheUpdate::col: u32
 pub formualizer_workbook::backends::umya::FormulaCacheUpdate::row: u32
 pub formualizer_workbook::backends::umya::FormulaCacheUpdate::sheet: alloc::string::String
 pub formualizer_workbook::backends::umya::FormulaCacheUpdate::value: formualizer_common::value::LiteralValue
-impl core::clone::Clone for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::backends::umya::FormulaCacheUpdate
-impl core::cmp::PartialEq for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::eq(&self, &formualizer_workbook::backends::umya::FormulaCacheUpdate) -> bool
-impl core::fmt::Debug for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for formualizer_workbook::backends::umya::FormulaCacheUpdate
+impl core::clone::Clone for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::FormulaCacheUpdate
+impl core::cmp::PartialEq for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::eq(&self, &formualizer_workbook::FormulaCacheUpdate) -> bool
+impl core::fmt::Debug for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for formualizer_workbook::FormulaCacheUpdate
 pub struct formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
 pub formualizer_workbook::backends::umya::FormulaCacheUpdateRef::col: u32
 pub formualizer_workbook::backends::umya::FormulaCacheUpdateRef::row: u32
 pub formualizer_workbook::backends::umya::FormulaCacheUpdateRef::sheet: &'a str
 pub formualizer_workbook::backends::umya::FormulaCacheUpdateRef::value: &'a formualizer_common::value::LiteralValue
-impl<'a> core::clone::Clone for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-impl<'a> core::fmt::Debug for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::marker::Copy for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
+impl<'a> core::clone::Clone for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::FormulaCacheUpdateRef<'a>
+impl<'a> core::fmt::Debug for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Copy for formualizer_workbook::FormulaCacheUpdateRef<'a>
 pub struct formualizer_workbook::backends::umya::UmyaAdapter
 impl formualizer_workbook::backends::umya::UmyaAdapter
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::formula_cells(&self) -> alloc::vec::Vec<(alloc::string::String, u32, u32)>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::into_document(self) -> umya_spreadsheet::structs::spreadsheet::Spreadsheet
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::new_empty() -> Self
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_value(&mut self, &str, u32, u32, &formualizer_common::value::LiteralValue, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
-pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>>
-pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::backends::umya::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::FormulaCacheUpdateRef<'a>>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -319,9 +336,95 @@ pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_to<W: std::io::W
 impl<R> formualizer_eval::engine::ingest::EngineLoadStream<R> for formualizer_workbook::backends::umya::UmyaAdapter where R: formualizer_eval::traits::EvaluationContext
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = formualizer_workbook::error::IoError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::stream_into_engine(&mut self, &mut formualizer_eval::engine::eval::Engine<R>) -> core::result::Result<(), Self::Error>
+pub mod formualizer_workbook::backends::umya3
+pub struct formualizer_workbook::backends::umya3::FormulaCacheUpdate
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdate::col: u32
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdate::row: u32
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdate::sheet: alloc::string::String
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdate::value: formualizer_common::value::LiteralValue
+impl core::clone::Clone for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::FormulaCacheUpdate
+impl core::cmp::PartialEq for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::eq(&self, &formualizer_workbook::FormulaCacheUpdate) -> bool
+impl core::fmt::Debug for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for formualizer_workbook::FormulaCacheUpdate
+pub struct formualizer_workbook::backends::umya3::FormulaCacheUpdateRef<'a>
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdateRef::col: u32
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdateRef::row: u32
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdateRef::sheet: &'a str
+pub formualizer_workbook::backends::umya3::FormulaCacheUpdateRef::value: &'a formualizer_common::value::LiteralValue
+impl<'a> core::clone::Clone for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::FormulaCacheUpdateRef<'a>
+impl<'a> core::fmt::Debug for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Copy for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub struct formualizer_workbook::backends::umya3::UmyaAdapter
+impl formualizer_workbook::backends::umya3::UmyaAdapter
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::formula_cells(&self) -> alloc::vec::Vec<(alloc::string::String, u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::into_document(self) -> umya_spreadsheet::structs::workbook::Workbook
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::new_empty() -> Self
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::set_formula_cached_value(&mut self, &str, u32, u32, &formualizer_common::value::LiteralValue, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::FormulaCacheUpdateRef<'a>>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::calc_settings(&self) -> core::option::Option<formualizer_workbook::traits::CalcSettings>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::capabilities(&self) -> formualizer_workbook::traits::BackendCaps
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::defined_names(&mut self) -> core::result::Result<alloc::vec::Vec<formualizer_workbook::traits::DefinedName>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::is_loaded(&self, &str, core::option::Option<u32>, core::option::Option<u32>) -> bool
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::load_stats(&self) -> core::option::Option<formualizer_workbook::traits::AdapterLoadStats>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_bytes(alloc::vec::Vec<u8>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_path<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_reader(alloc::boxed::Box<(dyn std::io::Read + core::marker::Send + core::marker::Sync)>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_cell(&mut self, &str, u32, u32) -> core::result::Result<core::option::Option<formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
+impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::create_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::delete_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::flush(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::rename_sheet(&mut self, &str, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_as_path<P: core::convert::AsRef<std::path::Path>>(&mut self, P) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to<'a>(&mut self, formualizer_workbook::traits::SaveDestination<'a>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to_bytes(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
+impl<R> formualizer_eval::engine::ingest::EngineLoadStream<R> for formualizer_workbook::backends::umya3::UmyaAdapter where R: formualizer_eval::traits::EvaluationContext
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = formualizer_workbook::error::IoError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::stream_into_engine(&mut self, &mut formualizer_eval::engine::eval::Engine<R>) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::read_document(&[u8]) -> core::result::Result<umya_spreadsheet::structs::workbook::Workbook, umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::read_document_path(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<umya_spreadsheet::structs::workbook::Workbook, umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::read_document_reader(impl std::io::Read) -> core::result::Result<umya_spreadsheet::structs::workbook::Workbook, umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::write_document(&umya_spreadsheet::structs::workbook::Workbook) -> core::result::Result<alloc::vec::Vec<u8>, umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::write_document_path(&umya_spreadsheet::structs::workbook::Workbook, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::write_document_writer(&umya_spreadsheet::structs::workbook::Workbook, impl std::io::Write) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub enum formualizer_workbook::backends::XlsxPathSource
+pub formualizer_workbook::backends::XlsxPathSource::DirectMmap
+pub formualizer_workbook::backends::XlsxPathSource::SharedFile
+impl core::clone::Clone for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::clone(&self) -> formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::cmp::Eq for formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::cmp::PartialEq for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::eq(&self, &formualizer_workbook::backends::calamine::XlsxPathSource) -> bool
+impl core::default::Default for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::default() -> formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::fmt::Debug for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::marker::StructuralPartialEq for formualizer_workbook::backends::calamine::XlsxPathSource
 pub struct formualizer_workbook::backends::CalamineAdapter
 impl formualizer_workbook::backends::calamine::CalamineAdapter
 pub fn formualizer_workbook::backends::calamine::CalamineAdapter::external_link_target(&self, u32) -> core::option::Option<&str>
+pub fn formualizer_workbook::backends::calamine::CalamineAdapter::open_bytes_cancellable(alloc::vec::Vec<u8>, formualizer_eval::engine::cancel::CancelToken) -> core::result::Result<Self, calamine::errors::Error>
+pub fn formualizer_workbook::backends::calamine::CalamineAdapter::open_path_with_source<P: core::convert::AsRef<std::path::Path>>(P, formualizer_workbook::backends::calamine::XlsxPathSource) -> core::result::Result<Self, calamine::errors::Error>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::calamine::CalamineAdapter
 pub type formualizer_workbook::backends::calamine::CalamineAdapter::Error = calamine::errors::Error
 pub fn formualizer_workbook::backends::calamine::CalamineAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -393,23 +496,23 @@ pub formualizer_workbook::backends::FormulaCacheUpdate::col: u32
 pub formualizer_workbook::backends::FormulaCacheUpdate::row: u32
 pub formualizer_workbook::backends::FormulaCacheUpdate::sheet: alloc::string::String
 pub formualizer_workbook::backends::FormulaCacheUpdate::value: formualizer_common::value::LiteralValue
-impl core::clone::Clone for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::backends::umya::FormulaCacheUpdate
-impl core::cmp::PartialEq for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::eq(&self, &formualizer_workbook::backends::umya::FormulaCacheUpdate) -> bool
-impl core::fmt::Debug for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for formualizer_workbook::backends::umya::FormulaCacheUpdate
+impl core::clone::Clone for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::FormulaCacheUpdate
+impl core::cmp::PartialEq for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::eq(&self, &formualizer_workbook::FormulaCacheUpdate) -> bool
+impl core::fmt::Debug for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for formualizer_workbook::FormulaCacheUpdate
 pub struct formualizer_workbook::backends::FormulaCacheUpdateRef<'a>
 pub formualizer_workbook::backends::FormulaCacheUpdateRef::col: u32
 pub formualizer_workbook::backends::FormulaCacheUpdateRef::row: u32
 pub formualizer_workbook::backends::FormulaCacheUpdateRef::sheet: &'a str
 pub formualizer_workbook::backends::FormulaCacheUpdateRef::value: &'a formualizer_common::value::LiteralValue
-impl<'a> core::clone::Clone for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-impl<'a> core::fmt::Debug for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::marker::Copy for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
+impl<'a> core::clone::Clone for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::FormulaCacheUpdateRef<'a>
+impl<'a> core::fmt::Debug for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Copy for formualizer_workbook::FormulaCacheUpdateRef<'a>
 pub struct formualizer_workbook::backends::JsonAdapter
 impl formualizer_workbook::backends::json::JsonAdapter
 pub fn formualizer_workbook::backends::json::JsonAdapter::new() -> Self
@@ -458,13 +561,55 @@ pub fn formualizer_workbook::backends::json::JsonAdapter::write_to<W: std::io::W
 impl<R> formualizer_eval::engine::ingest::EngineLoadStream<R> for formualizer_workbook::backends::json::JsonAdapter where R: formualizer_eval::traits::EvaluationContext
 pub type formualizer_workbook::backends::json::JsonAdapter::Error = formualizer_workbook::error::IoError
 pub fn formualizer_workbook::backends::json::JsonAdapter::stream_into_engine(&mut self, &mut formualizer_eval::engine::eval::Engine<R>) -> core::result::Result<(), Self::Error>
+pub struct formualizer_workbook::backends::Umya3Adapter
+impl formualizer_workbook::backends::umya3::UmyaAdapter
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::formula_cells(&self) -> alloc::vec::Vec<(alloc::string::String, u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::into_document(self) -> umya_spreadsheet::structs::workbook::Workbook
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::new_empty() -> Self
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::set_formula_cached_value(&mut self, &str, u32, u32, &formualizer_common::value::LiteralValue, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::FormulaCacheUpdateRef<'a>>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::calc_settings(&self) -> core::option::Option<formualizer_workbook::traits::CalcSettings>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::capabilities(&self) -> formualizer_workbook::traits::BackendCaps
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::defined_names(&mut self) -> core::result::Result<alloc::vec::Vec<formualizer_workbook::traits::DefinedName>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::is_loaded(&self, &str, core::option::Option<u32>, core::option::Option<u32>) -> bool
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::load_stats(&self) -> core::option::Option<formualizer_workbook::traits::AdapterLoadStats>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_bytes(alloc::vec::Vec<u8>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_path<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_reader(alloc::boxed::Box<(dyn std::io::Read + core::marker::Send + core::marker::Sync)>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_cell(&mut self, &str, u32, u32) -> core::result::Result<core::option::Option<formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
+impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::create_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::delete_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::flush(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::rename_sheet(&mut self, &str, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_as_path<P: core::convert::AsRef<std::path::Path>>(&mut self, P) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to<'a>(&mut self, formualizer_workbook::traits::SaveDestination<'a>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to_bytes(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
+impl<R> formualizer_eval::engine::ingest::EngineLoadStream<R> for formualizer_workbook::backends::umya3::UmyaAdapter where R: formualizer_eval::traits::EvaluationContext
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = formualizer_workbook::error::IoError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::stream_into_engine(&mut self, &mut formualizer_eval::engine::eval::Engine<R>) -> core::result::Result<(), Self::Error>
 pub struct formualizer_workbook::backends::UmyaAdapter
 impl formualizer_workbook::backends::umya::UmyaAdapter
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::formula_cells(&self) -> alloc::vec::Vec<(alloc::string::String, u32, u32)>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::into_document(self) -> umya_spreadsheet::structs::spreadsheet::Spreadsheet
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::new_empty() -> Self
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_value(&mut self, &str, u32, u32, &formualizer_common::value::LiteralValue, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
-pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>>
-pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::backends::umya::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::FormulaCacheUpdateRef<'a>>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -509,6 +654,46 @@ pub fn formualizer_workbook::builtins::ensure_builtins_loaded() -> &'static form
 pub fn formualizer_workbook::builtins::load_io_builtins() -> usize
 pub fn formualizer_workbook::builtins::register_function_dynamic(alloc::sync::Arc<dyn formualizer_eval::function::Function>)
 pub fn formualizer_workbook::builtins::try_load_builtins() -> core::result::Result<formualizer_workbook::builtins::BuiltinsGuard, &'static str>
+pub mod formualizer_workbook::cache_recalculate
+pub struct formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_cells: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_columns: u32
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_entries: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_expanded_bytes: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_formula_cells: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_input_bytes: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_output_bytes: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_worksheet_bytes: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::max_xml_depth: usize
+impl core::clone::Clone for formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::clone(&self) -> formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+impl core::default::Default for formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::default() -> Self
+impl core::fmt::Debug for formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::cancel: core::option::Option<formualizer_eval::engine::cancel::CancelToken>
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::error_location_limit: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::eval_config: formualizer_eval::engine::EvalConfig
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::limits: formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+impl core::clone::Clone for formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::clone(&self) -> formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+impl core::default::Default for formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::default() -> Self
+impl core::fmt::Debug for formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateResult::bytes: alloc::vec::Vec<u8>
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateResult::cache_cells_changed: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateResult::formula_cells: usize
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateResult::summary: formualizer_workbook::recalculate::RecalculateSummary
+pub formualizer_workbook::cache_recalculate::XlsxRecalculateResult::worksheet_parts_changed: usize
+impl core::clone::Clone for formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateResult::clone(&self) -> formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+impl core::fmt::Debug for formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn formualizer_workbook::cache_recalculate::recalculate_xlsx_bytes(&[u8], formualizer_workbook::cache_recalculate::XlsxRecalculateOptions) -> core::result::Result<formualizer_workbook::cache_recalculate::XlsxRecalculateResult, formualizer_workbook::error::IoError>
+pub fn formualizer_workbook::cache_recalculate::recalculate_xlsx_file(&std::path::Path, core::option::Option<&std::path::Path>, formualizer_workbook::cache_recalculate::XlsxRecalculateOptions) -> core::result::Result<formualizer_workbook::cache_recalculate::XlsxRecalculateResult, formualizer_workbook::error::IoError>
 pub mod formualizer_workbook::calc_pr
 pub fn formualizer_workbook::calc_pr::apply_calc_settings_to_cycle(&formualizer_workbook::traits::CalcSettings, formualizer_eval::engine::CycleConfig) -> formualizer_eval::engine::CycleConfig
 pub fn formualizer_workbook::calc_pr::calc_settings_from_cycle(&formualizer_eval::engine::CycleConfig) -> formualizer_workbook::traits::CalcSettings
@@ -962,6 +1147,22 @@ pub fn formualizer_workbook::backends::json::JsonAdapter::read_range(&mut self, 
 pub fn formualizer_workbook::backends::json::JsonAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
 pub fn formualizer_workbook::backends::json::JsonAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
 pub fn formualizer_workbook::backends::json::JsonAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
+impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::calc_settings(&self) -> core::option::Option<formualizer_workbook::traits::CalcSettings>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::capabilities(&self) -> formualizer_workbook::traits::BackendCaps
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::defined_names(&mut self) -> core::result::Result<alloc::vec::Vec<formualizer_workbook::traits::DefinedName>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::is_loaded(&self, &str, core::option::Option<u32>, core::option::Option<u32>) -> bool
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::load_stats(&self) -> core::option::Option<formualizer_workbook::traits::AdapterLoadStats>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_bytes(alloc::vec::Vec<u8>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_path<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_reader(alloc::boxed::Box<(dyn std::io::Read + core::marker::Send + core::marker::Sync)>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_cell(&mut self, &str, u32, u32) -> core::result::Result<core::option::Option<formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -1020,6 +1221,20 @@ pub fn formualizer_workbook::backends::json::JsonAdapter::save_to_bytes(&mut sel
 pub fn formualizer_workbook::backends::json::JsonAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
 pub fn formualizer_workbook::backends::json::JsonAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
 pub fn formualizer_workbook::backends::json::JsonAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
+impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::create_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::delete_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::flush(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::rename_sheet(&mut self, &str, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_as_path<P: core::convert::AsRef<std::path::Path>>(&mut self, P) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to<'a>(&mut self, formualizer_workbook::traits::SaveDestination<'a>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to_bytes(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
 impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
@@ -1602,6 +1817,20 @@ impl core::clone::Clone for formualizer_workbook::transaction::WriteOp
 pub fn formualizer_workbook::transaction::WriteOp::clone(&self) -> formualizer_workbook::transaction::WriteOp
 impl core::fmt::Debug for formualizer_workbook::transaction::WriteOp
 pub fn formualizer_workbook::transaction::WriteOp::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum formualizer_workbook::XlsxPathSource
+pub formualizer_workbook::XlsxPathSource::DirectMmap
+pub formualizer_workbook::XlsxPathSource::SharedFile
+impl core::clone::Clone for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::clone(&self) -> formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::cmp::Eq for formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::cmp::PartialEq for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::eq(&self, &formualizer_workbook::backends::calamine::XlsxPathSource) -> bool
+impl core::default::Default for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::default() -> formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::fmt::Debug for formualizer_workbook::backends::calamine::XlsxPathSource
+pub fn formualizer_workbook::backends::calamine::XlsxPathSource::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for formualizer_workbook::backends::calamine::XlsxPathSource
+impl core::marker::StructuralPartialEq for formualizer_workbook::backends::calamine::XlsxPathSource
 pub struct formualizer_workbook::AdapterLoadStats
 pub formualizer_workbook::AdapterLoadStats::formula_cells_handed_to_engine: core::option::Option<u64>
 pub formualizer_workbook::AdapterLoadStats::formula_cells_observed: core::option::Option<u64>
@@ -1644,6 +1873,8 @@ pub fn formualizer_workbook::traits::BackendCaps::fmt(&self, &mut core::fmt::For
 pub struct formualizer_workbook::CalamineAdapter
 impl formualizer_workbook::backends::calamine::CalamineAdapter
 pub fn formualizer_workbook::backends::calamine::CalamineAdapter::external_link_target(&self, u32) -> core::option::Option<&str>
+pub fn formualizer_workbook::backends::calamine::CalamineAdapter::open_bytes_cancellable(alloc::vec::Vec<u8>, formualizer_eval::engine::cancel::CancelToken) -> core::result::Result<Self, calamine::errors::Error>
+pub fn formualizer_workbook::backends::calamine::CalamineAdapter::open_path_with_source<P: core::convert::AsRef<std::path::Path>>(P, formualizer_workbook::backends::calamine::XlsxPathSource) -> core::result::Result<Self, calamine::errors::Error>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::calamine::CalamineAdapter
 pub type formualizer_workbook::backends::calamine::CalamineAdapter::Error = calamine::errors::Error
 pub fn formualizer_workbook::backends::calamine::CalamineAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -1782,23 +2013,23 @@ pub formualizer_workbook::FormulaCacheUpdate::col: u32
 pub formualizer_workbook::FormulaCacheUpdate::row: u32
 pub formualizer_workbook::FormulaCacheUpdate::sheet: alloc::string::String
 pub formualizer_workbook::FormulaCacheUpdate::value: formualizer_common::value::LiteralValue
-impl core::clone::Clone for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::backends::umya::FormulaCacheUpdate
-impl core::cmp::PartialEq for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::eq(&self, &formualizer_workbook::backends::umya::FormulaCacheUpdate) -> bool
-impl core::fmt::Debug for formualizer_workbook::backends::umya::FormulaCacheUpdate
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for formualizer_workbook::backends::umya::FormulaCacheUpdate
+impl core::clone::Clone for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::clone(&self) -> formualizer_workbook::FormulaCacheUpdate
+impl core::cmp::PartialEq for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::eq(&self, &formualizer_workbook::FormulaCacheUpdate) -> bool
+impl core::fmt::Debug for formualizer_workbook::FormulaCacheUpdate
+pub fn formualizer_workbook::FormulaCacheUpdate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for formualizer_workbook::FormulaCacheUpdate
 pub struct formualizer_workbook::FormulaCacheUpdateRef<'a>
 pub formualizer_workbook::FormulaCacheUpdateRef::col: u32
 pub formualizer_workbook::FormulaCacheUpdateRef::row: u32
 pub formualizer_workbook::FormulaCacheUpdateRef::sheet: &'a str
 pub formualizer_workbook::FormulaCacheUpdateRef::value: &'a formualizer_common::value::LiteralValue
-impl<'a> core::clone::Clone for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-impl<'a> core::fmt::Debug for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
-pub fn formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::marker::Copy for formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>
+impl<'a> core::clone::Clone for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::clone(&self) -> formualizer_workbook::FormulaCacheUpdateRef<'a>
+impl<'a> core::fmt::Debug for formualizer_workbook::FormulaCacheUpdateRef<'a>
+pub fn formualizer_workbook::FormulaCacheUpdateRef<'a>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a> core::marker::Copy for formualizer_workbook::FormulaCacheUpdateRef<'a>
 pub struct formualizer_workbook::IoConfig
 pub formualizer_workbook::IoConfig::enable_changelog: bool
 impl core::clone::Clone for formualizer_workbook::session::IoConfig
@@ -1978,13 +2209,55 @@ impl serde_core::ser::Serialize for formualizer_workbook::traits::TableDefinitio
 pub fn formualizer_workbook::traits::TableDefinition::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for formualizer_workbook::traits::TableDefinition
 pub fn formualizer_workbook::traits::TableDefinition::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+pub struct formualizer_workbook::Umya3Adapter
+impl formualizer_workbook::backends::umya3::UmyaAdapter
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::formula_cells(&self) -> alloc::vec::Vec<(alloc::string::String, u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::into_document(self) -> umya_spreadsheet::structs::workbook::Workbook
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::new_empty() -> Self
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::set_formula_cached_value(&mut self, &str, u32, u32, &formualizer_common::value::LiteralValue, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::FormulaCacheUpdateRef<'a>>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::calc_settings(&self) -> core::option::Option<formualizer_workbook::traits::CalcSettings>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::capabilities(&self) -> formualizer_workbook::traits::BackendCaps
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::defined_names(&mut self) -> core::result::Result<alloc::vec::Vec<formualizer_workbook::traits::DefinedName>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::is_loaded(&self, &str, core::option::Option<u32>, core::option::Option<u32>) -> bool
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::load_stats(&self) -> core::option::Option<formualizer_workbook::traits::AdapterLoadStats>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_bytes(alloc::vec::Vec<u8>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_path<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_reader(alloc::boxed::Box<(dyn std::io::Read + core::marker::Send + core::marker::Sync)>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_cell(&mut self, &str, u32, u32) -> core::result::Result<core::option::Option<formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
+impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::create_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::delete_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::flush(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::rename_sheet(&mut self, &str, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_as_path<P: core::convert::AsRef<std::path::Path>>(&mut self, P) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to<'a>(&mut self, formualizer_workbook::traits::SaveDestination<'a>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to_bytes(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
+impl<R> formualizer_eval::engine::ingest::EngineLoadStream<R> for formualizer_workbook::backends::umya3::UmyaAdapter where R: formualizer_eval::traits::EvaluationContext
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = formualizer_workbook::error::IoError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::stream_into_engine(&mut self, &mut formualizer_eval::engine::eval::Engine<R>) -> core::result::Result<(), Self::Error>
 pub struct formualizer_workbook::UmyaAdapter
 impl formualizer_workbook::backends::umya::UmyaAdapter
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::formula_cells(&self) -> alloc::vec::Vec<(alloc::string::String, u32, u32)>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::into_document(self) -> umya_spreadsheet::structs::spreadsheet::Spreadsheet
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::new_empty() -> Self
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_value(&mut self, &str, u32, u32, &formualizer_common::value::LiteralValue, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
-pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::backends::umya::FormulaCacheUpdateRef<'a>>
-pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::backends::umya::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::set_formula_cached_values_batch<'a, I>(&mut self, I, formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError> where I: core::iter::traits::collect::IntoIterator<Item = formualizer_workbook::FormulaCacheUpdateRef<'a>>
+pub fn formualizer_workbook::backends::umya::UmyaAdapter::write_formula_caches_batch(&mut self, &[formualizer_workbook::FormulaCacheUpdate], formualizer_common::value::DateSystem) -> core::result::Result<(), umya_spreadsheet::structs::error::XlsxError>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -2309,6 +2582,43 @@ pub fn formualizer_workbook::transaction::WriteTransaction<'a, W>::write_cell(&m
 pub fn formualizer_workbook::transaction::WriteTransaction<'a, W>::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> &mut Self
 impl<'a, W: formualizer_workbook::traits::SpreadsheetWriter> core::ops::drop::Drop for formualizer_workbook::transaction::WriteTransaction<'a, W>
 pub fn formualizer_workbook::transaction::WriteTransaction<'a, W>::drop(&mut self)
+pub struct formualizer_workbook::XlsxRecalculateLimits
+pub formualizer_workbook::XlsxRecalculateLimits::max_cells: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_columns: u32
+pub formualizer_workbook::XlsxRecalculateLimits::max_entries: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_expanded_bytes: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_formula_cells: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_input_bytes: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_output_bytes: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_worksheet_bytes: usize
+pub formualizer_workbook::XlsxRecalculateLimits::max_xml_depth: usize
+impl core::clone::Clone for formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::clone(&self) -> formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+impl core::default::Default for formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::default() -> Self
+impl core::fmt::Debug for formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateLimits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct formualizer_workbook::XlsxRecalculateOptions
+pub formualizer_workbook::XlsxRecalculateOptions::cancel: core::option::Option<formualizer_eval::engine::cancel::CancelToken>
+pub formualizer_workbook::XlsxRecalculateOptions::error_location_limit: usize
+pub formualizer_workbook::XlsxRecalculateOptions::eval_config: formualizer_eval::engine::EvalConfig
+pub formualizer_workbook::XlsxRecalculateOptions::limits: formualizer_workbook::cache_recalculate::XlsxRecalculateLimits
+impl core::clone::Clone for formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::clone(&self) -> formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+impl core::default::Default for formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::default() -> Self
+impl core::fmt::Debug for formualizer_workbook::cache_recalculate::XlsxRecalculateOptions
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct formualizer_workbook::XlsxRecalculateResult
+pub formualizer_workbook::XlsxRecalculateResult::bytes: alloc::vec::Vec<u8>
+pub formualizer_workbook::XlsxRecalculateResult::cache_cells_changed: usize
+pub formualizer_workbook::XlsxRecalculateResult::formula_cells: usize
+pub formualizer_workbook::XlsxRecalculateResult::summary: formualizer_workbook::recalculate::RecalculateSummary
+pub formualizer_workbook::XlsxRecalculateResult::worksheet_parts_changed: usize
+impl core::clone::Clone for formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateResult::clone(&self) -> formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+impl core::fmt::Debug for formualizer_workbook::cache_recalculate::XlsxRecalculateResult
+pub fn formualizer_workbook::cache_recalculate::XlsxRecalculateResult::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const formualizer_workbook::DEFAULT_ERROR_LOCATION_LIMIT: usize
 pub const formualizer_workbook::WASM_ABI_VERSION_V1: u32
 pub const formualizer_workbook::WASM_CODEC_VERSION_V1: u32
@@ -2385,6 +2695,22 @@ pub fn formualizer_workbook::backends::json::JsonAdapter::read_range(&mut self, 
 pub fn formualizer_workbook::backends::json::JsonAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
 pub fn formualizer_workbook::backends::json::JsonAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
 pub fn formualizer_workbook::backends::json::JsonAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
+impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::calc_settings(&self) -> core::option::Option<formualizer_workbook::traits::CalcSettings>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::capabilities(&self) -> formualizer_workbook::traits::BackendCaps
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::defined_names(&mut self) -> core::result::Result<alloc::vec::Vec<formualizer_workbook::traits::DefinedName>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::is_loaded(&self, &str, core::option::Option<u32>, core::option::Option<u32>) -> bool
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::load_stats(&self) -> core::option::Option<formualizer_workbook::traits::AdapterLoadStats>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_bytes(alloc::vec::Vec<u8>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_path<P: core::convert::AsRef<std::path::Path>>(P) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::open_reader(alloc::boxed::Box<(dyn std::io::Read + core::marker::Send + core::marker::Sync)>) -> core::result::Result<Self, Self::Error> where Self: core::marker::Sized
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_cell(&mut self, &str, u32, u32) -> core::result::Result<core::option::Option<formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::read_sheet(&mut self, &str) -> core::result::Result<formualizer_workbook::traits::SheetData, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_bounds(&self, &str) -> core::option::Option<(u32, u32)>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::sheet_names(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, Self::Error>
 impl formualizer_workbook::traits::SpreadsheetReader for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::access_granularity(&self) -> formualizer_workbook::traits::AccessGranularity
@@ -2443,6 +2769,20 @@ pub fn formualizer_workbook::backends::json::JsonAdapter::save_to_bytes(&mut sel
 pub fn formualizer_workbook::backends::json::JsonAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
 pub fn formualizer_workbook::backends::json::JsonAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
 pub fn formualizer_workbook::backends::json::JsonAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
+impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya3::UmyaAdapter
+pub type formualizer_workbook::backends::umya3::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::create_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::delete_sheet(&mut self, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::flush(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::rename_sheet(&mut self, &str, &str) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save(&mut self) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_as_path<P: core::convert::AsRef<std::path::Path>>(&mut self, P) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to<'a>(&mut self, formualizer_workbook::traits::SaveDestination<'a>) -> core::result::Result<core::option::Option<alloc::vec::Vec<u8>>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::save_to_bytes(&mut self) -> core::result::Result<alloc::vec::Vec<u8>, Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_cell(&mut self, &str, u32, u32, formualizer_workbook::traits::CellData) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_range(&mut self, &str, alloc::collections::btree::map::BTreeMap<(u32, u32), formualizer_workbook::traits::CellData>) -> core::result::Result<(), Self::Error>
+pub fn formualizer_workbook::backends::umya3::UmyaAdapter::write_to<W: std::io::Write>(&mut self, &mut W) -> core::result::Result<(), Self::Error>
 impl formualizer_workbook::traits::SpreadsheetWriter for formualizer_workbook::backends::umya::UmyaAdapter
 pub type formualizer_workbook::backends::umya::UmyaAdapter::Error = umya_spreadsheet::structs::error::XlsxError
 pub fn formualizer_workbook::backends::umya::UmyaAdapter::clear_range(&mut self, &str, (u32, u32), (u32, u32)) -> core::result::Result<(), Self::Error>
@@ -2481,6 +2821,8 @@ pub fn formualizer_workbook::extract_wasm_manifest_json_from_module(&[u8]) -> co
 pub fn formualizer_workbook::parse_wasm_manifest_json(&[u8]) -> core::result::Result<formualizer_workbook::workbook::WasmModuleManifest, formualizer_common::error::ExcelError>
 pub fn formualizer_workbook::recalculate_file(&std::path::Path, core::option::Option<&std::path::Path>) -> core::result::Result<formualizer_workbook::recalculate::RecalculateSummary, formualizer_workbook::error::IoError>
 pub fn formualizer_workbook::recalculate_file_with_limit(&std::path::Path, core::option::Option<&std::path::Path>, usize) -> core::result::Result<formualizer_workbook::recalculate::RecalculateSummary, formualizer_workbook::error::IoError>
+pub fn formualizer_workbook::recalculate_xlsx_bytes(&[u8], formualizer_workbook::cache_recalculate::XlsxRecalculateOptions) -> core::result::Result<formualizer_workbook::cache_recalculate::XlsxRecalculateResult, formualizer_workbook::error::IoError>
+pub fn formualizer_workbook::recalculate_xlsx_file(&std::path::Path, core::option::Option<&std::path::Path>, formualizer_workbook::cache_recalculate::XlsxRecalculateOptions) -> core::result::Result<formualizer_workbook::cache_recalculate::XlsxRecalculateResult, formualizer_workbook::error::IoError>
 pub fn formualizer_workbook::register_function_dynamic(alloc::sync::Arc<dyn formualizer_eval::function::Function>)
 pub fn formualizer_workbook::try_load_builtins() -> core::result::Result<formualizer_workbook::builtins::BuiltinsGuard, &'static str>
 pub fn formualizer_workbook::validate_wasm_manifest(&formualizer_workbook::workbook::WasmModuleManifest) -> core::result::Result<(), formualizer_common::error::ExcelError>

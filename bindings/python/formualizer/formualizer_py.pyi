@@ -62,12 +62,15 @@ __all__ = [
     "Workbook",
     "WorkbookConfig",
     "WorkbookMode",
+    "XlsxPathSource",
     "excel_token_for_kind",
     "load_workbook",
     "load_workbook_bytes",
     "parse",
     "parse_formula",
     "recalculate_file",
+    "recalculate_xlsx_bytes",
+    "recalculate_xlsx_file",
     "tokenize",
     "EXCEL_ERROR_TOKENS",
     "DependencyStateUnavailableError",
@@ -299,6 +302,17 @@ class CycleTelemetry:
     def nan_converged(self) -> builtins.int:
         r"""
         Identical-bit NaN comparisons treated as converged (spec §6 NaN rule).
+        """
+    @property
+    def reused_sccs(self) -> builtins.int:
+        r"""
+        Retained exactly-converged SCCs that had no dirty member at the start of this request and were
+        therefore served without a re-run (#368).
+        """
+    @property
+    def reused_scc_members(self) -> builtins.int:
+        r"""
+        Members of the SCCs counted in `reused_sccs`.
         """
     @property
     def elapsed_ms(self) -> builtins.int:
@@ -1563,7 +1577,7 @@ class Workbook:
         """
     def __new__(cls, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook: ...
     @classmethod
-    def load_path(cls, path: builtins.str, strategy: typing.Optional[builtins.str] = None, backend: typing.Optional[builtins.str] = None, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
+    def load_path(cls, path: builtins.str, strategy: typing.Optional[builtins.str] = None, backend: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
         r"""
         Class method: load an XLSX workbook from a file path.
         
@@ -1572,13 +1586,19 @@ class Workbook:
         Args:
             path: Path to the `.xlsx` file.
             backend: Backend name (currently defaults to `calamine`).
+            path_source: `XlsxPathSource.SHARED_FILE` (the safe default) or
+                `XlsxPathSource.DIRECT_MMAP`. Direct mmap requires a native
+                Calamine `.xlsx` path whose underlying file is not destructively
+                modified or truncated while the workbook loads.
             mode/config: Optional workbook configuration.
         
         Example:
         ```python
             import formualizer as fz
         
-            wb = fz.Workbook.load_path("model.xlsx")
+            wb = fz.Workbook.load_path(
+                "model.xlsx", path_source=fz.XlsxPathSource.DIRECT_MMAP
+            )
             print(wb.sheet_names)
         ```
         """
@@ -1602,7 +1622,7 @@ class Workbook:
         ```
         """
     @classmethod
-    def from_path(cls, path: builtins.str, backend: typing.Optional[builtins.str] = None, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook: ...
+    def from_path(cls, path: builtins.str, backend: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook: ...
     @classmethod
     def from_bytes(cls, data: bytes, backend: typing.Optional[builtins.str] = None, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
         r"""
@@ -2117,7 +2137,24 @@ def excel_token_for_kind(kind: builtins.str) -> typing.Optional[builtins.str]:
     ```
     """
 
-def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = None, *, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
+@typing.final
+class XlsxPathSource(enum.Enum):
+    r"""
+    XLSX filesystem backing source used by Calamine path loads.
+    """
+    SHARED_FILE = ...
+    r"""
+    Safe default: one retained file handle with shared serialized I/O.
+    """
+    DIRECT_MMAP = ...
+    r"""
+    Explicit read-only mmap; see the filesystem mutation contract.
+    """
+
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
+
+def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
     r"""
     Load an XLSX workbook from a filesystem path.
     
@@ -2127,12 +2164,19 @@ def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = 
         path: Path to an `.xlsx` file.
         strategy: Currently accepted for backward compatibility.
             (The backend/strategy is currently fixed to `calamine` + eager load.)
+        path_source: `XlsxPathSource.SHARED_FILE` (the safe default) or
+            `XlsxPathSource.DIRECT_MMAP`. Direct mmap retains an actual read-only
+            mapping; the underlying file must not be destructively modified or
+            truncated while the workbook loads.
     
     Example:
     ```python
         import formualizer as fz
     
-        wb = fz.load_workbook("financial_model.xlsx")
+        wb = fz.load_workbook(
+            "financial_model.xlsx",
+            path_source=fz.XlsxPathSource.DIRECT_MMAP,
+        )
         print(wb.evaluate_cell("Summary", 1, 2))
     ```
     """
@@ -2189,6 +2233,17 @@ def recalculate_file(path: builtins.str, output: typing.Optional[builtins.str] =
     Note:
         Formula text is preserved. Cached-value typing follows the active
         `umya-spreadsheet` implementation.
+    """
+
+def recalculate_xlsx_bytes(data: bytes, *, error_location_limit: typing.Optional[builtins.int] = None) -> typing.Any:
+    r"""
+    Recalculate XLSX formula caches in memory without rewriting unrelated package parts.
+    Returns a dictionary with output ``bytes``, a ``summary``, and formula/cache/worksheet counts.
+    """
+
+def recalculate_xlsx_file(path: builtins.str, output: typing.Optional[builtins.str] = None, *, error_location_limit: typing.Optional[builtins.int] = None) -> typing.Any:
+    r"""
+    Recalculate XLSX formula caches from a path using atomic output replacement.
     """
 
 def tokenize(formula: builtins.str, dialect: typing.Optional[FormulaDialect] = None) -> Tokenizer:

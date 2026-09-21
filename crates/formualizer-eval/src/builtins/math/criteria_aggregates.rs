@@ -74,6 +74,100 @@ enum RangeOrScalar<'a> {
     ReferenceError(ExcelError),
 }
 
+// Blank-sensitive counts must retain the logical extent of whole rows/columns.
+// Ordinary aggregate resolution trims those references to their used region.
+// Keep a physically bounded view and carry only an arithmetic logical cell
+// count alongside it. Expanding to the full Excel rectangle here would introduce
+// huge unstored-column work. Cached resolution also avoids executing reference-
+// producing expressions twice. u64 keeps whole-sheet counts safe on wasm32.
+fn resolve_count_argument<'a, 'b>(
+    arg: &ArgumentHandle<'a, 'b>,
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<(AggregateArgument<'b>, Option<u64>), ExcelError> {
+    use formualizer_parse::parser::ReferenceType;
+
+    let unbounded = match arg.resolve_reference_or_value()? {
+        crate::function::FunctionResolution::Reference(
+            reference @ ReferenceType::Range {
+                start_row,
+                end_row,
+                start_col,
+                end_col,
+                ..
+            },
+        ) if start_row.is_none()
+            || end_row.is_none()
+            || start_col.is_none()
+            || end_col.is_none() =>
+        {
+            Some(reference)
+        }
+        _ => None,
+    };
+    let argument = resolve_aggregate_argument(arg, ctx)?;
+    if let AggregateArgument::Range(mut view) = argument {
+        let (rows, cols) = view.dims();
+        let mut logical_cells = rows as u64 * cols as u64;
+        if let Some(mut reference) = unbounded {
+            let ReferenceType::Range {
+                start_row,
+                end_row,
+                start_col,
+                end_col,
+                start_row_abs,
+                end_row_abs,
+                start_col_abs,
+                end_col_abs,
+                ..
+            } = &mut reference
+            else {
+                unreachable!()
+            };
+            let (r1, r2) = (start_row.unwrap_or(1), end_row.unwrap_or(1_048_576));
+            let (c1, c2) = (start_col.unwrap_or(1), end_col.unwrap_or(16_384));
+            let logical_rows = r1.abs_diff(r2) as u64 + 1;
+            let logical_cols = c1.abs_diff(c2) as u64 + 1;
+            logical_cells = logical_rows * logical_cols;
+            // Use already-resolved coordinates (including shared-formula rebasing).
+            let (sr, sc) = (view.start_row() as u32 + 1, view.start_col() as u32 + 1);
+            let er = (sr as u64 - 1 + logical_rows).min(view.sheet().nrows as u64) as u32;
+            let ec = (sc as u64 - 1 + logical_cols).min(view.sheet().columns.len() as u64) as u32;
+            let physical_rows = er.saturating_sub(sr.saturating_sub(1)) as usize;
+            let physical_cols = ec.saturating_sub(sc.saturating_sub(1)) as usize;
+            if physical_rows > 0
+                && physical_cols > 0
+                && (physical_rows > rows || physical_cols > cols)
+            {
+                // Generic whole-axis resolution can trim to graph placements,
+                // which excludes spill members beyond their anchor. Re-resolve
+                // only this finite physical rectangle through the context so
+                // computed/spill authority is retained. The argument expression
+                // stays cached; neither the whole Excel axis nor its AST is expanded.
+                *start_row = Some(sr);
+                *end_row = Some(er);
+                *start_col = Some(sc);
+                *end_col = Some(ec);
+                *start_row_abs = true;
+                *end_row_abs = true;
+                *start_col_abs = true;
+                *end_col_abs = true;
+                view = arg.with_context_cancel_token(
+                    ctx.resolve_range_view(&reference, ctx.current_sheet())?,
+                );
+            }
+        }
+        let (rows, cols) = view.dims();
+        let physical_rows =
+            rows.min((view.sheet().nrows as usize).saturating_sub(view.start_row()));
+        let physical_cols = cols.min(view.sheet().columns.len().saturating_sub(view.start_col()));
+        return Ok((
+            AggregateArgument::Range(view.sub_view(0, 0, physical_rows, physical_cols)),
+            Some(logical_cells),
+        ));
+    }
+    Ok((argument, None))
+}
+
 fn range_or_scalar<'a, 'b>(
     arg: &ArgumentHandle<'a, 'b>,
     ctx: &dyn FunctionContext<'b>,
@@ -172,6 +266,43 @@ fn first_selected_error(
     None
 }
 
+// Bound additional retained masks per invocation; an over-budget mask is still
+// used for the current chunk, but is not retained. Keep the row-major reduction
+// order unchanged (including floating-point summation order).
+const CRITERIA_MASK_MEMO_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct CriteriaMaskMemo {
+    masks: rustc_hash::FxHashMap<(usize, usize), Option<std::sync::Arc<BooleanArray>>>,
+    bytes: usize,
+}
+
+impl CriteriaMaskMemo {
+    fn get_or_build(
+        &mut self,
+        key: (usize, usize),
+        build: impl FnOnce() -> Option<std::sync::Arc<BooleanArray>>,
+    ) -> Option<std::sync::Arc<BooleanArray>> {
+        if let Some(mask) = self.masks.get(&key) {
+            return mask.clone();
+        }
+        let mask = build();
+        // Include the BooleanArray allocation and full backing buffers. The extra
+        // 512 bytes conservatively cover its Arc header, two Arrow buffer owners,
+        // allocator overhead, and hash buckets (including growth slack). Charge
+        // unsupported predicates too, so memo metadata remains bounded.
+        let bytes = mask
+            .as_ref()
+            .map_or(0, |m| m.get_array_memory_size())
+            .saturating_add(512);
+        if bytes <= CRITERIA_MASK_MEMO_BYTES.saturating_sub(self.bytes) {
+            self.bytes += bytes;
+            self.masks.insert(key, mask.clone());
+        }
+        mask
+    }
+}
+
 fn eval_if_family<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     ctx: &dyn FunctionContext<'b>,
@@ -181,6 +312,7 @@ fn eval_if_family<'a, 'b>(
     let mut sum_view: Option<crate::engine::range_view::RangeView<'_>> = None;
     let mut sum_scalar: Option<LiteralValue> = None;
     let mut crit_specs = Vec::new();
+    let mut logical_count_cells = None;
 
     macro_rules! resolve_range_or_scalar {
         ($arg:expr) => {
@@ -205,7 +337,19 @@ fn eval_if_family<'a, 'b>(
             )));
         }
         let pred = crate::args::parse_criteria(&args[1].value()?.into_literal())?;
-        let (crit_rv, crit_val) = resolve_range_or_scalar!(&args[0]);
+        let (crit_rv, crit_val) = if agg_type == AggregationType::Count {
+            let (argument, logical_cells) = resolve_count_argument(&args[0], ctx)?;
+            logical_count_cells = logical_cells;
+            match argument {
+                AggregateArgument::Range(view) => (Some(view), None),
+                AggregateArgument::Scalar(value) => (None, Some(value)),
+                AggregateArgument::ReferenceError(error) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                }
+            }
+        } else {
+            resolve_range_or_scalar!(&args[0])
+        };
         crit_specs.push((crit_rv, pred, crit_val));
 
         if agg_type != AggregationType::Count {
@@ -313,26 +457,20 @@ fn eval_if_family<'a, 'b>(
             drv
         };
 
+        let mut criteria_masks = CriteriaMaskMemo::default();
+        let mut visited_rows = 0usize;
         for res in driver.iter_row_chunks() {
             let cs = res?;
             let row_start = cs.row_start;
             let row_len = cs.row_len;
+            visited_rows = visited_rows.max(row_start + row_len);
             if row_len == 0 {
                 continue;
             }
 
-            // Get slices for all criteria and sum range
-            let mut crit_num_slices = Vec::with_capacity(crit_specs.len());
-            let mut crit_text_slices = Vec::with_capacity(crit_specs.len());
-            for (rv, _, _) in &crit_specs {
-                if let Some(v) = rv {
-                    crit_num_slices.push(Some(v.slice_numbers(row_start, row_len)));
-                    crit_text_slices.push(Some(v.slice_lowered_text(row_start, row_len)));
-                } else {
-                    crit_num_slices.push(None);
-                    crit_text_slices.push(None);
-                }
-            }
+            // Numeric fallback lanes are materialized only if a mask is unsupported.
+            // Text fallback uses get_cell, not lowered-text lanes.
+            let mut crit_num_slices = vec![None; crit_specs.len()];
 
             let sum_slices = sum_view
                 .as_ref()
@@ -360,45 +498,47 @@ fn eval_if_family<'a, 'b>(
 
                     // Try cache
                     let cur_cached = if let Some(ref view) = crit_specs[j].0 {
-                        ctx.get_criteria_mask(view, c, pred).map(|m| {
-                            let fill = criteria_match(pred, &LiteralValue::Empty);
-                            let m_len = m.len();
+                        criteria_masks
+                            .get_or_build((j, c), || ctx.get_criteria_mask(view, c, pred))
+                            .map(|m| {
+                                let fill = criteria_match(pred, &LiteralValue::Empty);
+                                let m_len = m.len();
 
-                            // The cached mask may be shorter than the current driver's chunk
-                            // (e.g., whole-column references trimmed to different used-regions).
-                            // Treat out-of-bounds rows as Empty cells.
-                            if row_start + row_len <= m_len {
-                                #[cfg(test)]
-                                test_hooks::inc_slice_fast();
-                                let sl = m.slice(row_start, row_len);
-                                return sl
-                                    .as_any()
-                                    .downcast_ref::<arrow_array::BooleanArray>()
-                                    .expect("cached criteria mask slice downcast")
-                                    .clone();
-                            }
+                                // The cached mask may be shorter than the current driver's chunk
+                                // (e.g., whole-column references trimmed to different used-regions).
+                                // Treat out-of-bounds rows as Empty cells.
+                                if row_start + row_len <= m_len {
+                                    #[cfg(test)]
+                                    test_hooks::inc_slice_fast();
+                                    let sl = m.slice(row_start, row_len);
+                                    return sl
+                                        .as_any()
+                                        .downcast_ref::<arrow_array::BooleanArray>()
+                                        .expect("cached criteria mask slice downcast")
+                                        .clone();
+                                }
 
-                            let mut bb =
-                                arrow_array::builder::BooleanBuilder::with_capacity(row_len);
-                            if row_start < m_len {
-                                #[cfg(test)]
-                                test_hooks::inc_pad_partial();
-                                let take_len = row_len.min(m_len - row_start);
-                                let sl = m.slice(row_start, take_len);
-                                let ba = sl
-                                    .as_any()
-                                    .downcast_ref::<arrow_array::BooleanArray>()
-                                    .expect("cached criteria mask slice downcast");
-                                bb.append_array(ba);
-                                bb.append_n(row_len - take_len, fill);
-                            } else {
-                                #[cfg(test)]
-                                test_hooks::inc_pad_all_fill();
-                                bb.append_n(row_len, fill);
-                            }
+                                let mut bb =
+                                    arrow_array::builder::BooleanBuilder::with_capacity(row_len);
+                                if row_start < m_len {
+                                    #[cfg(test)]
+                                    test_hooks::inc_pad_partial();
+                                    let take_len = row_len.min(m_len - row_start);
+                                    let sl = m.slice(row_start, take_len);
+                                    let ba = sl
+                                        .as_any()
+                                        .downcast_ref::<arrow_array::BooleanArray>()
+                                        .expect("cached criteria mask slice downcast");
+                                    bb.append_array(ba);
+                                    bb.append_n(row_len - take_len, fill);
+                                } else {
+                                    #[cfg(test)]
+                                    test_hooks::inc_pad_all_fill();
+                                    bb.append_n(row_len, fill);
+                                }
 
-                            bb.finish()
-                        })
+                                bb.finish()
+                            })
                     } else {
                         None
                     };
@@ -411,28 +551,44 @@ fn eval_if_family<'a, 'b>(
                         continue;
                     }
 
-                    // Compute mask for this chunk
+                    // Compute mask for this chunk.
+                    use crate::args::CriteriaPredicate;
+                    if matches!(
+                        pred,
+                        CriteriaPredicate::Gt(_)
+                            | CriteriaPredicate::Ge(_)
+                            | CriteriaPredicate::Lt(_)
+                            | CriteriaPredicate::Le(_)
+                            | CriteriaPredicate::Eq(LiteralValue::Number(_) | LiteralValue::Int(_))
+                            | CriteriaPredicate::Ne(LiteralValue::Number(_) | LiteralValue::Int(_))
+                    ) && crit_num_slices[j].is_none()
+                    {
+                        crit_num_slices[j] = Some(
+                            crit_specs[j]
+                                .0
+                                .as_ref()
+                                .unwrap()
+                                .slice_numbers(row_start, row_len),
+                        );
+                    }
                     let num_col = crit_num_slices[j]
                         .as_ref()
                         .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
-                    let text_col = crit_text_slices[j]
-                        .as_ref()
-                        .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
 
-                    let m = match (pred, num_col, text_col) {
-                        (crate::args::CriteriaPredicate::Gt(n), Some(nc), _) => {
+                    let m = match (pred, num_col) {
+                        (crate::args::CriteriaPredicate::Gt(n), Some(nc)) => {
                             cmp::gt(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
                         }
-                        (crate::args::CriteriaPredicate::Ge(n), Some(nc), _) => {
+                        (crate::args::CriteriaPredicate::Ge(n), Some(nc)) => {
                             cmp::gt_eq(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
                         }
-                        (crate::args::CriteriaPredicate::Lt(n), Some(nc), _) => {
+                        (crate::args::CriteriaPredicate::Lt(n), Some(nc)) => {
                             cmp::lt(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
                         }
-                        (crate::args::CriteriaPredicate::Le(n), Some(nc), _) => {
+                        (crate::args::CriteriaPredicate::Le(n), Some(nc)) => {
                             cmp::lt_eq(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
                         }
-                        (crate::args::CriteriaPredicate::Eq(v), nc, tc) => {
+                        (crate::args::CriteriaPredicate::Eq(v), nc) => {
                             match v {
                                 LiteralValue::Number(x) => {
                                     let nx = *x;
@@ -538,7 +694,7 @@ fn eval_if_family<'a, 'b>(
                                 }
                             }
                         }
-                        (crate::args::CriteriaPredicate::Ne(v), nc, tc) => match v {
+                        (crate::args::CriteriaPredicate::Ne(v), nc) => match v {
                             LiteralValue::Number(x) => {
                                 let nx = *x;
                                 if let Some(nc) = nc {
@@ -632,7 +788,7 @@ fn eval_if_family<'a, 'b>(
                                 bb.finish()
                             }
                         },
-                        (crate::args::CriteriaPredicate::TextLike { .. }, _, _) => {
+                        (crate::args::CriteriaPredicate::TextLike { .. }, _) => {
                             let mut bb =
                                 arrow_array::builder::BooleanBuilder::with_capacity(row_len);
                             let view = crit_specs[j].0.as_ref().unwrap();
@@ -759,6 +915,16 @@ fn eval_if_family<'a, 'b>(
                     }
                 }
             }
+        }
+        // COUNTIF's logical range can extend beyond physically stored rows.
+        // Every cell in that tail is Empty: account for it arithmetically,
+        // without allocating masks or iterating a million empty cells.
+        if !multi
+            && agg_type == AggregationType::Count
+            && criteria_match(&crit_specs[0].1, &LiteralValue::Empty)
+        {
+            let logical_cells = logical_count_cells.unwrap_or(dims.0 as u64 * dims.1 as u64);
+            total_count += logical_cells.saturating_sub(visited_rows as u64 * dims.1 as u64) as i64;
         }
     } else {
         // Scalar driver fallback
@@ -1610,16 +1776,19 @@ impl Function for CountBlankFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut cnt = 0i64;
         for a in args {
-            match resolve_aggregate_argument(a, ctx)? {
+            let (argument, logical_cells) = resolve_count_argument(a, ctx)?;
+            match argument {
                 AggregateArgument::Range(view) => {
                     let mut tag_it = view.type_tags_slices();
                     let mut text_it = view.text_slices();
+                    let mut visited_cells = 0u64;
 
                     while let (Some(tag_res), Some(text_res)) = (tag_it.next(), text_it.next()) {
                         let (_, _, tag_cols) = tag_res?;
                         let (_, _, text_cols) = text_res?;
 
                         for (tc, xc) in tag_cols.into_iter().zip(text_cols.into_iter()) {
+                            visited_cells += tc.len() as u64;
                             let text_arr = xc
                                 .as_any()
                                 .downcast_ref::<arrow_array::StringArray>()
@@ -1636,6 +1805,10 @@ impl Function for CountBlankFn {
                             }
                         }
                     }
+                    let (rows, cols) = view.dims();
+                    cnt += logical_cells
+                        .unwrap_or(rows as u64 * cols as u64)
+                        .saturating_sub(visited_cells) as i64;
                 }
                 AggregateArgument::ReferenceError(error) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
@@ -1672,11 +1845,127 @@ mod tests {
     use crate::traits::ArgumentHandle;
     use formualizer_common::LiteralValue;
     use formualizer_parse::parser::{ASTNode, ASTNodeType};
+    #[test]
+    fn expanded_count_view_keeps_argument_cancellation() {
+        use crate::engine::{CancelToken, Engine, EvalConfig};
+        use crate::traits::CalcValue;
+        use formualizer_common::ExcelErrorKind;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        #[derive(Debug)]
+        struct Probe(Arc<AtomicBool>);
+        impl Function for Probe {
+            func_caps!(PURE, REDUCTION, WINDOWED, STREAM_OK);
+            fn arg_schema(&self) -> &'static [ArgSchema] {
+                &ARG_ANY_ONE[..]
+            }
+            fn name(&self) -> &'static str {
+                "COUNT_EXPANSION_CANCEL_PROBE"
+            }
+            fn eval<'a, 'b, 'c>(
+                &self,
+                args: &'c [ArgumentHandle<'a, 'b>],
+                ctx: &dyn FunctionContext<'b>,
+            ) -> Result<CalcValue<'b>, ExcelError> {
+                let AggregateArgument::Range(original) = resolve_aggregate_argument(&args[0], ctx)?
+                else {
+                    panic!("expected original range");
+                };
+                assert_eq!(
+                    original.dims(),
+                    (10, 1),
+                    "probe must take the expansion branch"
+                );
+                let (AggregateArgument::Range(view), logical) =
+                    resolve_count_argument(&args[0], ctx)?
+                else {
+                    panic!("expected an expanded count view");
+                };
+                assert_eq!(view.dims(), (11, 1));
+                assert_eq!(logical, Some(1_048_576));
+                ctx.cancellation_token()
+                    .expect("active request token")
+                    .cancel();
+                let cancelled = matches!(view.iter_row_chunks().next(), Some(Err(error)) if error.kind == ExcelErrorKind::Cancelled);
+                self.0.store(cancelled, Ordering::SeqCst);
+                Ok(CalcValue::Scalar(LiteralValue::Boolean(cancelled)))
+            }
+        }
+        let observed = Arc::new(AtomicBool::new(false));
+        let workbook = TestWorkbook::new().with_function(Arc::new(Probe(Arc::clone(&observed))));
+        let mut engine = Engine::new(workbook, EvalConfig::default());
+        engine
+            .set_cell_formula(
+                "Data",
+                10,
+                3,
+                formualizer_parse::parser::parse("=SEQUENCE(2,3)").unwrap(),
+            )
+            .unwrap();
+        engine
+            .set_cell_formula(
+                "Results",
+                1,
+                1,
+                formualizer_parse::parser::parse("=COUNT_EXPANSION_CANCEL_PROBE(Data!C:C)")
+                    .unwrap(),
+            )
+            .unwrap();
+        let result = engine.evaluate_all_cancellable(CancelToken::new());
+        assert!(result.is_ok() || result.unwrap_err().kind == ExcelErrorKind::Cancelled);
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "expanded iteration must retain the argument's cancellation token, not just rely on a later engine checkpoint"
+        );
+    }
+
     fn interp(wb: &TestWorkbook) -> crate::interpreter::Interpreter<'_> {
         wb.interpreter()
     }
     fn lit(v: LiteralValue) -> ASTNode {
         ASTNode::new(ASTNodeType::Literal(v), None)
+    }
+
+    #[test]
+    fn criteria_mask_memo_is_lazy_and_bounded() {
+        let mut memo = CriteriaMaskMemo::default();
+        let small = std::sync::Arc::new(BooleanArray::from(vec![true; 1024]));
+        assert!(memo.get_or_build((0, 0), || Some(small.clone())).is_some());
+        assert!(
+            memo.get_or_build((0, 0), || panic!("rebuilt mask"))
+                .is_some()
+        );
+        assert!(memo.get_or_build((1, 0), || None).is_none());
+        assert!(
+            memo.get_or_build((1, 0), || panic!("retried unsupported mask"))
+                .is_none()
+        );
+        let oversized =
+            std::sync::Arc::new(BooleanArray::from(vec![true; CRITERIA_MASK_MEMO_BYTES * 8]));
+        assert!(memo.get_or_build((2, 0), || Some(oversized)).is_some());
+        assert!(!memo.masks.contains_key(&(2, 0)));
+        // COUNTIF on a one-row wide range builds distinct tiny masks, not shared
+        // buffers. Include both mask allocations and the backing table in the gate.
+        for col in 1..16_384 {
+            memo.get_or_build((0, col), || {
+                Some(std::sync::Arc::new(BooleanArray::from(vec![true])))
+            });
+        }
+        let arrays_and_owners: usize = memo
+            .masks
+            .values()
+            .flatten()
+            .map(|m| m.get_array_memory_size() + 16 + 2 * 128)
+            .sum();
+        let buckets = (memo.masks.capacity() + 1).next_power_of_two();
+        let table_bytes = buckets
+            * (std::mem::size_of::<((usize, usize), Option<std::sync::Arc<BooleanArray>>)>() + 1);
+        assert!(arrays_and_owners + table_bytes <= CRITERIA_MASK_MEMO_BYTES);
+        assert!(memo.bytes <= CRITERIA_MASK_MEMO_BYTES);
+        assert!(memo.masks.len() < 16_384);
     }
 
     #[test]

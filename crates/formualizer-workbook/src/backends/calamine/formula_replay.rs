@@ -347,6 +347,26 @@ impl HybridFormulaReplaySpool {
         }
     }
 
+    fn read_at(&mut self, offset: u64) -> Result<OwnedSpoolFormulaRecord, SpoolError> {
+        if offset < HEADER_LEN as u64 || offset >= self.encoded_bytes {
+            return Err(SpoolError::Truncated);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(file) = self.file.as_mut() {
+            let mut reader = BufReader::new(
+                file.as_file()
+                    .try_clone()
+                    .map_err(|e| SpoolError::Io(e.kind()))?,
+            );
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| SpoolError::Io(e.kind()))?;
+            return decode_frame_from_reader(&mut reader, &mut (self.encoded_bytes - offset));
+        }
+        let mut cursor = usize::try_from(offset).map_err(|_| SpoolError::OffsetOverflow)?;
+        decode_frame(&self.memory, &mut cursor)
+    }
+
     pub(super) fn peak_memory_bytes(&self) -> u64 {
         self.peak_memory_bytes
     }
@@ -373,7 +393,14 @@ impl HybridFormulaReplaySpool {
     }
 }
 
+type ExactReplayLocator = (Vec<(u32, u32, u64)>, Vec<(usize, u64)>);
+
 pub(super) struct CalamineDeferredFormulaReplay {
+    /// Lazy, text-free coordinate/offset locator. None means not scanned yet;
+    /// The second buffer maps shared ids to anchor offsets, never anchor text.
+    /// Err means unsupported metadata requires conservative replay.
+    ordinary_index: Option<Result<ExactReplayLocator, ()>>,
+    cache_footprint: std::sync::Arc<std::sync::atomic::AtomicU64>,
     spool: HybridFormulaReplaySpool,
     sheet_name: String,
     sheet_instance: u32,
@@ -386,6 +413,8 @@ impl CalamineDeferredFormulaReplay {
         sheet_instance: u32,
     ) -> Self {
         Self {
+            ordinary_index: None,
+            cache_footprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             spool,
             sheet_name,
             sheet_instance,
@@ -453,14 +482,19 @@ impl CalamineDeferredFormulaReplay {
         row: u32,
         col: u32,
     ) -> Result<Option<DeferredReplayFormula>, String> {
-        let mut found = None;
+        let mut found: Option<DeferredReplayFormula> = None;
         let sheet_instance = self.sheet_instance;
         replay_spool_with_family(
             &mut self.spool,
             &self.sheet_name,
             |_, _| true,
             |sequence, coord0, text, family| {
-                if coord0.row + 1 == row && coord0.col + 1 == col {
+                if coord0.row + 1 == row
+                    && coord0.col + 1 == col
+                    && found
+                        .as_ref()
+                        .is_none_or(|prior| prior.source_order < SourceFormulaOrder::new(sequence))
+                {
                     let family = family.map(|shared_index| SourceFamilyId {
                         sheet_instance,
                         source_index: shared_index,
@@ -483,6 +517,10 @@ impl CalamineDeferredFormulaReplay {
 }
 
 impl DeferredFormulaReplay for CalamineDeferredFormulaReplay {
+    fn selection_cache_footprint(&self) -> Option<std::sync::Weak<std::sync::atomic::AtomicU64>> {
+        Some(std::sync::Arc::downgrade(&self.cache_footprint))
+    }
+
     fn replay(
         &mut self,
         disposition: &FormulaReplayDisposition,
@@ -496,6 +534,179 @@ impl DeferredFormulaReplay for CalamineDeferredFormulaReplay {
         partitions: &[PartitionedSourceFormulaFamily],
     ) -> Result<Vec<DeferredReplayFormula>, String> {
         self.replay_routed(disposition, partitions)
+    }
+
+    fn replay_selected_ordinary(
+        &mut self,
+        coordinates: &[(u32, u32)],
+        checkpoint: &mut dyn FnMut(u64, u64) -> Result<(), formualizer_common::ExcelError>,
+    ) -> Result<Option<Vec<DeferredReplayFormula>>, formualizer_common::ExcelError> {
+        Ok(self
+            .replay_selected_exact(coordinates, checkpoint)?
+            .filter(|records| records.iter().all(|record| record.family.is_none())))
+    }
+
+    fn replay_selected_exact(
+        &mut self,
+        coordinates: &[(u32, u32)],
+        checkpoint: &mut dyn FnMut(u64, u64) -> Result<(), formualizer_common::ExcelError>,
+    ) -> Result<Option<Vec<DeferredReplayFormula>>, formualizer_common::ExcelError> {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        let error =
+            |e: SpoolError| ExcelError::new(ExcelErrorKind::Value).with_message(e.to_string());
+        if self.ordinary_index.is_none() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let encoded_bytes = self.spool.encoded_bytes;
+            let mut iter = self.spool.replay().map_err(error)?;
+            let mut index = Vec::new();
+            let mut anchors = Vec::new();
+            loop {
+                checkpoint(1, 0)?;
+                let offset = match &iter {
+                    FormulaReplayIter::Memory { cursor, .. } => *cursor as u64,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    FormulaReplayIter::Native { remaining, .. } => encoded_bytes - remaining,
+                };
+                let Some(record) = iter.next() else {
+                    break;
+                };
+                let coord0 = match record.map_err(error)? {
+                    OwnedSpoolFormulaRecord::Ordinary { coord0, .. }
+                    | OwnedSpoolFormulaRecord::SharedDescendant { coord0, .. } => coord0,
+                    OwnedSpoolFormulaRecord::SharedAnchor {
+                        coord0,
+                        shared_index,
+                        ..
+                    } => {
+                        if anchors.len() == anchors.capacity() {
+                            let additional = anchors.capacity().max(16);
+                            checkpoint(0, additional as u64 * 16)?;
+                            let admitted_capacity = anchors.capacity() + additional;
+                            anchors.try_reserve_exact(additional).map_err(|_| {
+                                ExcelError::new(ExcelErrorKind::Value)
+                                    .with_message("shared anchor locator allocation failed")
+                            })?;
+                            checkpoint(0, (anchors.capacity() - admitted_capacity) as u64 * 16)?;
+                        }
+                        anchors.push((shared_index, offset));
+                        coord0
+                    }
+                    OwnedSpoolFormulaRecord::Unsupported { .. } => {
+                        self.ordinary_index = Some(Err(()));
+                        return Ok(None);
+                    }
+                };
+                if index.len() == index.capacity() {
+                    let additional = index.capacity().max(256);
+                    checkpoint(0, (additional as u64).saturating_mul(16))?;
+                    let admitted_capacity = index.capacity() + additional;
+                    index.try_reserve_exact(additional).map_err(|_| {
+                        ExcelError::new(ExcelErrorKind::Value)
+                            .with_message("ordinary source locator allocation failed")
+                    })?;
+                    // Allocators may provide more capacity than requested. Admit
+                    // that excess before this allocation can become retained.
+                    checkpoint(0, (index.capacity() - admitted_capacity) as u64 * 16)?;
+                }
+                index.push((coord0.row + 1, coord0.col + 1, offset));
+            }
+            checkpoint(
+                (index.len() as u64)
+                    .saturating_mul(u64::from(usize::BITS - index.len().max(1).leading_zeros())),
+                0,
+            )?;
+            index.sort_unstable();
+            if !anchors.is_empty() {
+                checkpoint(anchors.len() as u64 * 64, 0)?;
+                anchors.sort_unstable();
+            }
+            self.cache_footprint.store(
+                index.capacity() as u64 * std::mem::size_of::<(u32, u32, u64)>() as u64
+                    + anchors.capacity() as u64 * std::mem::size_of::<(usize, u64)>() as u64,
+                std::sync::atomic::Ordering::Release,
+            );
+            self.ordinary_index = Some(Ok((index, anchors)));
+        }
+        let Some(Ok((index, anchors))) = &self.ordinary_index else {
+            return Ok(None);
+        };
+        let mut formulas = Vec::new();
+        for &(row, col) in coordinates {
+            checkpoint(1, 0)?;
+            let start = index.partition_point(|&(r, c, _)| (r, c) < (row, col));
+            for &(_, _, offset) in index[start..]
+                .iter()
+                .take_while(|&&(r, c, _)| (r, c) == (row, col))
+            {
+                checkpoint(1, 0)?;
+                let record = self.spool.read_at(offset).map_err(error)?;
+                let (sequence, coord0, text, family) = match record {
+                    OwnedSpoolFormulaRecord::Ordinary {
+                        sequence,
+                        coord0,
+                        text,
+                    } => (sequence, coord0, text, None),
+                    OwnedSpoolFormulaRecord::SharedAnchor {
+                        sequence,
+                        coord0,
+                        text,
+                        shared_index,
+                        ..
+                    } => (sequence, coord0, text, Some(shared_index)),
+                    OwnedSpoolFormulaRecord::SharedDescendant {
+                        sequence,
+                        coord0,
+                        shared_index,
+                    } => {
+                        let start = anchors.partition_point(|&(id, _)| id < shared_index);
+                        let end = anchors.partition_point(|&(id, _)| id <= shared_index);
+                        let family_anchors = &anchors[start..end];
+                        if family_anchors.is_empty() {
+                            // Full replay's established missing-anchor policy remains authoritative.
+                            return Ok(None);
+                        }
+                        let preceding =
+                            family_anchors.partition_point(|&(_, anchor)| anchor < offset);
+                        let anchor_offset = family_anchors[preceding.saturating_sub(1)].1;
+                        checkpoint(1, 0)?;
+                        let OwnedSpoolFormulaRecord::SharedAnchor {
+                            coord0: anchor,
+                            text: template,
+                            ..
+                        } = self.spool.read_at(anchor_offset).map_err(error)?
+                        else {
+                            unreachable!()
+                        };
+                        let mut text = String::new();
+                        expand_shared_formula_into(
+                            &template,
+                            (anchor.row, anchor.col),
+                            (coord0.row, coord0.col),
+                            &mut text,
+                        )
+                        .map_err(|e| {
+                            ExcelError::new(ExcelErrorKind::Value).with_message(e.to_string())
+                        })?;
+                        (sequence, coord0, text, Some(shared_index))
+                    }
+                    OwnedSpoolFormulaRecord::Unsupported { .. } => return Ok(None),
+                };
+                let family = family.map(|source_index| SourceFamilyId {
+                    sheet_instance: self.sheet_instance,
+                    source_index,
+                });
+                formulas.push(DeferredReplayFormula {
+                    source_order: SourceFormulaOrder::new(sequence),
+                    row: coord0.row + 1,
+                    col: coord0.col + 1,
+                    text,
+                    family,
+                    partition_owner: family,
+                });
+            }
+        }
+        formulas.sort_by_key(|formula| formula.source_order);
+        Ok(Some(formulas))
     }
 
     fn formula_at(&mut self, row: u32, col: u32) -> Result<Option<DeferredReplayFormula>, String> {
@@ -1704,6 +1915,351 @@ mod tests {
             allow_disk,
             spill_files_remaining: 1,
             spill_files_limit: 1,
+        }
+    }
+
+    #[test]
+    fn indexed_ordinary_selection_preserves_duplicate_coordinate_source_order() {
+        let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+        ));
+        for (sequence, text) in [(20, "2"), (10, "1"), (30, "3")] {
+            spool
+                .append(SpoolFormulaRecord::Ordinary {
+                    sequence,
+                    coord0: coord(0, 0),
+                    text,
+                })
+                .unwrap();
+        }
+        let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+        let records = replay
+            .replay_selected_ordinary(&[(1, 1)], &mut |_, _| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+        let mut disposition = FormulaReplayDisposition::default();
+        disposition.extend_suppressed_excel_coords([(1, 1)]);
+        assert!(replay.replay(&disposition).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indexed_shared_forward_override_lookup_uses_source_order_not_emission_order() {
+        let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+        ));
+        spool
+            .append(SpoolFormulaRecord::SharedDescendant {
+                sequence: 0,
+                coord0: coord(1, 1),
+                shared_index: 9,
+            })
+            .unwrap();
+        spool
+            .append(SpoolFormulaRecord::Ordinary {
+                sequence: 1,
+                coord0: coord(1, 1),
+                text: "99",
+            })
+            .unwrap();
+        spool
+            .append(SpoolFormulaRecord::SharedAnchor {
+                sequence: 2,
+                coord0: coord(0, 1),
+                shared_index: 9,
+                declared_range: None,
+                text: "A1+1",
+            })
+            .unwrap();
+        let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+        assert_eq!(replay.formula_at(2, 2).unwrap().unwrap().text, "99");
+        let selected = replay
+            .replay_selected_exact(&[(2, 2)], &mut |_, _| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A2+1", "99"]
+        );
+        let mut work = 0;
+        assert!(
+            replay
+                .replay_selected_exact(&[(2, 2)], &mut |units, _| {
+                    work += units;
+                    if work >= 3 {
+                        Err(formualizer_common::ExcelError::new(
+                            formualizer_common::ExcelErrorKind::Value,
+                        )
+                        .with_message("cancelled anchor read"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert!(
+            replay
+                .cache_footprint
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        );
+        assert_eq!(
+            replay
+                .replay_selected_exact(&[(2, 2)], &mut |_, _| Ok(()))
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(replay.formula_at(2, 2).unwrap().unwrap().text, "99");
+    }
+
+    #[test]
+    fn indexed_shared_selection_preserves_forward_anchors_overrides_and_bounded_reads() {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        for disk in [false, true] {
+            let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+                u64::MAX,
+                u64::MAX,
+                if disk { 1 } else { u64::MAX },
+                u64::MAX,
+                disk,
+            ));
+            spool
+                .append(SpoolFormulaRecord::SharedDescendant {
+                    sequence: 0,
+                    coord0: coord(1, 1),
+                    shared_index: 9,
+                })
+                .unwrap();
+            spool
+                .append(SpoolFormulaRecord::SharedAnchor {
+                    sequence: 1,
+                    coord0: coord(0, 1),
+                    shared_index: 9,
+                    declared_range: None,
+                    text: "A1+1",
+                })
+                .unwrap();
+            for row in 2..10_000 {
+                spool
+                    .append(SpoolFormulaRecord::SharedDescendant {
+                        sequence: row as u64,
+                        coord0: coord(row, 1),
+                        shared_index: 9,
+                    })
+                    .unwrap();
+            }
+            spool
+                .append(SpoolFormulaRecord::Ordinary {
+                    sequence: 10000,
+                    coord0: coord(1, 1),
+                    text: "99",
+                })
+                .unwrap();
+            // A repeated shared index changes subsequent descendants' template,
+            // but must not change the original forward descendant's expansion.
+            spool
+                .append(SpoolFormulaRecord::SharedAnchor {
+                    sequence: 10001,
+                    coord0: coord(0, 2),
+                    shared_index: 9,
+                    declared_range: None,
+                    text: "A1+100",
+                })
+                .unwrap();
+            spool
+                .append(SpoolFormulaRecord::SharedDescendant {
+                    sequence: 10002,
+                    coord0: coord(1, 2),
+                    shared_index: 9,
+                })
+                .unwrap();
+            let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+            assert!(replay.ordinary_index.is_none());
+            let mut work = 0;
+            assert!(
+                replay
+                    .replay_selected_exact(&[(2, 2)], &mut |units, _| {
+                        work += units;
+                        if work > 100 {
+                            Err(ExcelError::new(ExcelErrorKind::Value)
+                                .with_message("cancelled locator"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+            );
+            assert!(replay.ordinary_index.is_none());
+            let mut bytes = 0;
+            let first = std::time::Instant::now();
+            let selected = replay
+                .replay_selected_exact(&[(2, 2), (2, 3)], &mut |_, allocation| {
+                    bytes += allocation;
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                selected.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                ["A2+1", "99", "A2+100"]
+            );
+            let first = first.elapsed();
+            let repeated = std::time::Instant::now();
+            let mut work = 0;
+            for row in 3..103 {
+                let selected = replay
+                    .replay_selected_exact(&[(row, 2)], &mut |units, _| {
+                        work += units;
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected.len(), 1);
+                assert_eq!(selected[0].text, format!("A{row}+1"));
+            }
+            assert_eq!(work, 300);
+            eprintln!(
+                "shared locator disk={disk} bytes={bytes} first={first:?} next100={:?} work={work}",
+                repeated.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_ordinary_selection_is_lazy_bounded_and_retryable() {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        for disk in [false, true] {
+            let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+                u64::MAX,
+                u64::MAX,
+                if disk { 1 } else { u64::MAX },
+                u64::MAX,
+                disk,
+            ));
+            for row in 0..10_000 {
+                spool
+                    .append(SpoolFormulaRecord::Ordinary {
+                        sequence: row as u64,
+                        coord0: coord(row, 0),
+                        text: "1+2",
+                    })
+                    .unwrap();
+            }
+            let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+            assert!(replay.ordinary_index.is_none());
+            let footprint = replay.selection_cache_footprint().unwrap();
+            let mut scanned = 0;
+            let failure = replay
+                .replay_selected_ordinary(&[(1, 1)], &mut |work, _| {
+                    scanned += work;
+                    if scanned > 32 {
+                        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(failure.kind, ExcelErrorKind::Cancelled);
+            assert!(replay.ordinary_index.is_none());
+            let denied = replay.replay_selected_ordinary(&[(1, 1)], &mut |_, bytes| {
+                if bytes > 0 {
+                    Err(ExcelError::new(ExcelErrorKind::Value)
+                        .with_message("injected locator admission denial"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(denied.is_err());
+            assert!(replay.ordinary_index.is_none());
+            assert_eq!(
+                footprint
+                    .upgrade()
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            // Cancel on the first indexed lookup, after construction/publication.
+            let mut sorted = false;
+            let failed = replay.replay_selected_ordinary(&[(1, 1)], &mut |work, _| {
+                if sorted {
+                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                }
+                sorted = work > 10_000;
+                Ok(())
+            });
+            assert!(failed.is_err());
+            let capacity = replay
+                .ordinary_index
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .capacity() as u64
+                * 16;
+            assert_eq!(
+                footprint
+                    .upgrade()
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::Acquire),
+                capacity
+            );
+            let mut bytes = 0;
+            let started = std::time::Instant::now();
+            let records = replay
+                .replay_selected_ordinary(&[(1, 1)], &mut |_, allocated| {
+                    bytes += allocated;
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            let first = started.elapsed();
+            assert_eq!(records.len(), 1);
+            assert_eq!(bytes, 0, "retry reuses the retained locator");
+            assert!((160_000..=320_000).contains(&capacity));
+            let mut work = 0;
+            let started = std::time::Instant::now();
+            for row in 2..=101 {
+                let records = replay
+                    .replay_selected_ordinary(&[(row, 1)], &mut |units, allocated| {
+                        work += units;
+                        assert_eq!(allocated, 0);
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].row, row);
+            }
+            assert_eq!(work, 200);
+            eprintln!(
+                "ordinary locator disk={disk} records=10000 locator_bytes={capacity} retry={first:?} next100={:?} bounded_work={work}",
+                started.elapsed()
+            );
+            drop(replay);
+            assert!(
+                footprint.upgrade().is_none(),
+                "observation must not retain a dead cache"
+            );
         }
     }
 

@@ -4,14 +4,114 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+## [0.9.3] - 2026-09-11
+
+- Aligned Rust product crates and Python/npm bindings at 0.9.3. Parser/common move together to **3.1.2** because the date/time text parsing change below lives in `formualizer-common`; `formualizer-parse` moves in lockstep with no source change and product crates now pin `formualizer-parse = "3.1.2"`. SheetPort spec remains 0.3.1.
+
 ### Changed
+
+- Date/time text parsing accepts more Excel-compatible forms: single-digit years (`"1/2/5"`), `24:00`/`24:00:00` as midnight, truncated fractional seconds on a full `HH:MM:SS.f` field, and month-year-only forms (`"Jan 2003"`, `"January 2003"`) resolving to the first of the month. The month-year form requires a four-digit year, so `"Jan 3"` is not read as `2003-01-01`, and fractional-second truncation only fires when the dot terminates a full `HH:MM:SS` field, so a single-colon `"12:00.5"` is rejected as `#VALUE!` rather than silently accepted as `12:00`. Partially addresses #290; the `"24:00"`-as-a-full-day arithmetic case, sub-second retention, and `DATEVALUE`/`TIMEVALUE` datetime routing are tracked separately in #416. (#398)
+
+### Fixed
+
+- Computed the standard normal CDF with the Hart (1968) rational approximation as given by West (2005), replacing the Abramowitz & Stegun 7.1.26 formula that was accurate only to about 7e-8. `NORM.S.DIST`, `NORM.DIST`, `LOGNORM.DIST`, `GAUSS` and `Z.TEST` now agree with a 90-digit reference to about 2e-16 absolute error across the sampled real line, and `NORM.S.DIST(0,TRUE)` is exactly 0.5. Corrected a mistyped Cody CALERF constant in the small-argument `ERF` branch that skewed `ERF`, `ERF.PRECISE`, `ERFC` and `ERFC.PRECISE` by up to about 1e-7 near the origin. Relative accuracy in the far tails, large-argument `ERFC`, the inverse-normal family and the `Z.TEST` sample-versus-population deviation convention are tracked separately in #464. Contributed by @cloudexible. (#458, #461)
+- Fixed endian-sensitive Bessel word extraction and integer-overflow paths, preserving extreme-order parity. `BESSELJ`/`BESSELY` now reject recurrence orders above 1,000,000 with `#NUM!` instead of risking unbounded work; existing constant-time paths remain available. No order-only or Debye cutoff fabricates zero/infinity for representable results. (#465)
+
+- Prevent spills from overwriting pending formulas without preparing blockers; retain bounded, admitted retry regions and release failed reservations. Existing interactive Empty-overlay visibility remains unchanged.
+
+- Fixed logged workbook formula setters silently swallowing binding/admission failures and clearing existing spills on rejection. Rejected assignments now report errors like unlogged setters; existing deferred-validation and non-atomic batch policies remain unchanged. Added fallible low-level editor APIs without changing legacy signatures. See [formula assignment contracts](docs/formula-assignment-failures.md). (#451)
+- Fixed dependency edges disappearing across split bulk-ingest calls and stale consumers after bulk formula replacement. Complete initial loads retain their fast path. (#456)
+- Preserved imported/staged formula sources after compressed preparation failures so inspection, edits and retries remain possible; corrected inspection of formula text without a leading `=` without changing genuine string-literal formulas. (#452, #455)
+- Fixed blank criteria masks mistaking absent numeric/boolean text-lane data for empty cells, without adding numeric-string caches. Mixed wildcard masks now preserve the existing scalar matching policy across imported and edited data. (#457)
+- Counted implicit blanks in COUNTIF/COUNTBLANK ranges arithmetically while keeping physical views bounded, including direct whole-row/column extents and available spill members beyond graph placement bounds. This addresses part of #285, not all blank-range or cross-engine criteria semantics. See [criteria compatibility](docs/criteria-ingest-compatibility.md).
+- Isolated ordinary and supported shared/fragmented Calamine formula targets from unrelated preparation failures using indexed source selection. Partial families retain validated residual compression; complete-family demands retain compressed preparation without per-member AST expansion. Preserve source order, selected edits, retries and retained locator admission. Unsupported/reconciliation-dependent sources remain conservative; shared coordinate metadata adds disclosed linear cold storage. See [target preparation](docs/imported-target-preparation.md). (#453)
+- Documented and tested the existing preparation-error boundary: spreadsheet guards do not turn unresolved-sheet/table preparation or request-level admission/cancellation failures into fallback values. No new reference-error policy was introduced. (#454)
+
+### Python bindings
+
+- Added a Python undo/redo/cancel regression suite with real outcome assertions; the two pre-existing defects it exposes (#301, #412) are pinned as strict expected failures rather than hidden. Contributed by @Ocean82. (#401)
+
+### Security and hardening
+
+- Bumped the docs site's `fumadocs-mdx` from 14 to 15, dropping the transitive `js-yaml` dependency flagged by SNYK-JS-JSYAML-18313070, and aligned `fumadocs-core`/`fumadocs-ui` with the MDX upgrade. Docs-site only; no published package payload changes. Contributed by @Ocean82. (#402)
+
+## [0.9.2] - 2026-09-10
+
+- Aligned Rust product crates and Python/npm bindings at 0.9.2; parser/common remain at 3.1.1 and SheetPort spec at 0.3.1. Cache-only XLSX APIs are additive and explicitly invoked; Python support is native-only, not Pyodide.
+- Added explicitly invoked cache-only XLSX recalculation through Calamine, available by default in `formualizer-workbook` and the facade through the removable `xlsx-recalc` feature, with bounded namespace-aware admission, typed cache repair, source-epoch handling and package-preserving ZIP32 writeback. Unsupported metadata/results fail without publishing partial output.
+- Exposed the shared cache-only core through Rust byte/file APIs, Python byte/file functions and a WASM `Uint8Array` API, without changing existing workbook APIs.
+- Added cancellable Calamine byte ingestion and cooperative read/row/replay checkpoints.
+
+- Added `UmyaAdapter::into_document` for both Umya backends, allowing evaluator ingestion and rich-document ownership to share one import without cloning or serializing the workbook.
+
+- Added the opt-in `umya3` backend to `formualizer-workbook` and the facade (0.9.1), sharing adapter algorithms with the unchanged Umya 2 backend.
+- Fixed lost border colours on Umya 3.1 XLSX import and colour-selector collisions during export using paired, bounded compatibility I/O. The cold writer repairs emitted colour definitions and style references from the authoritative document, retaining RGB/indexed/theme identity and tint without reimporting a workbook or evaluator.
+
+## [0.9.0] - 2026-09-06
+
+### Highlights
+
+- Improved lookup, reference-returning conditional, LET/LAMBDA, and temporal-value compatibility.
+- Fixed stale results after structural, named-symbol, logged, and atomic edits, with broader FormulaPlane parity coverage.
+- Reduced repeated criteria work, registry locking, range traversal, and schedule copying; exactly converged nonvolatile cycles can remain clean between recalculations.
+- Added Python workbook clock control, hardened parser and binding error paths, and corrected release package contents.
+
+### Compatibility notes
+
+- Rust callers constructing or matching `RangeKey::OpenRect` must use its four independent optional axis bounds instead of the former two optional coordinates. (#371)
+- Review temporal egress and runtime XLSX source selection below when upgrading. The `mmap` feature is now a compatibility no-op; mapping is an explicit runtime choice.
+- Product crates and Python/npm bindings move to **0.9.0**; common/parse move together to **3.1.1**. `sheetport-spec` remains **0.3.1** and the internal C ABI crate remains **0.1.0**.
+
+### Changed
+
+- **Exactly converged circular cells are no longer re-run on every recalc.** Under `CyclePolicy::Iterate` the engine redirtied every iterating SCC at the end of each recalc, so every circular cell in a workbook was re-evaluated on every recalculation, like Excel. An SCC is now retained clean across recalcs when the recalc that iterated it stopped because every member reproduced its previous value exactly — `|Δ| == 0` for numbers, identity for text, booleans and errors, and never a NaN identity — before the `max_iterations` cap, with no volatile and no dynamic-reference (`INDIRECT`/`OFFSET`) member. Such an SCC is a fixed point of its own inputs, so re-running it with the same inputs cannot change a value: it runs again only when the dirty graph reaches a member (a precedent edit, a formula change, a structural edit, a name rebinding) or when a config knob that can change its result changes between recalcs (cycle policy or tolerance, date system, workbook seed, volatile level, deterministic mode, range-expansion limits) or when a function that a member calls is registered or replaced in the function registry. Tolerance-only convergence (`|Δ| < max_change` but non-zero), capped SCCs (including the `max_iterations: 1` accumulator contract) and volatile cycles keep re-running every recalc, exactly as before. Retention is unconditional (there is no knob): it changes only the work done, never a value, and retained SCCs are invalidated by the same machinery that invalidates every other formula. `CycleTelemetry::reused_sccs` and `CycleTelemetry::reused_scc_members` count the retained SCCs served without a re-run in a request, and `EngineBaselineStats::retained_scc_members` reports the retained population. Measured in release on 78 ring SCCs of 120 members each (9,360 circular cells) plus three downstream column families: a no-change recalc goes 70 ms -> 0.3 ms, an unrelated-cell edit 84 ms -> 0.9 ms, and an edit feeding one SCC goes 72 ms -> 2.6 ms with exactly one SCC re-run (two passes), on identical checksums. (#368)
+
+- FormulaPlane correctness now covers mixed-pass named-symbol scheduling with dynamic fail-closed preflight, format preservation across broadcast and computed-overlay writeback, transactional demotion of retained spans before Off-mode legacy evaluation without FormulaPlane dispatch, and dependent healing after name redefinition.
+- FormulaPlane now admits `IF`, `IFS`, and `CHOOSE` spans when every result arm is a single cell or a statically scalar expression. Range, open-range, named, volatile, and dynamic-reference arms remain on the legacy path.
+- Added the `CELL` and `HYPERLINK` builtins. Per the determinism decision in #239, `CELL` implements only the workbook/cell-property info types — `contents`, `address`, `col`, `row` and `type` — while host-dependent selectors (`format`, `filename`, `parentheses`, `prefix`, `protect`, `width`) and calls without a reference return `#VALUE!`. Argument errors propagate with their own kind (`=CELL("row",1/0)` is `#DIV/0!`), `contents` and `type` accept a literal in the reference position, and 3-D references are rejected. `HYPERLINK` returns its friendly name or link location as text. `CELL` is context-dependent (`WorkbookMetadata`) like `SHEET`/`SHEETS`, so the formula-plane ingest rejects it. Off-sheet `address` qualification is fixed as part of #333; `CELL("contents", <blank>)` still yields Empty rather than Excel's `0` and is left open there pending the #319 blank-coercion study. (#329)
+- Calamine XLSX path loading now selects its retained backing source at runtime with `XlsxPathSource::{SharedFile, DirectMmap}`. `SharedFile` remains the safe default; explicit `DirectMmap` never silently falls back and carries a caller-enforced no-destructive-mutation contract. Python exposes the same choice through `XlsxPathSource` on `load_workbook` and `Workbook.load_path`.
+
+  **The `mmap` Cargo feature no longer selects any behaviour.** Enabling it does not change how `SpreadsheetReader::open_path` loads a file: the default source is `XlsxPathSource::SharedFile` with or without the feature, and `XlsxPathSource::DirectMmap` is the only way to obtain a memory mapping. The feature is retained purely so existing `features = ["mmap"]` declarations keep compiling; it is a no-op alias and can be dropped from downstream manifests. A test compiled only under `--features calamine,mmap` pins this.
+
+  **`memmap2` is now an unconditional dependency of the `calamine` feature** (on `unix` and `windows` targets; it is not pulled in on wasm). It was previously reachable only through `mmap`. Keeping it behind `mmap` was considered and rejected: because mapping is now a runtime choice on a public enum variant, gating the dependency would make `XlsxPathSource::DirectMmap` return `ErrorKind::Unsupported` in every default `calamine` build — including the Python extension, which enables `calamine` but not `mmap` — and would reintroduce exactly the build-time behaviour selection this change removes. `memmap2` is a small, dependency-free crate, so the unconditional cost is one extra compilation unit.
+
+- The Calamine `SharedFile` XLSX source now keeps a 64 KiB per-cursor readahead window behind the shared file lock, so a ZIP scanner's many small reads coalesce into few locked `seek`+`read` pairs. The window is keyed by absolute offset, so seeks landing inside it are served from memory. Measured on a 60 MiB, 12-sheet package with 48 scoped names and eight external-link targets, counting `read` syscalls on the workbook fd: metadata-forced 268 -> 17, open-only 69 -> 11; on a 46 KiB package, metadata-forced 255 -> 14. Wall time is unchanged. Snapshot semantics are unchanged — `SharedFile` was never a snapshot, and concurrent truncation still surfaces as ordinary EOF/I/O/ZIP errors.
 
 - Named-range definitions now track structural inserts and deletes like all other references; previously they stayed pinned to their original coordinates. Deleting a band containing a name target now invalidates the definition to `#REF!`. (#170)
 - Computed temporals are numeric during evaluation (`ISNUMBER`/`TYPE` now match Excel). Native scalar, range, table, Python, and SheetPort egress materializes date/time values from the cell's effective format; callers can opt into uniform raw serials. A known datetime class preserves midnight datetimes, while calamine's code-lossy date-ish signal can only classify pure fractions as time, day-plus-fraction serials as datetime, and integers as date.
 - Arrow dependencies upgraded 58.2 → 59.2 across `formualizer-eval` (`arrow`, `arrow-array`, `arrow-buffer`, `arrow-schema`, `arrow-select`, `arrow-cast`). No API or behaviour change; full suite green on the pinned surface, native and wasm32.
 
+- **Parser/SDK track `parse-v3.1.1`.** The previously published 3.1.0 track introduced `NumberFormat`, `FormatClass`, and `numfmt::builtin_code`. This release advances both parser-track crates to 3.1.1 for parser hardening and package-content corrections; product crates now pin `formualizer-parse = "3.1.1"`. Release preflight requires matching common/parse versions and actual registry availability before the product track can publish. (#439, #444)
+- Pyodide wheel documentation now reflects distribution reality: native wheels are on PyPI, while Pyodide wheels are built and smoke-tested and retained as the `wheels-pyodide` Actions artifact for download or self-hosting from a compatible wheel URL.
+
+### Performance
+
+- Bounded range traversal to relevant row segments and projected numeric/error lanes without repeatedly materializing unrelated values. Preserved order, overlays, ownership and cancellation behavior. Synthetic results and the small generic-head regression are documented in the benchmark report; these are not universal workbook speedup claims. (#436)
+- Shared immutable cached legacy schedules instead of deep-copying nested vectors on eligible requests. Cache eligibility and target routing are unchanged. Synthetic same-chain edit/recalculation medians improved, with shared-host attribution limits and a small alternating-case regression retained in the report. (#441)
+
+- **Reduced criteria, registry, and exact-lookup overhead.** Criteria masks are memoized per invocation, predicate, and column with a conservative 1 MiB admission charge; ordinary registry hits take a read lock and clone only the current function handle; exact indexes are reclaimed at exclusive Engine snapshot-mutation boundaries with retained-payload admission accounting. Matching rules are unchanged; tranche probes show less repeated mask work and fewer direct-registry allocations, while no-edit lookup recalculation reuses the index. (#431)
+
 ### Fixed
 
+- Resolved LET/LAMBDA locals before workbook named-range lookup in range-consuming arguments, so expressions such as `LET(r,A1:A3,SUM(r))` work and local names consistently shadow workbook names. (#339)
+- Preserved selected references through `IF`, `IFS`, and `CHOOSE`, allowing compositions such as `OFFSET(IF(TRUE,A1,B1),2,0)`. `IFERROR` and `IFNA` remain value-returning. (#369)
+- Propagated `IF` condition errors unchanged without evaluating either arm. (#372)
+- Made bounded single-cell `INDEX` selection read only the selected cell, avoiding phantom cycles under runtime cycle detection with bulk ingest. Static-cycle behavior and other INDEX shapes remain unchanged. (#370)
+- Preserved independent row/column bounds in open ranges, fixed zero-column plan labels, and handled wholly unbounded range dependencies without dropping coverage. (#371, #377)
+- Treated an omitted `XLOOKUP` fallback as absent rather than numeric zero, and kept exact text needles from matching numeric cells. (#340)
+
+- Logged formula/topology edits, atomic commits, and undo/redo now invalidate cached schedules and retained plans according to the replayed operation. Partial replay failures invalidate before returning; existing-cell value-only edits preserve eligible schedule hits while clearing lookup snapshots. (#435)
+
+- Logged Engine mutations now use a complete operation-local capture for graph rollback, Arrow mirroring, FormulaPlane invalidation, and explicit action journals before publishing to the caller's optional audit `ChangeLog`. Disabled, zero-cap, and saturated audit policies no longer make a direct edit or atomic rollback incomplete, and failed actions no longer evict older retained audit entries. Retention policy is unchanged: index-based `undo_logged` can replay only events still present in its external log and cannot recover disabled or evicted history; explicit `ActionJournal` undo/redo remains the retention-independent path. (#434)
+
+- **FormulaPlane first evaluation is linear again when a rejected legacy formula column sits next to accepted spans.** The mixed-schedule dirty projection merged every changed cell into its consumer's dirty domain with a clone-and-compare `Vec` union, so a column of `n` dirty legacy cells cost O(n²) on the all-dirty first evaluation whenever any span was present on the sheet. On a running-balance column (`InternalDependency` reject) plus two unrelated span families, the Authoritative penalty over `Off` grew 37 → 168 → 736 → 3,100 ms across 2,400 / 4,680 / 9,360 / 18,720 rows (4.2x to 4.5x per doubling, `probe-fp-reject-chain --spans 2`); it is now 2 → 13 → 9 → 56 ms, an Authoritative/Off ratio of 1.03x to 1.11x at every size. Dirty domains now accumulate through a hash-backed `DirtyDomainAccumulator` shared by the closure and the mixed scheduler, with identical output (arrival order, cross-kind dedupe, `Whole` absorption). `probe-fp-reject-chain --spans 2 --max-ratio 3` pins the shape in the parity workflow. (#405)
+- Approximate `MATCH` over an array literal now applies the same sortedness guard as the reference-backed path and as `VLOOKUP`/`HLOOKUP`, so `MATCH(2.5, {3,2,1}, 1)` returns `#N/A` on data that is not ascending instead of a silently wrong position. Previously the array-literal branch called the unguarded search, so an ascending `MATCH` over descending data returned a match while the equivalent `VLOOKUP(..., TRUE)` returned `#N/A` — a new inconsistency introduced by the very change meant to make lookups consistent. The guard now lives in the shared `binary_search_match` (ascending for `match_type` 1, descending for -1). The `MATCH`, `VLOOKUP` and `HLOOKUP` docstrings, and the generated `vlookup`/`hlookup` reference pages, are corrected to describe the `#N/A`-on-unsorted behaviour rather than the previous "can return incorrect rows". (#283)
+- Exact `MATCH`, `VLOOKUP` and `HLOOKUP` no longer select a blank candidate as numeric zero; their blank lookup values still select real numeric zero, including signed `-0`. In exact and wildcard modes, `XMATCH` and `XLOOKUP` instead match a blank lookup value only to a blank candidate, choosing the first or last blank according to search direction. Numeric zero never selects a blank, empty text remains distinct, and indexed and scan paths agree. (#319)
+- FormulaPlane span evaluation now fails closed when a placement produces an array result instead of collapsing it to the array's top-left element. A span publishes exactly one value per placement, while the legacy evaluator routes `LiteralValue::Array` results into the spill planner, so the collapse would have broadcast a single value across the whole span while legacy spilled a rectangle. The sink now returns a typed error before anything is published; the coordinator drops the layer's uncommitted write buffer, transactionally demotes the offending span to legacy vertices, and replans, so the placements re-evaluate on the legacy path with correct spill semantics. No stock template reaches this today — it is a fail-closed backstop for future dynamic-array admission — and it is pinned by a test-only function with declared-scalar semantics that returns an array at runtime. (#388)
+- **A row or column delete inside a FormulaPlane span no longer serves pre-delete values when the span's reads are displaced from its placements.** A span whose formulas read a band elsewhere on the sheet (e.g. `C150:C270` holding `=A{r-140}`) survived a delete that straddled its result domain by *compacting*: the domain closed over the deleted band, the template AST was kept verbatim and only the origin was carried through the delete. That keeps one relative offset for the whole surviving domain, but placements above the band keep their authored offset while placements below move up and must read the same cells as before — two different offsets. Deleting rows 200:201 left `C200` serving `=A60`'s value where Excel and the legacy per-cell path serve `=A62`'s; trimming the head with the origin row surviving diverged the same way. Compaction is now gated on an explicit frame identity (read, placement and origin displacement must satisfy `d_r == d_p - d_o` for every relative read bound of every surviving placement, and no read bound may land inside the deleted band); when it does not hold the span splits at the deleted band into an untouched upper half and a shifted lower half — the same surgery mid-domain inserts already use — and demotes to per-cell formulas when that split is not provably clean. Lockstep deletes, tail trims and whole-span shifts still compact into a single span. (#171)
+- **Deleting or rebinding a name no longer leaves formula-backed dependent names serving stale values.** `DependencyGraph::delete_name` and `update_name` dirtied the deleted name's dependents with a non-propagating mark, which is correct for a grid formula (a leaf of the invalidation walk) but wrong for a dependent that is itself a name vertex: a `NamedDefinition::Formula` such as `B_name = "=A_name*2"` was dirtied and recomputed, while every cell reading `B_name` kept its cached value. With `A_name -> $A$1`, `B_name = "=A_name*2"` and `C1 = "=B_name"`, deleting `A_name` left `C1` at its old number instead of `#NAME?`, and later writes to `A1` did not reach it either. A cell referencing the deleted name directly always invalidated correctly; only the name-to-name edge was missed. Both paths now propagate through `mark_dirty_many` (which honours deferred-dirty scopes), and `delete_name` additionally re-extracts the dependency edges of affected name vertices via `rebuild_name_dependencies`, the same healing pass cell formulas already received, so a later define re-binds them. (#365)
+
+- FormulaPlane computed-format writes now commit with values and stale-sideband purging only after authoritative commit-window preflight, without per-placement locks or virgin-lane format hash work. General recomputation clears only covered computed formats, and General source-format runs now fall through to computed formats while genuine source and user-overlay formats retain precedence.
 - SheetPort ports now coerce temporal values to the manifest-declared type at the port boundary: `number`/`integer` ports receive serials regardless of the engine's `TemporalEgress` policy, and `date`/`datetime` ports receive native temporals; the manifest is the protocol contract, engine egress is only a default.
 - Date arithmetic no longer conditionally propagates `LiteralValue::Date`; a position-keyed, non-sticky scalar format annotation carries temporal display class independently, fixing #312 without exposing annotations to bulk numeric kernels. Date-plus-time yields datetime, date-plus-percent and date-plus-plain-number yield date, and unspecified class pairs drop the annotation. Selection functions preserve the chosen scalar annotation, including `IFERROR`, `IFNA`, and scalar-argument `MAX`/`MIN`; `MAX`/`MIN` over multi-cell ranges do not yet recover the winning cell's format.
 - Before merge, the unreleased format channel was hardened so row, column, and sheet structural edits purge affected derived-format positions, and value/formula writes invalidate format state in both ephemeral and interactive/changelog modes. This prevents shifted plain values and logged overwrites from inheriting stale temporal formats; neither pre-merge regression shipped.
@@ -25,6 +125,32 @@ All notable changes to Formualizer will be documented in this file.
   A **structural edit on a completely unrelated sheet** dropped formula→name edges. Deleting row 1 or column 1 of the default sheet swept up any name vertex parked at `$A$1` as an ordinary resident of that row or column and deleted it, taking its edges with it — even when both the formula and the name's target lived on another sheet entirely. Subsequent changes to the name's target no longer dirtied the formula, which then served silently stale values. (#302)
 
   Symbol vertices now hold a `SymbolAddr` in an address space disjoint from the grid's, and the structures keyed by position — the cell index, the per-sheet range index, and the iteration that drives every structural edit — accept a `GridAddr`, which a symbol cannot produce. `NameScope` is now purely lookup metadata and no longer decides where a vertex lives. Evaluation results are unchanged; a name's scope, resolution and dirty propagation all behave exactly as before.
+
+### Python bindings
+
+- Added `Workbook.set_deterministic_clock` to pin time on an existing workbook for its next recalculation, including deterministic embedding and Pyodide use. (#341)
+- Accepted `NImpl` and `Error` in `LiteralValue.error`, allowing all canonical error kinds to round-trip. (#354)
+- Replaced panicking AST/Token conversions and a Sheet cache-lock unwrap with Python error propagation while preserving callback reentrancy guards. (#404)
+
+### Packaging
+
+- Included canonical project license texts in Rust, Python, and npm package payloads. Python's declared license remains MIT; shipping both repository texts does not change that declaration. The published `sheetport-spec` 0.3.1 payload is unchanged. (#444)
+- Pinned native Rust/package release builds to Rust 1.93.0; Pyodide retains its xbuildenv-derived toolchain. Made release-preflight fixtures independent of the product version. (#442, #444)
+
+### Security and hardening
+
+- Bounded parser recursion to 72 parser frames so excessively nested formulas return a parser error instead of exhausting the stack, with accepted-boundary coverage for 64 nested calls and parentheses. The limit counts parser frames rather than Excel nesting levels; recursive destruction of very long flat ASTs remains a separate known limitation (#411). Original recursion guard contributed by @chiliec. (#408)
+- Release preflight now fails closed when declared binding feature profiles drift from the canonical value-feature policy; Pyodide's explicit `system-clock` opt-out remains the only approved exception. (#433)
+
+- Bumped the docs site to Next.js `16.2.11`, clearing nine npm advisories affecting `next` `16.2.6` (four high: GHSA-89xv-2m56-2m9x, GHSA-p9j2-gv94-2wf4, GHSA-6gpp-xcg3-4w24, GHSA-m99w-x7hq-7vfj). The docs site's `bun.lock` was removed; `pnpm-lock.yaml` is the only lockfile the site builds and deploys from.
+
+### Known limitations
+
+- Workbook undo can drop a dependent formula edge after writing a referenced empty cell (#301), leave a retained formula AST and dependency edge referring to different rows after undoing a logged row insertion (#303), truncate the changelog and lose the undone operation's audit record (#367), or leave an evaluated formula written to a fresh cell in place (#412). Long flat, left-associative chains can overflow the stack during recursive AST drop even when parsing returns `Ok` (#411).
+
+### Contributors
+
+Thanks to @Ocean82, @chiliec, and @tommy230 for contributed fixes, parser hardening, and independently captured lookup compatibility cases and reruns. The integration preserves original authorship. (#438, #439)
 
 ## [0.8.4] - 2026-08-14
 
@@ -492,7 +618,8 @@ All notable changes to Formualizer will be documented in this file.
 
 - Incomplete product release due to partial publication during the release workflow. Superseded by `0.5.1`.
 
-[Unreleased]: https://github.com/PSU3D0/formualizer/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/PSU3D0/formualizer/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/PSU3D0/formualizer/compare/v0.8.4...v0.9.0
 [0.8.4]: https://github.com/PSU3D0/formualizer/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/PSU3D0/formualizer/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/PSU3D0/formualizer/compare/v0.8.1...v0.8.2

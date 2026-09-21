@@ -15,6 +15,9 @@ fn xlookup_numeric_zero_does_not_match_whole_column_blanks() {
 
     // ES-058: numeric zero does not select a blank candidate, including the
     // trimmed whole-column path.
+    // Lookup column A has no used rows; XLOOKUP(0,...) should NOT match blank
+    // cells because Excel's exact match distinguishes blank from zero (#319).
+    // The "not found" value "NF" is returned.
     engine
         .set_cell_formula("Sheet1", 1, 3, parse("=XLOOKUP(0,A:A,B:B,\"NF\")").unwrap())
         .unwrap();

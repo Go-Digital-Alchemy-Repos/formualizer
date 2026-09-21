@@ -1,6 +1,6 @@
 [package]
 name = "formualizer-workbook"
-version = "0.8.4"
+version = "0.9.3"
 edition = "2024"
 description = "Ergonomic workbook API over the Formualizer engine (sheets, loaders, staging, undo/redo)"
 homepage.workspace = true
@@ -14,7 +14,7 @@ categories = ["data-structures", "mathematics"]
 [dependencies]
 formualizer-parse = { workspace = true }
 formualizer-common = { workspace = true }
-formualizer-eval = { path = "../formualizer-eval", version = "0.8.4", default-features = false }
+formualizer-eval = { path = "../formualizer-eval", version = "0.9.3", default-features = false }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
@@ -29,15 +29,27 @@ quick-xml = { version = "0.39", features = ["encoding"], optional = true }
 [features]
 # system-clock: forwards eval's ambient-time feature (Local::now/Utc::now).
 # Enabled by default for native + wasm-js consumers. Disable for portable wasm guests.
-default = ["json", "csv", "system-clock"]
+default = ["json", "csv", "system-clock", "xlsx-recalc"]
 system-clock = ["formualizer-eval/system-clock"]
 # js-runtime: forwards eval's browser/wasm-bindgen runtime feature.
 # Activates web-time + JS getrandom. NOT enabled by default.
-js-runtime = ["formualizer-eval/js-runtime"]
+js-runtime = ["formualizer-eval/js-runtime", "getrandom04?/wasm_js"]
 json = ["dep:serde_json", "formualizer-common/serde"]
 csv = ["dep:csv"]
-calamine = ["dep:calamine", "dep:zip", "dep:quick-xml"]
+# `memmap2` is unconditional here on purpose: `XlsxPathSource::DirectMmap` is a
+# runtime choice on a public enum, so gating the dependency behind `mmap` would
+# make that variant fail with ErrorKind::Unsupported in every default calamine
+# build (including the Python extension, which enables calamine but not mmap).
+calamine = ["dep:calamine", "dep:zip", "dep:quick-xml", "dep:memmap2"]
+# Package-preserving XLSX formula-cache recalculation through Calamine and ZIP.
+xlsx-recalc = ["calamine"]
 umya = ["dep:umya-spreadsheet", "dep:zip", "dep:quick-xml"]
+umya3 = ["dep:umya-spreadsheet3", "dep:zip", "dep:quick-xml", "dep:getrandom04"]
+# No-op compatibility alias, retained only so existing `features = ["mmap"]`
+# declarations keep compiling. It selects no behaviour: `open_path` uses
+# `XlsxPathSource::SharedFile` with or without it, and mapping is reachable only
+# through the explicit `XlsxPathSource::DirectMmap`. Safe to drop downstream.
+# Pinned by `legacy_mmap_feature_does_not_select_path_behaviour`.
 mmap = ["dep:memmap2"]
 io_builtins = []
 import_range = ["io_builtins"]
@@ -53,10 +65,6 @@ wasm_runtime_wasmtime = ["wasm_plugins", "dep:wasmtime"]
 
 [dependencies.calamine]
 version = "0.36"
-optional = true
-
-[dependencies.memmap2]
-version = "0.9"
 optional = true
 
 [dependencies.reqwest]
@@ -79,12 +87,19 @@ optional = true
 tempfile = { workspace = true }
 wasmtime = { version = "43.0.2", optional = true }
 
+[target.'cfg(any(unix, windows))'.dependencies]
+memmap2 = { version = "0.9", optional = true }
+
 [dev-dependencies]
-formualizer-eval = { path = "../formualizer-eval", version = "0.8.4", default-features = false, features = ["test-support"] }
+formualizer-eval = { path = "../formualizer-eval", version = "0.9.3", default-features = false, features = ["test-support"] }
 wasm-encoder = "0.240"
 formualizer-testkit = { path = "../formualizer-testkit" }
 tempfile = { workspace = true }
 umya-spreadsheet = "=2.3.2"
+
+[[example]]
+name = "cache_recalculate"
+required-features = ["xlsx-recalc"]
 
 [[test]]
 name = "calamine"
@@ -92,9 +107,27 @@ path = "tests/calamine/mod.rs"
 required-features = ["calamine"]
 
 [[test]]
+name = "umya3_export"
+path = "tests/umya3_export.rs"
+required-features = ["umya3"]
+
+[[test]]
+name = "umya3_border_import"
+path = "tests/umya3_border_import.rs"
+required-features = ["umya3"]
+
+[[test]]
 name = "umya"
 path = "tests/umya/mod.rs"
 required-features = ["umya"]
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom04 = { package = "getrandom", version = "0.4", optional = true }
+
+[dependencies.umya-spreadsheet3]
+version = "=3.1.0"
+package = "umya-spreadsheet"
+optional = true
 
 [dependencies.umya-spreadsheet]
 version = "=2.3.2"

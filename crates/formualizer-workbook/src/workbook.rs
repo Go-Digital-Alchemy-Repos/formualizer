@@ -2246,14 +2246,15 @@ impl Workbook {
 
                     self.engine
                         .edit_with_logger(&mut self.log, |editor| {
-                            editor.set_cell_formula_with_old_state(
+                            editor.try_set_cell_formula_with_old_state(
                                 cell,
                                 ast,
                                 old_value,
                                 old_formula,
-                            );
+                            )
                         })
-                        .map_err(|e| IoError::from_backend("editor", e))?;
+                        .map_err(|e| IoError::from_backend("editor", e))?
+                        .map_err(IoError::Engine)?;
 
                     self.engine.clear_staged_formula_text(sheet, row, col);
                     if let Some(before) = staged_before {
@@ -2296,9 +2297,10 @@ impl Workbook {
                 );
                 self.engine
                     .edit_with_logger(&mut self.log, |editor| {
-                        editor.set_cell_formula(cell, ast);
+                        editor.try_set_cell_formula(cell, ast)
                     })
-                    .map_err(|e| IoError::from_backend("editor", e))?;
+                    .map_err(|e| IoError::from_backend("editor", e))?
+                    .map_err(IoError::Engine)?;
                 self.engine.clear_staged_formula_text(sheet, row, col);
                 if let Some(before) = staged_before {
                     self.record_staged_formula_cell_change(sheet, row, col, before, None);
@@ -2656,7 +2658,9 @@ impl Workbook {
         }
     }
 
-    // Batch set formulas in a rectangle starting at (start_row,start_col)
+    /// Set formulas in a rectangle starting at `(start_row, start_col)`.
+    /// In graph mode, an error may leave the successful prefix committed; this is
+    /// not an atomic batch. Deferred mode stages text for validation at preparation.
     pub fn set_formulas(
         &mut self,
         sheet: &str,
@@ -2746,7 +2750,9 @@ impl Workbook {
                             };
                             let ast = formualizer_parse::parser::parse(&with_eq)
                                 .map_err(|e| IoError::from_backend("parser", e))?;
-                            editor.set_cell_formula(cell, ast);
+                            editor
+                                .try_set_cell_formula(cell, ast)
+                                .map_err(IoError::Engine)?;
                         }
                     }
                     Ok(())

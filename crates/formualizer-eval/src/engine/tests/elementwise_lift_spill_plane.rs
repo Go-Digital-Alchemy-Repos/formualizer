@@ -128,39 +128,28 @@ fn elementwise_lift_over_a_range_is_admitted_by_the_template_plane() {
     }
 }
 
-/// MEASURED DEFECT, NOT A SPECIFICATION. Do not read the expectations below as
-/// desired behaviour; they record what the engine does today so that a fix is
-/// visible as a change here.
+/// The element-wise lift keeps its spill even when the experimental
+/// FormulaPlane owns the span.
 ///
-/// When the experimental FormulaPlane owns a span, its span evaluator writes
-/// each placement through `formula_plane::span_eval::literal_to_overlay`, whose
-/// `LiteralValue::Array` arm keeps only the top-left element. That is sound
-/// only under the plane's stated invariant ("FormulaPlane rejects spill-capable
-/// formulas", `engine/inspect.rs`), and the preceding test measures that the
-/// invariant does not hold for an element-wise lift. The consequence, measured
-/// here: the anchor keeps the first element and the rest of the spill is
-/// silently dropped.
+/// HISTORY. This test was banked by GOD-286/CL-087 as a MEASURED DEFECT: the
+/// plane's span evaluator wrote each placement through
+/// `formula_plane::span_eval::literal_to_overlay`, whose `LiteralValue::Array`
+/// arm kept only the top-left element, so an element-wise lift inside a span
+/// silently lost the rest of its spill. The fix was out of that round's scope.
 ///
-/// PRE-EXISTING, NOT A GOD-286 REGRESSION. ABS is included as the control: it
-/// lifted through the retired name allowlist before this round
-/// (`"ABS" | "LEN" | "ISNUMBER" | "SQRT" => Some(vec![0])`), its `MAY_SPILL`
-/// capability is unchanged by this round, and `git diff 1a831439..HEAD` touches
-/// no file under `formula_plane/` or `engine/arena/`. The round widens the set
-/// of callees that reach this defect; it does not create it.
-///
-/// The fix is NOT in this round's scope: making the plane reject only the
-/// call sites that actually lift a range requires a per-call-site change in
-/// `template_canonical`, `engine/arena/canonical` and
-/// `formula_plane/dependency_summary` together. Declaring `MAY_SPILL` on the
-/// element-wise set instead was tried and MEASURED to contradict 14 standing
-/// plane assertions (among them
-/// `formula_plane_dependency_summary_accepts_abs_with_cell_arg`), which pin
-/// that a pure scalar callee with a CELL argument stays plane-admissible.
+/// Upstream fixed it (#388): `literal_to_overlay` now FAILS CLOSED on an array
+/// result (`SpanEvalError::ArrayResultRequiresSpill`), the plane demotes the
+/// span and the legacy authority re-evaluates it, so the spill lands in full.
+/// The expectations below were flipped to the fixed behaviour when upstream
+/// v0.9.3 was merged: the plane holds NO active span for these 200 formulas
+/// (it demoted), and both authorities produce the same three-cell spill.
+/// ABS is kept as the pre-existing control, on the same terms.
 ///
 /// The layout keeps each spill on its own row (a 1x3 horizontal range spilling
-/// three columns wide), so 200 copied formulas form one span without colliding.
+/// three columns wide), so 200 copied formulas would form one span if the plane
+/// retained them.
 #[test]
-fn elementwise_lift_inside_a_formula_plane_span_drops_its_spill() {
+fn elementwise_lift_inside_a_formula_plane_span_keeps_its_spill() {
     const ROWS: u32 = 200;
 
     fn build(mode: FormulaPlaneMode, callee: &str) -> Engine<TestWorkbook> {
@@ -211,8 +200,8 @@ fn elementwise_lift_inside_a_formula_plane_span_drops_its_spill() {
     );
     assert_eq!(
         plane.baseline_stats().formula_plane_active_span_count,
-        1,
-        "the 200 copied formulas form exactly one plane span"
+        0,
+        "the plane demotes the span rather than collapsing the spill (#388)"
     );
     for row in [1u32, 7, ROWS] {
         assert_eq!(
@@ -222,8 +211,8 @@ fn elementwise_lift_inside_a_formula_plane_span_drops_its_spill() {
         );
         assert_eq!(
             row_block(&plane, row),
-            vec![Some(LiteralValue::Number(2023.0)), None, None],
-            "MEASURED DEFECT: the plane keeps only the top-left element at row {row}"
+            numbers([2023.0, 2023.0, 2023.0]),
+            "the plane authority spills in full at row {row}"
         );
     }
 
@@ -236,7 +225,7 @@ fn elementwise_lift_inside_a_formula_plane_span_drops_its_spill() {
     );
     assert_eq!(
         row_block(&plane_abs, 1),
-        vec![Some(LiteralValue::Number(45000.0)), None, None],
-        "MEASURED DEFECT, pre-existing: ABS loses its spill the same way"
+        numbers([45000.0, 45001.0, 45002.0]),
+        "ABS, the pre-existing control, spills in full too"
     );
 }

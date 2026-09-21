@@ -456,6 +456,9 @@ fn find_exact_number_in_view(
         }
     }
 
+    // Excel exact-match semantics: blank cells are NOT equal to numeric
+    // zero. MATCH(0, {blank,1,2}, 0) returns #N/A, not a position. (#319)
+
     Ok(None)
 }
 
@@ -711,6 +714,148 @@ mod tests {
             find_exact_index_in_view(&view, &wildcard, true, DateSystem::Excel1900).unwrap(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn find_exact_number_in_view_does_not_match_blank_as_zero() {
+        // Regression test for #319: MATCH(0, {blank, 1, 2}, 0) must return
+        // None (which surfaces as #N/A), not match the blank cell.
+        let values = vec![
+            LiteralValue::Empty,
+            LiteralValue::Number(1.0),
+            LiteralValue::Number(2.0),
+        ];
+        let engine = build_vertical_text_engine(&values, 8);
+        let range = ReferenceType::range(
+            Some("Sheet1".to_string()),
+            Some(1),
+            Some(1),
+            Some(3),
+            Some(1),
+        );
+        let view = engine.resolve_range_view(&range, "Sheet1").unwrap();
+
+        // Searching for 0 must NOT match the blank cell at index 0.
+        assert_eq!(
+            find_exact_index_in_view(
+                &view,
+                &LiteralValue::Number(0.0),
+                false,
+                DateSystem::Excel1900
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            find_exact_index_in_view(&view, &LiteralValue::Int(0), false, DateSystem::Excel1900)
+                .unwrap(),
+            None
+        );
+
+        // Ratified S6: a blank needle coerces to zero, not a blank candidate.
+        assert_eq!(
+            find_exact_index_in_view(&view, &LiteralValue::Empty, false, DateSystem::Excel1900)
+                .unwrap(),
+            None
+        );
+
+        // Searching for 1 still works normally.
+        assert_eq!(
+            find_exact_index_in_view(
+                &view,
+                &LiteralValue::Number(1.0),
+                false,
+                DateSystem::Excel1900
+            )
+            .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn zero_needles_only_find_real_zero_in_both_orientations() {
+        let values = vec![
+            LiteralValue::Empty,
+            LiteralValue::Text(String::new()),
+            LiteralValue::Text("0".into()),
+            LiteralValue::Boolean(false),
+            LiteralValue::Number(-0.0),
+            LiteralValue::Number(0.0),
+            LiteralValue::Empty,
+            LiteralValue::Boolean(false),
+            LiteralValue::Text("0".into()),
+        ];
+        let no_numeric_zero = vec![
+            LiteralValue::Empty,
+            LiteralValue::Text(String::new()),
+            LiteralValue::Text("0".into()),
+            LiteralValue::Boolean(false),
+            LiteralValue::Text("0".into()),
+            LiteralValue::Boolean(false),
+        ];
+        for vertical in [true, false] {
+            let make_rows = |values: &[LiteralValue]| {
+                if vertical {
+                    values.iter().cloned().map(|value| vec![value]).collect()
+                } else {
+                    vec![values.to_vec()]
+                }
+            };
+            let view = RangeView::from_owned_rows(make_rows(&values), DateSystem::Excel1900);
+            let missing_view =
+                RangeView::from_owned_rows(make_rows(&no_numeric_zero), DateSystem::Excel1900);
+            for needle in [
+                LiteralValue::Number(0.0),
+                LiteralValue::Number(-0.0),
+                LiteralValue::Empty,
+            ] {
+                assert_eq!(
+                    find_exact_index_in_view(&view, &needle, false, DateSystem::Excel1900).unwrap(),
+                    Some(4)
+                );
+                assert_eq!(
+                    find_exact_index_in_view(&missing_view, &needle, false, DateSystem::Excel1900)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn materialized_zero_needles_only_match_numeric_zero() {
+        let values = vec![
+            LiteralValue::Empty,
+            LiteralValue::Text(String::new()),
+            LiteralValue::Text("0".into()),
+            LiteralValue::Boolean(false),
+            LiteralValue::Number(-0.0),
+            LiteralValue::Number(0.0),
+            LiteralValue::Boolean(false),
+            LiteralValue::Text("0".into()),
+        ];
+        let no_numeric_zero = vec![
+            LiteralValue::Empty,
+            LiteralValue::Text(String::new()),
+            LiteralValue::Text("0".into()),
+            LiteralValue::Boolean(false),
+            LiteralValue::Text("0".into()),
+            LiteralValue::Boolean(false),
+        ];
+        for needle in [
+            LiteralValue::Number(0.0),
+            LiteralValue::Number(-0.0),
+            LiteralValue::Empty,
+        ] {
+            assert_eq!(
+                find_exact_index(&values, &needle, false, DateSystem::Excel1900),
+                Some(4)
+            );
+            assert_eq!(
+                find_exact_index(&no_numeric_zero, &needle, false, DateSystem::Excel1900),
+                None
+            );
+        }
     }
 
     #[test]

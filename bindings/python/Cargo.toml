@@ -1,6 +1,6 @@
 [package]
 name = "formualizer-python"
-version = "0.8.4"
+version = "0.9.3"
 publish = false
 edition = "2024"
 homepage = "https://github.com/PSU3D0/formualizer"
@@ -13,6 +13,10 @@ documentation = "https://pypi.org/project/formualizer/"
 build = "build.rs"
 keywords = ["spreadsheet", "excel", "formula", "python", "parser"]
 categories = ["api-bindings", "mathematics"]
+
+[package.metadata.formualizer-release.value-feature-opt-outs.python-pyodide]
+system-clock = "Pyodide/Emscripten deliberately uses a fixed or caller-injected clock instead of ambient wall-clock time."
+
 [lib]
 name = "formualizer_py"
 crate-type = ["cdylib", "rlib"]
@@ -45,7 +49,7 @@ formualizer-common = { path = "../../crates/formualizer-common", features = ["se
 # it the engine falls back to the FixedClock at the UTC epoch and every
 # volatile date/time builtin answers 1970-01-01. The emscripten target below is
 # left as-is: ambient wall-clock time is not part of the portable wasm profile.
-formualizer = { path = "../../crates/formualizer", default-features = false, features = ["eval", "workbook", "sheetport", "parse", "calamine", "umya", "system-clock"] }
+formualizer = { path = "../../crates/formualizer", default-features = false, features = ["eval", "workbook", "sheetport", "parse", "calamine", "umya", "xlsx-recalc", "system-clock"] }
 pyo3-stub-gen = "0.23.0"
 
 # Pyodide 0.29's wasm-EH sysroot is pinned to Rust 1.86, while Calamine 0.36

@@ -153,12 +153,17 @@ fn aggregate_overflow_sanitizes_to_num_error_and_scc_converges() {
     );
 
     // And stays converged: a no-edit recalc does NOT burn the pass budget
-    // (the old leak capped at 7 passes on every recalc, forever).
+    // (the old leak capped at 7 passes on every recalc, forever). The
+    // `#NUM!` fixed point is exact (error identity), so the SCC is retained
+    // and not re-run (#368).
     engine.evaluate_all().unwrap();
     let t = engine.last_cycle_telemetry();
-    assert_eq!(t.converged_sccs, 1);
+    assert_eq!(t.iterated_sccs, 0, "exact error fixed point is retained");
+    assert_eq!(t.reused_sccs, 1);
     assert_eq!(t.capped_sccs, 0);
-    assert!(t.settle_passes_total <= 6);
+    assert_eq!(t.settle_passes_total, 0);
+    assert_eq!(err_kind(&engine, "Sheet1", 1, 2), ExcelErrorKind::Num);
+    assert_eq!(err_kind(&engine, "Sheet1", 1, 3), ExcelErrorKind::Num);
 }
 
 #[test]

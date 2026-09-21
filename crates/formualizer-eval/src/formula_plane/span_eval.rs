@@ -16,6 +16,7 @@ use crate::engine::CancelToken;
 use crate::engine::arena::{AstNodeData, AstNodeId, CompactRefType, DataStore};
 use crate::engine::eval::ComputedWriteBuffer;
 use crate::engine::sheet_registry::SheetRegistry;
+use crate::format::FormatId;
 use crate::interpreter::{Interpreter, InterpreterParameterBindings};
 use crate::reference::CellRef;
 use crate::traits::EvaluationContext;
@@ -64,6 +65,16 @@ pub(crate) enum SpanEvalError {
     UnsupportedDirtyDomain,
     UnsupportedReferenceRelocation,
     Cancelled,
+    /// A placement evaluated to `LiteralValue::Array` (refs #388).
+    ///
+    /// Spans are a scalar-result surface: every placement owns exactly one
+    /// cell, so there is no way to publish an array without diverging from the
+    /// legacy evaluator, which routes array results into the spill planner.
+    /// Collapsing to the top-left element would silently broadcast one value
+    /// across the whole span while legacy spills, so span evaluation fails
+    /// closed here and the coordinator demotes the span to legacy vertices
+    /// before anything is published.
+    ArrayResultRequiresSpill,
 }
 
 pub(crate) struct SpanComputedWriteSink<'a> {
@@ -79,9 +90,19 @@ impl<'a> SpanComputedWriteSink<'a> {
         }
     }
 
-    pub(crate) fn push_cell(&mut self, placement: PlacementCoord, value: OverlayValue) {
-        self.buffer
-            .push_cell(placement.sheet_id, placement.row, placement.col, value);
+    pub(crate) fn push_cell(
+        &mut self,
+        placement: PlacementCoord,
+        value: OverlayValue,
+        format_id: Option<FormatId>,
+    ) {
+        self.buffer.push_cell_with_format(
+            placement.sheet_id,
+            placement.row,
+            placement.col,
+            value,
+            format_id,
+        );
         self.push_count = self.push_count.saturating_add(1);
     }
 
@@ -166,6 +187,11 @@ pub(crate) enum ErrorExtraAtom {
 struct MemoGroup {
     representative: PlacementCoord,
     placements: Vec<PlacementCoord>,
+}
+
+struct MemoGroupValue {
+    value: OverlayValue,
+    format_id: Option<FormatId>,
 }
 
 pub(crate) struct SpanEvaluator<'a> {
@@ -291,17 +317,15 @@ impl<'a> SpanEvaluator<'a> {
                 first_writable_placement.row,
                 first_writable_placement.col,
             ));
-            let value = match interpreter.evaluate_ast(&ast_tree) {
+            let (value, format_id) = match interpreter.evaluate_ast(&ast_tree) {
                 Ok(calc) => {
-                    self.context.record_cell_derived_format(
-                        self.current_sheet,
-                        first_writable_placement.row + 1,
-                        first_writable_placement.col + 1,
-                        calc.format_id(),
-                    );
-                    formula_result_to_overlay(calc.into_literal(), self.context.date_system())
+                    let format_id = calc.format_id();
+                    (
+                        formula_result_to_overlay(calc.into_literal(), self.context.date_system())?,
+                        format_id,
+                    )
                 }
-                Err(err) => OverlayValue::Error(map_error_code(err.kind)),
+                Err(err) => (OverlayValue::Error(map_error_code(err.kind)), None),
             };
 
             for (index, placement) in placements.iter().enumerate() {
@@ -311,7 +335,7 @@ impl<'a> SpanEvaluator<'a> {
                         report.skipped_overlay_punchout_count.saturating_add(1);
                     continue;
                 }
-                sink.push_cell(placement, value.clone());
+                sink.push_cell(placement, value.clone(), format_id);
                 report.span_eval_placement_count =
                     report.span_eval_placement_count.saturating_add(1);
             }
@@ -410,7 +434,7 @@ impl<'a> SpanEvaluator<'a> {
         origin_col: u32,
         binding_set: Option<&SpanBindingSet>,
         placement: PlacementCoord,
-    ) -> Result<OverlayValue, SpanEvalError> {
+    ) -> Result<MemoGroupValue, SpanEvalError> {
         let row_delta = i64::from(placement.row) + 1 - i64::from(origin_row);
         let col_delta = i64::from(placement.col) + 1 - i64::from(origin_col);
         let interpreter = Interpreter::new(self.context, self.current_sheet).with_current_cell(
@@ -432,15 +456,19 @@ impl<'a> SpanEvaluator<'a> {
                 self.sheet_registry,
             ) {
                 Ok(calc) => {
-                    self.context.record_cell_derived_format(
-                        self.current_sheet,
-                        placement.row + 1,
-                        placement.col + 1,
-                        calc.format_id(),
-                    );
-                    formula_result_to_overlay(calc.into_literal(), self.context.date_system())
+                    let format_id = calc.format_id();
+                    MemoGroupValue {
+                        value: formula_result_to_overlay(
+                            calc.into_literal(),
+                            self.context.date_system(),
+                        )?,
+                        format_id,
+                    }
                 }
-                Err(err) => OverlayValue::Error(map_error_code(err.kind)),
+                Err(err) => MemoGroupValue {
+                    value: OverlayValue::Error(map_error_code(err.kind)),
+                    format_id: None,
+                },
             }
         } else {
             match interpreter.evaluate_arena_ast_with_offset(
@@ -451,15 +479,19 @@ impl<'a> SpanEvaluator<'a> {
                 self.sheet_registry,
             ) {
                 Ok(calc) => {
-                    self.context.record_cell_derived_format(
-                        self.current_sheet,
-                        placement.row + 1,
-                        placement.col + 1,
-                        calc.format_id(),
-                    );
-                    formula_result_to_overlay(calc.into_literal(), self.context.date_system())
+                    let format_id = calc.format_id();
+                    MemoGroupValue {
+                        value: formula_result_to_overlay(
+                            calc.into_literal(),
+                            self.context.date_system(),
+                        )?,
+                        format_id,
+                    }
                 }
-                Err(err) => OverlayValue::Error(map_error_code(err.kind)),
+                Err(err) => MemoGroupValue {
+                    value: OverlayValue::Error(map_error_code(err.kind)),
+                    format_id: None,
+                },
             }
         };
         Ok(value)
@@ -490,7 +522,7 @@ impl<'a> SpanEvaluator<'a> {
                 binding_set,
                 placement,
             )?;
-            sink.push_cell(placement, value);
+            sink.push_cell(placement, value.value, value.format_id);
         }
         let count = writable_placements.len() as u64;
         report.transient_ast_relocation_count =
@@ -535,7 +567,7 @@ impl<'a> SpanEvaluator<'a> {
                 .collect::<Result<Vec<_>, _>>()
         })?;
         for (placement, value) in values {
-            sink.push_cell(placement, value);
+            sink.push_cell(placement, value.value, value.format_id);
         }
         let count = writable_placements.len() as u64;
         report.transient_ast_relocation_count =
@@ -695,7 +727,7 @@ impl<'a> SpanEvaluator<'a> {
         binding_set: &SpanBindingSet,
         group: &MemoGroup,
         base_interpreter: Option<&Interpreter<'a>>,
-    ) -> Result<OverlayValue, SpanEvalError> {
+    ) -> Result<MemoGroupValue, SpanEvalError> {
         let placement = group.representative;
         let row_delta = i64::from(placement.row) + 1 - i64::from(origin_row);
         let col_delta = i64::from(placement.col) + 1 - i64::from(origin_col);
@@ -732,15 +764,19 @@ impl<'a> SpanEvaluator<'a> {
             self.sheet_registry,
         ) {
             Ok(calc) => {
-                self.context.record_cell_derived_format(
-                    self.current_sheet,
-                    placement.row + 1,
-                    placement.col + 1,
-                    calc.format_id(),
-                );
-                formula_result_to_overlay(calc.into_literal(), self.context.date_system())
+                let format_id = calc.format_id();
+                MemoGroupValue {
+                    value: formula_result_to_overlay(
+                        calc.into_literal(),
+                        self.context.date_system(),
+                    )?,
+                    format_id,
+                }
             }
-            Err(err) => OverlayValue::Error(map_error_code(err.kind)),
+            Err(err) => MemoGroupValue {
+                value: OverlayValue::Error(map_error_code(err.kind)),
+                format_id: None,
+            },
         };
         Ok(value)
     }
@@ -748,12 +784,12 @@ impl<'a> SpanEvaluator<'a> {
     fn push_memo_group_value(
         &self,
         group: &MemoGroup,
-        value: OverlayValue,
+        value: MemoGroupValue,
         sink: &mut SpanComputedWriteSink<'_>,
         report: &mut SpanEvalReport,
     ) {
         for placement in &group.placements {
-            sink.push_cell(*placement, value.clone());
+            sink.push_cell(*placement, value.value.clone(), value.format_id);
             report.span_eval_placement_count = report.span_eval_placement_count.saturating_add(1);
         }
         report.memo_broadcast_count = report
@@ -1128,18 +1164,18 @@ fn validate_relocatable_compact_reference(reference: &CompactRefType) -> Result<
 fn literal_to_overlay(
     value: LiteralValue,
     date_system: formualizer_common::DateSystem,
-) -> OverlayValue {
-    match value {
+) -> Result<OverlayValue, SpanEvalError> {
+    Ok(match value {
         LiteralValue::Int(i) => OverlayValue::Number(i as f64),
         LiteralValue::Number(n) => OverlayValue::Number(n),
         LiteralValue::Text(s) => OverlayValue::Text(Arc::from(s)),
         LiteralValue::Boolean(b) => OverlayValue::Boolean(b),
-        LiteralValue::Array(mut rows) => rows
-            .get_mut(0)
-            .and_then(|row| row.get_mut(0))
-            .cloned()
-            .map(|value| literal_to_overlay(value, date_system))
-            .unwrap_or(OverlayValue::Empty),
+        // Fail closed (#388): never collapse an array to its top-left element.
+        // The legacy evaluator hands array results to the spill planner, so a
+        // collapse here would publish one value across every placement of the
+        // span. The caller demotes the span and re-evaluates it on the legacy
+        // path instead; nothing is published from this task.
+        LiteralValue::Array(_) => return Err(SpanEvalError::ArrayResultRequiresSpill),
         LiteralValue::Date(_) | LiteralValue::DateTime(_) | LiteralValue::Time(_) => value
             .as_serial_number_for(date_system)
             .map(OverlayValue::DateTime)
@@ -1151,13 +1187,13 @@ fn literal_to_overlay(
         LiteralValue::Empty => OverlayValue::Empty,
         LiteralValue::Pending => OverlayValue::Pending,
         LiteralValue::Error(err) => OverlayValue::Error(map_error_code(err.kind)),
-    }
+    })
 }
 
 fn formula_result_to_overlay(
     value: LiteralValue,
     date_system: formualizer_common::DateSystem,
-) -> OverlayValue {
+) -> Result<OverlayValue, SpanEvalError> {
     literal_to_overlay(
         crate::engine::result_finalization::finalize_formula_result(value),
         date_system,
@@ -1184,6 +1220,33 @@ mod tests {
     };
     use super::*;
 
+    /// Refs #388: an array result must never be collapsed to its top-left
+    /// element; the conversion fails closed so the coordinator can demote.
+    #[test]
+    fn array_results_fail_closed_instead_of_collapsing_to_top_left() {
+        let array = LiteralValue::Array(vec![
+            vec![LiteralValue::Number(1.0), LiteralValue::Number(2.0)],
+            vec![LiteralValue::Number(3.0), LiteralValue::Number(4.0)],
+        ]);
+        assert_eq!(
+            literal_to_overlay(array.clone(), formualizer_common::DateSystem::Excel1900),
+            Err(SpanEvalError::ArrayResultRequiresSpill)
+        );
+        // Even a 1x1 array fails closed: legacy routes it through the spill
+        // planner, so the plane must not special-case it into a scalar.
+        assert_eq!(
+            formula_result_to_overlay(
+                LiteralValue::Array(vec![vec![LiteralValue::Number(7.0)]]),
+                formualizer_common::DateSystem::Excel1900,
+            ),
+            Err(SpanEvalError::ArrayResultRequiresSpill)
+        );
+        assert_eq!(
+            formula_result_to_overlay(array, formualizer_common::DateSystem::Excel1900),
+            Err(SpanEvalError::ArrayResultRequiresSpill)
+        );
+    }
+
     #[test]
     fn temporal_overlay_conversion_uses_the_workbook_date_system() {
         let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
@@ -1202,11 +1265,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                literal_to_overlay(LiteralValue::Date(date), system),
+                literal_to_overlay(LiteralValue::Date(date), system).unwrap(),
                 OverlayValue::DateTime(date_serial)
             );
             assert_eq!(
-                literal_to_overlay(LiteralValue::DateTime(datetime), system),
+                literal_to_overlay(LiteralValue::DateTime(datetime), system).unwrap(),
                 OverlayValue::DateTime(datetime_serial)
             );
         }
