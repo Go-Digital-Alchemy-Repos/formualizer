@@ -508,3 +508,83 @@ fn test_cancellation_message_differentiation() {
         _ => panic!("Expected cancellation error with message"),
     }
 }
+
+#[derive(Debug)]
+struct SlowCountingProbe {
+    calls: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl Function for SlowCountingProbe {
+    fn name(&self) -> &'static str {
+        "SLOW_COUNTING_PROBE"
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        _args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(self.delay);
+        Ok(CalcValue::Scalar(LiteralValue::Int(7)))
+    }
+}
+
+/// A cancel signalled while a single wide layer of slow cells is running must
+/// be observed inside the layer, not only at the next layer boundary.
+#[test]
+fn cancellation_interrupts_a_single_wide_layer_of_slow_cells() {
+    const CELLS: u32 = 50;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let workbook = TestWorkbook::new().with_function(Arc::new(SlowCountingProbe {
+        calls: Arc::clone(&calls),
+        delay: Duration::from_millis(5),
+    }));
+    let mut config = EvalConfig::default();
+    config.enable_parallel = false;
+    let mut engine = Engine::new(workbook, config);
+
+    // 50 independent formula cells: no dependencies, so one scheduling layer.
+    let probe = formualizer_parse::parser::parse("=SLOW_COUNTING_PROBE()").unwrap();
+    for row in 1..=CELLS {
+        engine
+            .set_cell_formula("Sheet1", row, 1, probe.clone())
+            .unwrap();
+    }
+
+    let cancel = CancelToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        cancel_clone.cancel();
+    });
+
+    let result = engine.evaluate_all_cancellable(cancel);
+    handle.join().unwrap();
+
+    let error = result.expect_err("evaluation of a cancelled wide layer must fail");
+    assert_eq!(error.kind, ExcelErrorKind::Cancelled);
+
+    let calls_at_cancel = calls.load(Ordering::SeqCst);
+    assert!(
+        calls_at_cancel < CELLS as usize,
+        "cancel must stop the layer early, but all {CELLS} cells ran ({calls_at_cancel} calls)"
+    );
+
+    // The engine stays usable: a fresh token evaluates everything to completion.
+    let fresh = CancelToken::new();
+    engine
+        .evaluate_all_cancellable(fresh)
+        .expect("evaluation after a cancel must succeed");
+
+    assert!(calls.load(Ordering::SeqCst) > calls_at_cancel);
+    for row in 1..=CELLS {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row, 1),
+            Some(LiteralValue::Number(7.0)),
+            "row {row} must be computed after the second evaluation"
+        );
+    }
+}

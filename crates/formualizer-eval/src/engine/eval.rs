@@ -736,6 +736,12 @@ where
 // is faster while preserving the same visibility semantics.
 const COMPUTED_WRITE_COALESCING_MIN_LAYER_WIDTH: usize = 8;
 
+// How many vertices a cancellable layer evaluates between cancellation checks.
+// The check is a relaxed atomic load, so a stride of one vertex costs almost
+// nothing and lets a cancel take effect inside a wide layer of slow cells
+// instead of only at the next layer boundary.
+const LAYER_CANCEL_CHECK_STRIDE: usize = 1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComputedWrite {
     Cell {
@@ -31527,14 +31533,14 @@ where
                 None,
                 None,
                 Some(cancel_flag),
-                256,
+                LAYER_CANCEL_CHECK_STRIDE,
                 "Evaluation cancelled within layer",
             );
         }
 
         let mut computed_writes = ComputedWriteBuffer::default();
         for (i, &vertex_id) in layer.vertices.iter().enumerate() {
-            if i % 256 == 0 && cancel_flag.load(Ordering::Relaxed) {
+            if i % LAYER_CANCEL_CHECK_STRIDE == 0 && cancel_flag.load(Ordering::Relaxed) {
                 self.flush_computed_write_buffer(&mut computed_writes)?;
                 return Err(ExcelError::new(ExcelErrorKind::Cancelled)
                     .with_message("Evaluation cancelled within layer".to_string()));
@@ -31582,14 +31588,14 @@ where
                 None,
                 None,
                 Some(cancel_flag),
-                128,
+                LAYER_CANCEL_CHECK_STRIDE,
                 "Demand-driven evaluation cancelled within layer",
             );
         }
 
         let mut computed_writes = ComputedWriteBuffer::default();
         for (i, &vertex_id) in layer.vertices.iter().enumerate() {
-            if i % 128 == 0 && cancel_flag.load(Ordering::Relaxed) {
+            if i % LAYER_CANCEL_CHECK_STRIDE == 0 && cancel_flag.load(Ordering::Relaxed) {
                 self.flush_computed_write_buffer(&mut computed_writes)?;
                 return Err(ExcelError::new(ExcelErrorKind::Cancelled)
                     .with_message("Demand-driven evaluation cancelled within layer".to_string()));
