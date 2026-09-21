@@ -567,8 +567,8 @@ impl RangeVirtualDepProvider {
 }
 
 
-/// Memo for declared-output anchor-region lookups, valid for the lifetime of
-/// ONE [`VirtualDepBuilder::build`] pass.
+/// Memo for declared-output anchor-region lookups, held by one
+/// [`VirtualDepBuilder`] and reused across every `build` pass it performs.
 ///
 /// `output_anchors_in_region` walks the sheet's `declared_output_rows`
 /// interval tree, and `potential_output_anchors_in_region` walks it twice.
@@ -581,18 +581,73 @@ impl RangeVirtualDepProvider {
 ///
 /// The memo deliberately caches only the RAW anchor sets. Callers filter them
 /// by `is_dirty`/`is_volatile` afterwards, and those flags do change between
-/// builds, so the filter must stay outside the cache. The memo lives no longer
-/// than one build, so a fence added between two builds is seen by the second.
-#[derive(Default)]
+/// builds, so the filter must stay outside the cache.
+///
+/// One schedule build runs the builder many times — once over the candidate
+/// set, once per vertex visited by `build_demand_subgraph`, and once more over
+/// the augmented candidates — and those passes ask about the same regions over
+/// and over. The memo therefore outlives a single pass and is invalidated by
+/// epoch rather than by scope: [`Self::refresh`] drops every cached answer as
+/// soon as the engine's topology epoch or the graph's output-footprint epoch
+/// moves, i.e. as soon as a fence is registered or withdrawn, a spill
+/// footprint is committed or cleared, or the vertex set changes. A memo whose
+/// epochs still match cannot hold a stale answer.
+///
+/// Cached answers are capped: once the retained vertex ids reach
+/// [`ANCHOR_MEMO_MAX_IDS`] nothing further is inserted, so a build that walks
+/// a very large number of distinct regions degrades to the unmemoised cost
+/// instead of growing without bound.
 pub(crate) struct AnchorRegionMemo {
     anchors: std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
     potential: std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
+    /// `(topology_epoch, output_footprint_epoch)` the cached answers belong
+    /// to; `None` until the first refresh.
+    epochs: std::cell::Cell<Option<(u64, u64)>>,
+    cached_ids: std::cell::Cell<usize>,
 }
+
+/// Cached vertex ids retained by one memo before it stops inserting.
+const ANCHOR_MEMO_MAX_IDS: usize = 4 << 20;
 
 type RegionKey = (SheetId, u32, u32, u32, u32);
 
+impl Default for AnchorRegionMemo {
+    fn default() -> Self {
+        Self {
+            anchors: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            potential: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            epochs: std::cell::Cell::new(None),
+            cached_ids: std::cell::Cell::new(0),
+        }
+    }
+}
+
 impl AnchorRegionMemo {
-    fn output_anchors<R: EvaluationContext>(
+    /// Drop every cached answer if anything that could change one has moved.
+    pub(crate) fn refresh<R: EvaluationContext>(&self, engine: &Engine<R>) {
+        let now = (
+            engine.current_topology_epoch(),
+            engine.graph.output_footprint_epoch(),
+        );
+        if self.epochs.get() == Some(now) {
+            return;
+        }
+        self.anchors.borrow_mut().clear();
+        self.potential.borrow_mut().clear();
+        self.cached_ids.set(0);
+        self.epochs.set(Some(now));
+    }
+
+    fn record(&self, len: usize) -> bool {
+        let next = self.cached_ids.get().saturating_add(len);
+        if next > ANCHOR_MEMO_MAX_IDS {
+            return false;
+        }
+        self.cached_ids.set(next);
+        true
+    }
+
+    pub(crate) fn output_anchors<R: EvaluationContext>(
         &self,
         engine: &Engine<R>,
         key: RegionKey,
@@ -604,13 +659,15 @@ impl AnchorRegionMemo {
             .graph
             .output_anchors_in_region(key.0, key.1, key.2, key.3, key.4)
             .into();
-        self.anchors
-            .borrow_mut()
-            .insert(key, std::sync::Arc::clone(&computed));
+        if self.record(computed.len()) {
+            self.anchors
+                .borrow_mut()
+                .insert(key, std::sync::Arc::clone(&computed));
+        }
         computed
     }
 
-    fn potential_output_anchors<R: EvaluationContext>(
+    pub(crate) fn potential_output_anchors<R: EvaluationContext>(
         &self,
         engine: &Engine<R>,
         key: RegionKey,
@@ -622,20 +679,28 @@ impl AnchorRegionMemo {
             .graph
             .potential_output_anchors_in_region(key.0, key.1, key.2, key.3, key.4)
             .into();
-        self.potential
-            .borrow_mut()
-            .insert(key, std::sync::Arc::clone(&computed));
+        if self.record(computed.len()) {
+            self.potential
+                .borrow_mut()
+                .insert(key, std::sync::Arc::clone(&computed));
+        }
         computed
     }
 }
 
 pub struct VirtualDepBuilder<'a, R: EvaluationContext> {
     engine: &'a Engine<R>,
+    /// Shared by every `build` this builder performs; see
+    /// [`AnchorRegionMemo`] for how it is invalidated.
+    memo: AnchorRegionMemo,
 }
 
 impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
     pub fn new(engine: &'a Engine<R>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            memo: AnchorRegionMemo::default(),
+        }
     }
     pub fn build(
         &self,
@@ -648,18 +713,18 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             rustc_hash::FxHashMap::default();
         let mut augmented_vertices: Vec<VertexId> = Vec::new();
 
-        // One memo for this whole pass: the graph cannot change while the
-        // builder holds `&Engine`, and it is dropped with the pass so no
-        // answer survives into a later build.
-        let memo = AnchorRegionMemo::default();
+        // One memo for every pass this builder runs; `refresh` drops its
+        // contents if a fence or the graph moved since the previous pass.
+        self.memo.refresh(self.engine);
+        let memo = &self.memo;
         for &v in candidates {
             augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers_memoized(
                 self.engine,
                 v,
-                &memo,
+                memo,
             ));
             let mut deps =
-                RangeVirtualDepProvider::get_virtual_deps_memoized(self.engine, v, &memo);
+                RangeVirtualDepProvider::get_virtual_deps_memoized(self.engine, v, memo);
             let dynamic_deps = DynamicRefVirtualDepProvider::get_virtual_deps(self.engine, v);
 
             deps.extend(dynamic_deps);

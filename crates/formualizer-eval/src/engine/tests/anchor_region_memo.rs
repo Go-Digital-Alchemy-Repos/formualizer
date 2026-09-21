@@ -1,5 +1,7 @@
-//! Declared-output anchor-region lookups are memoised per virtual-dependency
-//! build pass, so their cost is O(distinct regions) rather than O(reads).
+//! Declared-output anchor-region lookups are memoised across the virtual-
+//! dependency build passes of one schedule build, so their cost is
+//! O(distinct regions) rather than O(reads), and the memo is dropped as soon
+//! as anything that could change an answer moves.
 
 use crate::engine::{Engine, EvalConfig, FormulaAuthorship, FormulaFence};
 use crate::test_workbook::TestWorkbook;
@@ -97,5 +99,52 @@ fn a_fence_added_between_builds_is_seen_by_the_next_build() {
     assert_eq!(
         engine.get_cell_value("Sheet1", 10, 4),
         Some(LiteralValue::Number(26.0))
+    );
+}
+
+/// The memo now outlives a single build pass, so its epoch guard — not its
+/// scope — is what keeps it honest. Registering a fence must invalidate it.
+#[test]
+fn registering_a_fence_invalidates_the_anchor_region_memo() {
+    use crate::engine::virtual_deps::AnchorRegionMemo;
+
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 10, 4, parse("=SUM($A$1:$A$4)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    // Region A1:A4, zero-based, as the builder asks it.
+    let sheet = engine.graph.sheet_id("Sheet1").expect("sheet");
+    let region = (sheet, 0u32, 0u32, 3u32, 0u32);
+
+    let memo = AnchorRegionMemo::default();
+    memo.refresh(&engine);
+    assert!(
+        memo.output_anchors(&engine, region).is_empty(),
+        "no declared output covers A1:A4 yet"
+    );
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("={1;2;3;4}").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        1,
+        FormulaAuthorship::cse_array(FormulaFence::new(1, 1, 4, 1)),
+    );
+    let producer = engine
+        .graph
+        .get_vertex_id_for_address(&engine.graph.make_cell_ref("Sheet1", 1, 1))
+        .copied()
+        .expect("producer vertex");
+
+    // The same memo object, reused across the mutation: refresh must drop the
+    // answer it cached before the fence existed.
+    memo.refresh(&engine);
+    assert!(
+        memo.output_anchors(&engine, region).contains(&producer),
+        "a fence registered after the memo cached a region must invalidate it"
     );
 }

@@ -216,6 +216,12 @@ pub struct DependencyGraph {
     /// O(component), not O(sources × component).
     dirty_propagation_visits: u64,
 
+    /// Bumped whenever an answer from `output_anchors_in_region` or
+    /// `potential_output_anchors_in_region` could change: a declared-output
+    /// fence registered or withdrawn, or the committed spill footprint moved.
+    /// A memo of those answers is only reusable while this is unchanged.
+    output_footprint_epoch: u64,
+
     /// Monotonic count of declared-output anchor-region queries
     /// (`output_anchors_in_region` / `potential_output_anchors_in_region`).
     /// Each one walks the sheet's `declared_output_rows` interval tree, which
@@ -951,6 +957,9 @@ impl DependencyGraph {
     }
 
     fn update_formula_authorship(&mut self, vertex: VertexId, authorship: FormulaAuthorship) {
+        // Any authorship write can add, move or withdraw a declared-output
+        // interval, and also changes the fence a query filters on.
+        self.bump_output_footprint_epoch();
         let sheet_id = self.get_vertex_sheet_id(vertex);
         if let Some(old) = self.formula_authorship.insert(vertex, authorship)
             && let Some(fence) = old.planning_extent()
@@ -1346,6 +1355,7 @@ impl DependencyGraph {
             formula_dirty: FormulaDirtyState::default(),
             formula_authorship: FxHashMap::default(),
             declared_output_rows: FxHashMap::default(),
+            output_footprint_epoch: 0,
             pending_formula_authorship: FxHashMap::default(),
             dirty_propagation_visits: 0,
             output_anchor_queries: std::sync::atomic::AtomicU64::new(0),
@@ -2973,6 +2983,15 @@ impl DependencyGraph {
         self.dirty_propagation_visits
     }
 
+    /// See [`Self::output_footprint_epoch`] on the field.
+    pub(crate) fn output_footprint_epoch(&self) -> u64 {
+        self.output_footprint_epoch
+    }
+
+    fn bump_output_footprint_epoch(&mut self) {
+        self.output_footprint_epoch = self.output_footprint_epoch.wrapping_add(1);
+    }
+
     /// See [`Self::output_anchor_queries`] on the field.
     pub(crate) fn output_anchor_queries(&self) -> u64 {
         self.output_anchor_queries
@@ -3900,6 +3919,7 @@ impl DependencyGraph {
         }
 
         // Update spill ownership maps only on success
+        self.bump_output_footprint_epoch();
         // Clear previous ownership not reused
         for cell in prev_cells.iter() {
             if !new_set.contains(cell) {
@@ -3967,6 +3987,7 @@ impl DependencyGraph {
         let Some(cells) = self.spill_anchor_to_cells.remove(&anchor) else {
             return Vec::new();
         };
+        self.bump_output_footprint_epoch();
 
         // Remove ownership for all cells first.
         for cell in cells.iter() {

@@ -7441,6 +7441,12 @@ where
         self.formula_plane_capacity_bailouts
     }
 
+    /// Graph topology generation. Bumped whenever the vertex or edge set
+    /// changes; a memo keyed on it cannot outlive the shape it was built for.
+    pub(crate) fn current_topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
     #[cfg(test)]
     pub(crate) fn topology_epoch_for_test(&self) -> u64 {
         self.topology_epoch
@@ -25967,7 +25973,7 @@ where
 
         let mut final_evaluate = to_evaluate.to_vec();
         if !augmented.is_empty() {
-            let (admitted, _) = self.build_demand_subgraph(&augmented);
+            let (admitted, _) = self.build_demand_subgraph_with(&augmented, &builder);
             final_evaluate.extend(admitted);
             final_evaluate.extend(augmented);
             final_evaluate.sort_unstable();
@@ -26168,6 +26174,21 @@ where
         Vec<VertexId>,
         rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
     ) {
+        self.build_demand_subgraph_with(target_vertices, &VirtualDepBuilder::new(self))
+    }
+
+    /// As [`Self::build_demand_subgraph`], but reusing a caller's builder so
+    /// the whole schedule build shares one anchor-region memo. The walk visits
+    /// hundreds of thousands of vertices on a large workbook and asks the same
+    /// regions repeatedly; a builder created per vertex threw that away.
+    fn build_demand_subgraph_with(
+        &self,
+        target_vertices: &[VertexId],
+        builder: &VirtualDepBuilder<'_, R>,
+    ) -> (
+        Vec<VertexId>,
+        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    ) {
         #[cfg(feature = "tracing")]
         let _span =
             tracing::info_span!("demand_subgraph", targets = target_vertices.len()).entered();
@@ -26256,7 +26277,6 @@ where
                     }
                 }
             } // Virtual dependencies (compressed ranges + dynamic like INDIRECT)
-            let builder = VirtualDepBuilder::new(self);
             let (vdeps_map, soft_producers) = builder.build(&[v]);
             stack.extend(soft_producers.into_iter().filter(|u| !visited.contains(u)));
             if let Some(deps) = vdeps_map.get(&v) {
