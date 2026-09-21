@@ -582,3 +582,67 @@ fn actual_dynamic_self_and_cross_producer_cycles_remain_circular() {
         );
     }
 }
+
+/// A single-cell CSE formula publishes only into its own anchor cell —
+/// `finalize_cse_result` truncates it to a scalar — so it must not register a
+/// declared-output interval. Its reader is still ordered after it by the
+/// ordinary cell edge. Multi-cell fences keep their entry.
+#[test]
+fn single_cell_cse_registers_no_declared_output_but_still_orders_its_reader() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    // A1: single-cell CSE. B1 reads it through a range that covers A1.
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=SUM({2,3})").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        1,
+        FormulaAuthorship::cse_array(FormulaFence::new(1, 1, 1, 1)),
+    );
+    // A3: multi-cell CSE, which must keep its declared-output entry.
+    engine
+        .set_cell_formula("Sheet1", 3, 1, parse("={1,2;3,4}").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        3,
+        1,
+        FormulaAuthorship::cse_array(FormulaFence::new(3, 1, 4, 2)),
+    );
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=SUM($A$1:$A$1)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    let a1 = vertex(&engine, "Sheet1", 1, 1);
+    let a3 = vertex(&engine, "Sheet1", 3, 1);
+
+    // The single-cell fence contributes no declared-output anchor...
+    assert!(
+        !engine
+            .graph
+            .output_anchors_in_region(0, 0, 0, 0, 0)
+            .contains(&a1),
+        "a single-cell CSE fence must not register a declared-output interval"
+    );
+    // ...while the multi-cell fence still does.
+    assert!(
+        engine
+            .graph
+            .output_anchors_in_region(0, 2, 0, 3, 1)
+            .contains(&a3),
+        "a multi-cell CSE fence must keep its declared-output interval"
+    );
+
+    // The reader still evaluates after the producer and sees its value.
+    assert_eq!(
+        engine.read_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(5.0))
+    );
+    assert_eq!(
+        engine.read_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(5.0))
+    );
+}

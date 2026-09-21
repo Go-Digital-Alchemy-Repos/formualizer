@@ -165,8 +165,25 @@ impl FormulaAuthorship {
         }
     }
 
+    /// The footprint this formula must be *planned* around, i.e. the region a
+    /// reader can touch that the ordinary cell dependency edge does not
+    /// already order it behind.
+    ///
+    /// A single-cell CSE fence contributes nothing here. `finalize_cse_result`
+    /// truncates a single-cell fence to `calc_top_left`, so such a formula can
+    /// never publish outside its own anchor cell, and a reader of that cell
+    /// already depends on it through the ordinary cell edge. Registering it as
+    /// a declared output only loads the sheet's `declared_output_rows`
+    /// interval tree, which every range read then has to walk: the Rev FIA
+    /// child carries ~78k single-cell CSE formulas and paid for them on every
+    /// virtual-dependency query.
+    ///
+    /// A multi-cell fence, and any saved dynamic extent, still register: those
+    /// do cover cells beyond the anchor, and a dynamic extent may still grow.
     pub(crate) fn planning_extent(self) -> Option<FormulaFence> {
-        self.cse_fence.or(self.saved_dynamic_extent)
+        self.cse_fence
+            .filter(|fence| !fence.is_single_cell())
+            .or(self.saved_dynamic_extent)
     }
 
     pub const fn cse_array(fence: FormulaFence) -> Self {
