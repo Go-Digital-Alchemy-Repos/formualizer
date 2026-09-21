@@ -26018,7 +26018,19 @@ where
             final_evaluate.extend(augmented);
             final_evaluate.sort_unstable();
             final_evaluate.dedup();
-            vdeps = builder.build(&final_evaluate).0;
+            // The third pass recomputes `vdeps` over `final_evaluate`. When
+            // neither the soft producers nor the demand walk added a vertex,
+            // `final_evaluate` is set-equal to `to_evaluate`, and `build` is a
+            // pure function of the candidate set and a graph that cannot have
+            // moved since pass one — so the rebuild would reproduce pass one's
+            // map exactly. Comparing the two sorted, deduplicated candidate
+            // lists is O(n) against a rebuild that rescans every range read.
+            let mut baseline = to_evaluate.to_vec();
+            baseline.sort_unstable();
+            baseline.dedup();
+            if final_evaluate != baseline {
+                vdeps = builder.build(&final_evaluate).0;
+            }
         }
 
         let use_virtual = !vdeps.is_empty();
