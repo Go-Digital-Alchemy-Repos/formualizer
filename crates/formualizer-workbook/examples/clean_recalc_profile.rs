@@ -22,7 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eval.max_threads = Some(n);
     }
     eval.enable_virtual_dep_telemetry = std::env::var("FZ_VDEP_TELEMETRY").is_ok();
-    eval.cycle.detection = CycleDetection::Runtime;
+    eval.cycle.detection = match std::env::var("FZ_CYCLE").as_deref() {
+        Ok("static") => CycleDetection::Static,
+        _ => CycleDetection::Runtime,
+    };
     eval.workbook_seed = 147;
     let mut cfg = WorkbookConfig::interactive();
     cfg.eval = EvalConfig {
@@ -93,6 +96,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         r.computed_vertices,
         r.cycle_errors
     );
+    println!("  cycle {:?}", wb.engine().last_cycle_telemetry());
+    if std::env::var("FZ_VDEP_TELEMETRY").is_ok() {
+        let t = wb.engine().last_virtual_dep_telemetry();
+        println!(
+            "  vdep candidates={} vdep_vertices={} vdep_edges={} builder_ms={} cache_hits={} cache_misses={} replans={} changed_vdeps={}",
+            t.candidate_vertices_total, t.vdeps_vertices_total, t.vdeps_edges_total,
+            t.builder_elapsed_ms_total, t.schedule_cache_hits, t.schedule_cache_misses,
+            t.replan_iterations, t.changed_vdeps_total
+        );
+    }
     for i in 0..passes {
         let t = Instant::now();
         let r = wb.evaluate_all()?;
@@ -140,6 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.computed_vertices,
             r.cycle_errors
         );
+        println!("  cycle {:?}", wb.engine().last_cycle_telemetry());
         if eval_telemetry {
             let t = wb.engine().last_virtual_dep_telemetry();
             println!(
