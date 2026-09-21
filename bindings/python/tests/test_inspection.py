@@ -355,6 +355,7 @@ def test_spill_payload_provenance_omission_cell_count_and_volatile() -> None:
 def test_range_text_quotes_every_consumer_surface(tmp_path) -> None:
     import openpyxl
     from openpyxl.workbook.defined_name import DefinedName
+    from openpyxl.worksheet.formula import ArrayFormula
 
     for sheet_name, canonical_sheet in (
         ("My Sheet", "'My Sheet'"),
@@ -369,7 +370,12 @@ def test_range_text_quotes_every_consumer_surface(tmp_path) -> None:
         sheet["A1"] = 1
         sheet["A2"] = 2
         sheet["B1"] = "=SUM(A1:A2)+SUM(Block)"
-        sheet["C1"] = "=SEQUENCE(2)"
+        # OT-035/CL-016: a loaded formula carries the file's own array
+        # classification. A bare "=SEQUENCE(2)" is written by openpyxl with no
+        # array metadata, so the engine loads it as a legacy scalar and
+        # implicitly intersects it instead of spilling. The spill surfaces below
+        # need an anchor, so the fixture authors the array fence in the file.
+        sheet["C1"] = ArrayFormula(ref="C1:C2", text="=SEQUENCE(2)")
         quoted_name = "'" + sheet_name.replace("'", "''") + "'"
         source.defined_names.add(
             DefinedName("Block", attr_text=f"{quoted_name}!$A$1:$A$2")
