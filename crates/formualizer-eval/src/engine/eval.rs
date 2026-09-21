@@ -5241,8 +5241,14 @@ where
         mode: crate::engine::DeterministicMode,
     ) -> Result<(), ExcelError> {
         let clock = mode.build_clock()?;
+        let frozen = mode.is_enabled();
         self.config.deterministic_mode = mode;
         self.clock = crate::timezone::SnapshotClock::new(clock);
+        // The clock source just moved: any cell parked as a clock-only
+        // constant under a previously frozen clock must recompute, and the
+        // skip itself only applies while the new mode is deterministic.
+        self.graph.set_clock_frozen(frozen);
+        self.graph.redirty_all_volatiles();
         Ok(())
     }
 
@@ -5255,6 +5261,10 @@ where
     /// sample.
     pub fn set_clock(&mut self, clock: Arc<dyn crate::timezone::ClockProvider>) {
         self.clock = crate::timezone::SnapshotClock::new(clock);
+        // An injected provider is a live clock as far as the engine knows, so
+        // clock-only volatiles go back to refreshing every recalc.
+        self.graph.set_clock_frozen(false);
+        self.graph.redirty_all_volatiles();
     }
 
     fn validate_deterministic_mode(&self) -> Result<(), ExcelError> {

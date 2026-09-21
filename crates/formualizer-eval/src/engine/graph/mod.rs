@@ -199,6 +199,13 @@ pub struct DependencyGraph {
     // and set representation behind this single authority.
     formula_dirty: FormulaDirtyState,
     volatile_vertices: FxHashSet<VertexId>,
+    /// True while the evaluation clock cannot move between recalcs, i.e. the
+    /// engine runs in `DeterministicMode::Enabled`. Clock-only volatiles
+    /// (`NOW()`/`TODAY()` and formulas built solely from them) are constants
+    /// under a frozen clock, so they are neither scheduled nor re-dirtied
+    /// while this holds. Kept in sync by `Engine::set_deterministic_mode` /
+    /// `Engine::set_clock`.
+    clock_frozen: bool,
     formula_authorship: FxHashMap<VertexId, FormulaAuthorship>,
     declared_output_rows: FxHashMap<SheetId, crate::engine::interval_tree::IntervalTree<VertexId>>,
     pending_formula_authorship: FxHashMap<(String, u32, u32), FormulaAuthorship>,
@@ -1336,6 +1343,7 @@ impl DependencyGraph {
             deferred_dirty_depth: 0,
             deferred_dirty_pending: Vec::new(),
             volatile_vertices: FxHashSet::default(),
+            clock_frozen: config.deterministic_mode.is_enabled(),
             ref_error_vertices: FxHashSet::default(),
             formula_to_range_deps: FxHashMap::default(),
             stripe_to_dependents: FxHashMap::default(),
@@ -3010,7 +3018,7 @@ impl DependencyGraph {
     pub fn get_evaluation_vertices(&self) -> Vec<VertexId> {
         let mut combined = FxHashSet::default();
         combined.extend(self.formula_dirty.legacy_iter().copied());
-        combined.extend(&self.volatile_vertices);
+        combined.extend(self.volatiles_needing_refresh());
 
         let mut result: Vec<VertexId> = combined
             .into_iter()
@@ -3049,8 +3057,53 @@ impl DependencyGraph {
     /// component used to pay O(volatiles × component) (a full `mark_dirty`
     /// BFS per volatile); `mark_dirty_many` visits the component once.
     pub(crate) fn redirty_volatiles(&mut self) {
+        let volatile_ids = self.volatiles_needing_refresh();
+        let _ = self.mark_dirty_many(&volatile_ids);
+    }
+
+    /// Declare whether the evaluation clock is pinned (deterministic mode).
+    ///
+    /// Freezing does not by itself dirty anything; unfreezing, or moving a
+    /// frozen clock to a new timestamp, does — see `redirty_all_volatiles`,
+    /// which the engine calls whenever the clock source changes.
+    pub(crate) fn set_clock_frozen(&mut self, frozen: bool) {
+        self.clock_frozen = frozen;
+    }
+
+    /// Re-dirty every volatile vertex regardless of the frozen-clock skip.
+    /// Used when the clock source itself moves, so cells that were parked as
+    /// clock-only constants pick up the new timestamp.
+    pub(crate) fn redirty_all_volatiles(&mut self) {
         let volatile_ids: Vec<VertexId> = self.volatile_vertices.iter().copied().collect();
         let _ = self.mark_dirty_many(&volatile_ids);
+    }
+
+    /// The volatile vertices that must be re-evaluated on the next recalc.
+    ///
+    /// With a live clock that is all of them. With a frozen clock it excludes
+    /// the vertices whose only volatile ingredient is the clock: those hold a
+    /// constant until the clock moves, and scheduling them would re-dirty
+    /// their entire dependent cone — the dominant cost of an otherwise clean
+    /// `evaluate_all` on a large workbook.
+    fn volatiles_needing_refresh(&self) -> Vec<VertexId> {
+        if !self.clock_frozen {
+            return self.volatile_vertices.iter().copied().collect();
+        }
+        self.volatile_vertices
+            .iter()
+            .copied()
+            .filter(|&id| !self.is_clock_only_volatile(id))
+            .collect()
+    }
+
+    /// True when this volatile vertex is volatile *only* because it reads the
+    /// clock. A volatile vertex with no formula (e.g. an unversioned external
+    /// source) is never clock-only.
+    fn is_clock_only_volatile(&self, id: VertexId) -> bool {
+        match self.get_formula(id) {
+            Some(ast) => !self.is_ast_non_clock_volatile(&ast),
+            None => false,
+        }
     }
 
     /// Re-marks members of iterating SCCs (and, via propagation, their

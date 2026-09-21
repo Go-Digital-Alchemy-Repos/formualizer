@@ -45,7 +45,7 @@ pub struct TodayFn;
 /// Variadic: false
 /// Signature: TODAY()
 /// Arg schema: []
-/// Caps: VOLATILE
+/// Caps: VOLATILE, VOLATILE_CLOCK
 /// [formualizer-docgen:schema:end]
 impl Function for TodayFn {
     fn propagate_format(
@@ -55,7 +55,7 @@ impl Function for TodayFn {
         Some(crate::format::FormatId::DATE)
     }
 
-    func_caps!(VOLATILE);
+    func_caps!(VOLATILE, VOLATILE_CLOCK);
 
     fn name(&self) -> &'static str {
         "TODAY"
@@ -118,7 +118,7 @@ pub struct NowFn;
 /// Variadic: false
 /// Signature: NOW()
 /// Arg schema: []
-/// Caps: VOLATILE
+/// Caps: VOLATILE, VOLATILE_CLOCK
 /// [formualizer-docgen:schema:end]
 impl Function for NowFn {
     fn propagate_format(
@@ -128,7 +128,7 @@ impl Function for NowFn {
         Some(crate::format::FormatId::DATETIME)
     }
 
-    func_caps!(VOLATILE);
+    func_caps!(VOLATILE, VOLATILE_CLOCK);
 
     fn name(&self) -> &'static str {
         "NOW"

@@ -391,6 +391,53 @@ impl DependencyGraph {
         }
     }
 
+    /// True when `ast` is volatile for a reason other than reading the
+    /// evaluation clock.
+    ///
+    /// A formula whose only volatile ingredient is `NOW()`/`TODAY()` answers
+    /// `false`: its value is fixed while the clock is frozen, so the engine
+    /// can leave it (and its dependent cone) clean between recalcs. Anything
+    /// the registry does not resolve, or any volatile without
+    /// `FnCaps::VOLATILE_CLOCK`, answers `true` — the conservative side.
+    pub(crate) fn is_ast_non_clock_volatile(&self, ast: &ASTNode) -> bool {
+        use formualizer_parse::parser::ASTNodeType;
+
+        match &ast.node_type {
+            ASTNodeType::Function { name, args } => {
+                match crate::function_registry::get("", name) {
+                    Some(func) => {
+                        let caps = func.caps();
+                        if caps.contains(crate::function::FnCaps::VOLATILE)
+                            && !caps.contains(crate::function::FnCaps::VOLATILE_CLOCK)
+                        {
+                            return true;
+                        }
+                    }
+                    // An unresolved callee the parser flagged volatile: we
+                    // cannot prove the volatility is clock-only.
+                    None => {
+                        if ast.contains_volatile() {
+                            return true;
+                        }
+                    }
+                }
+                args.iter().any(|arg| self.is_ast_non_clock_volatile(arg))
+            }
+            ASTNodeType::BinaryOp { left, right, .. } => {
+                self.is_ast_non_clock_volatile(left) || self.is_ast_non_clock_volatile(right)
+            }
+            ASTNodeType::UnaryOp { expr, .. } => self.is_ast_non_clock_volatile(expr),
+            ASTNodeType::Array(rows) => rows
+                .iter()
+                .any(|row| row.iter().any(|cell| self.is_ast_non_clock_volatile(cell))),
+            ASTNodeType::Call { callee, args } => {
+                self.is_ast_non_clock_volatile(callee)
+                    || args.iter().any(|a| self.is_ast_non_clock_volatile(a))
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_ast_dynamic(&self, ast: &ASTNode) -> bool {
         use formualizer_parse::parser::ASTNodeType;
 

@@ -97,6 +97,16 @@ bitflags::bitflags! {
     const LOCAL_ENVIRONMENT = 0b0001_0000_0000_0000_0000;
     /// Function can produce a multi-cell dynamic-array result.
     const MAY_SPILL = 0b0010_0000_0000_0000_0000;
+    /// The function's volatility comes *only* from reading the evaluation
+    /// clock (`NOW()`, `TODAY()`). Always set together with `VOLATILE`.
+    ///
+    /// A clock-only volatile is a constant while the clock is frozen — which
+    /// is exactly what `DeterministicMode::Enabled` does — so the engine may
+    /// leave such cells clean between recalcs instead of re-dirtying them and
+    /// their whole dependent cone on every pass. Volatility that does not come
+    /// from the clock (`RAND`, `OFFSET`, `INDIRECT`, `RANDARRAY`, …) must not
+    /// set this bit.
+    const VOLATILE_CLOCK = 0b0100_0000_0000_0000_0000;
     }
 }
 
