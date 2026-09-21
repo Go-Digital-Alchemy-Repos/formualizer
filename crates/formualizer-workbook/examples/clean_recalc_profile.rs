@@ -41,6 +41,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timezone: formualizer_eval::timezone::TimeZoneSpec::Utc,
     })?;
 
+    // Stand in for the session runtime's Python XCALL router. `FZ_XCALL_SHAPE`
+    // is "scalar" or "RxC" (e.g. "8x5"); every call returns the same fixed
+    // result, which is what the runtime's bisect used. Registered before
+    // prepare so the graph sees the function.
+    if let Ok(shape) = std::env::var("FZ_XCALL_SHAPE") {
+        use formualizer_workbook::CustomFnOptions;
+        let dims: Option<(usize, usize)> = shape.split_once('x').and_then(|(r, c)| {
+            Some((r.trim().parse().ok()?, c.trim().parse().ok()?))
+        });
+        let handler = std::sync::Arc::new(
+            move |_args: &[formualizer_common::LiteralValue]| match dims {
+                None => Ok(formualizer_common::LiteralValue::Number(1.0)),
+                Some((rows, cols)) => {
+                    let grid: Vec<Vec<formualizer_common::LiteralValue>> = (0..rows)
+                        .map(|r| {
+                            (0..cols)
+                                .map(|c| {
+                                    formualizer_common::LiteralValue::Number((r * cols + c) as f64)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    Ok(formualizer_common::LiteralValue::Array(grid))
+                }
+            },
+        );
+        for name in ["_xldudf_CS_SPARK_XCALL", "CS.SPARK.XCALL"] {
+            let options = CustomFnOptions {
+                min_args: 3,
+                max_args: None,
+                volatile: false,
+                thread_safe: false,
+                deterministic: true,
+                allow_override_builtin: false,
+            };
+            wb.register_custom_function(name, options, handler.clone())?;
+        }
+        println!("registered XCALL stub shape={shape}");
+    }
+
     let t = Instant::now();
     wb.prepare_graph_all()?;
     println!("prepare     {:?}", t.elapsed());
@@ -101,7 +141,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.cycle_errors
         );
         if eval_telemetry {
-            println!("  vdep {:?}", wb.engine().last_virtual_dep_telemetry());
+            let t = wb.engine().last_virtual_dep_telemetry();
+            println!(
+                "  replan_iterations={} changed_vdeps={} cache_hits={} cache_misses={} builder_ms={} bailout={:?}",
+                t.replan_iterations,
+                t.changed_vdeps_total,
+                t.schedule_cache_hits,
+                t.schedule_cache_misses,
+                t.builder_elapsed_ms_total,
+                t.bailout_reason
+            );
         }
     }
     Ok(())

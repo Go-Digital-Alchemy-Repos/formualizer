@@ -3830,7 +3830,24 @@ impl DependencyGraph {
             ));
         }
 
-        // Apply with optional injected fault
+        // Apply with optional injected fault.
+        //
+        // The whole apply runs inside ONE deferred-dirty scope. `set_cell_value`
+        // propagates dirtiness from every cell it writes, and all cells of a
+        // spill rectangle feed the same downstream component, so the plain loop
+        // costs O(cells x component): a 40-cell rectangle whose readers reach
+        // tens of thousands of vertices re-walks that cone 40 times per commit.
+        // The scope queues the sources and `end_deferred_dirty` runs one
+        // multi-source propagation over exactly the same set — the treatment
+        // `clear_spill_region_bulk` already applies to the clear half of this
+        // same operation. Measured on the Avocet parent (5 XCALL anchors, one
+        // scalar input changed): layer evaluation 1.45 s -> 0.30 s, with the
+        // same computed-vertex count.
+        //
+        // The scope is closed on both exits, including the injected-fault
+        // rollback, so it can never leak into evaluation.
+        self.begin_deferred_dirty();
+        let mut fault: Option<ExcelError> = None;
         for (applied, op) in ops.iter().enumerate() {
             if let Some(n) = fault_after_ops
                 && applied == n
@@ -3843,8 +3860,11 @@ impl DependencyGraph {
                         let _ = self.set_cell_value(sheet, row + 1, col + 1, old.value.clone());
                     }
                 }
-                return Err(ExcelError::new(ExcelErrorKind::Error)
-                    .with_message("Injected persistence fault during spill commit"));
+                fault = Some(
+                    ExcelError::new(ExcelErrorKind::Error)
+                        .with_message("Injected persistence fault during spill commit"),
+                );
+                break;
             }
             if op.sheet == anchor_sheet_name && op.row == anchor_row && op.col == anchor_col {
                 self.update_vertex_value(anchor, op.new_value.clone());
@@ -3852,6 +3872,10 @@ impl DependencyGraph {
                 let _ =
                     self.set_cell_value(&op.sheet, op.row + 1, op.col + 1, op.new_value.clone());
             }
+        }
+        self.end_deferred_dirty();
+        if let Some(error) = fault {
+            return Err(error);
         }
 
         // Update spill ownership maps only on success
