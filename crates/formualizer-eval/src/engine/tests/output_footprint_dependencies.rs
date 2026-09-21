@@ -646,3 +646,93 @@ fn single_cell_cse_registers_no_declared_output_but_still_orders_its_reader() {
         Some(LiteralValue::Number(5.0))
     );
 }
+
+/// A one-cell saved dynamic extent describes only the anchor, so it must not
+/// register a declared-output interval either: a read of a region containing
+/// the anchor already reaches it. A multi-cell saved extent keeps its entry,
+/// and a producer that grows beyond one cell still reaches its readers
+/// through the footprint its spill commits.
+#[test]
+fn single_cell_saved_dynamic_extent_registers_no_declared_output() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    // A1: dynamic array saved as one cell. B1 reads a range covering it.
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=SUM({2,3})").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        1,
+        FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(1, 1, 1, 1)),
+    );
+    // A3: dynamic array saved as a 2x2 block, which must keep its entry.
+    engine
+        .set_cell_formula("Sheet1", 3, 1, parse("={1,2;3,4}").unwrap())
+        .unwrap();
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        3,
+        1,
+        FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(3, 1, 4, 2)),
+    );
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=SUM($A$1:$A$1)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    let a1 = vertex(&engine, "Sheet1", 1, 1);
+    let a3 = vertex(&engine, "Sheet1", 3, 1);
+
+    assert!(
+        !engine
+            .graph
+            .potential_output_anchors_in_region(0, 0, 0, 0, 0)
+            .contains(&a1),
+        "a one-cell saved dynamic extent must not register a declared output"
+    );
+    assert!(
+        engine
+            .graph
+            .potential_output_anchors_in_region(0, 2, 0, 3, 1)
+            .contains(&a3),
+        "a multi-cell saved dynamic extent must keep its declared output"
+    );
+
+    // The reader still evaluates after the producer and sees its value.
+    assert_eq!(
+        engine.read_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(5.0))
+    );
+}
+
+/// A dynamic array whose saved extent was one cell but which now spills into
+/// a reader's range still reaches that reader: the committed footprint, not
+/// the stale hint, is what orders them.
+#[test]
+fn a_one_cell_saved_extent_that_now_spills_still_reaches_its_reader() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(4.0))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 4, parse("=SEQUENCE($A$1)").unwrap())
+        .unwrap();
+    // Saved when it produced a single cell; it now produces four.
+    engine.stage_loaded_formula_authorship(
+        "Sheet1",
+        1,
+        4,
+        FormulaAuthorship::dynamic_array_with_saved_extent(FormulaFence::new(1, 4, 1, 4)),
+    );
+    engine
+        .set_cell_formula("Sheet1", 1, 6, parse("=SUM($D$1:$D$8)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.read_cell_value("Sheet1", 1, 6),
+        Some(LiteralValue::Number(10.0)),
+        "1+2+3+4 from the committed spill, not the one-cell hint"
+    );
+}

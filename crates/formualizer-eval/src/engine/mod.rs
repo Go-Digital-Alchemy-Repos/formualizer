@@ -169,21 +169,37 @@ impl FormulaAuthorship {
     /// reader can touch that the ordinary cell dependency edge does not
     /// already order it behind.
     ///
-    /// A single-cell CSE fence contributes nothing here. `finalize_cse_result`
-    /// truncates a single-cell fence to `calc_top_left`, so such a formula can
-    /// never publish outside its own anchor cell, and a reader of that cell
-    /// already depends on it through the ordinary cell edge. Registering it as
-    /// a declared output only loads the sheet's `declared_output_rows`
-    /// interval tree, which every range read then has to walk: the Rev FIA
-    /// child carries ~78k single-cell CSE formulas and paid for them on every
-    /// virtual-dependency query.
+    /// A single-cell footprint contributes nothing here, whichever kind
+    /// declared it.
     ///
-    /// A multi-cell fence, and any saved dynamic extent, still register: those
-    /// do cover cells beyond the anchor, and a dynamic extent may still grow.
+    /// A single-cell CSE fence cannot publish outside its anchor:
+    /// `finalize_cse_result` truncates it through `calc_top_left`, so the
+    /// result is always a scalar. A single-cell saved dynamic extent covers
+    /// only the anchor either: the extent is where the producer's output was
+    /// when the workbook was saved, and a read of a region containing the
+    /// anchor already reaches it — as a hard virtual edge from the region
+    /// scan in `get_virtual_deps`, which applies the same dirty/volatile and
+    /// vertex-kind filters the anchor lookup does, and as an ordinary cell
+    /// edge for a direct read. If the producer grows beyond one cell, the
+    /// spill commit registers the real footprint; the stale one-cell hint
+    /// would not have described the growth anyway.
+    ///
+    /// What such an entry does cost is the sheet's `declared_output_rows`
+    /// interval tree, which every range read walks — and
+    /// `potential_output_anchors_in_region` walks twice. The Rev FIA child
+    /// carries 78,076 declared outputs and 78,075 of them are one-cell saved
+    /// dynamic extents, over 18,758 intervals, none of which contributed a
+    /// single virtual-dependency edge on that workbook.
+    ///
+    /// A multi-cell fence or saved extent still registers: those do cover
+    /// cells beyond the anchor.
     pub(crate) fn planning_extent(self) -> Option<FormulaFence> {
         self.cse_fence
             .filter(|fence| !fence.is_single_cell())
-            .or(self.saved_dynamic_extent)
+            .or_else(|| {
+                self.saved_dynamic_extent
+                    .filter(|fence| !fence.is_single_cell())
+            })
     }
 
     pub const fn cse_array(fence: FormulaFence) -> Self {
