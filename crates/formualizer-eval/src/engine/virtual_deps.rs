@@ -533,29 +533,25 @@ impl RangeVirtualDepProvider {
                     .copied()
                     .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
                 );
-                if let Some(index) = engine.graph.sheet_index(sheet_id) {
-                    let sr0 = sr.saturating_sub(1);
-                    let er0 = er.saturating_sub(1);
-                    let sc0 = sc.saturating_sub(1);
-                    let ec0 = ec.saturating_sub(1);
-                    for u in index.vertices_in_col_range(sc0, ec0) {
-                        let Some(pc) = engine.graph.vertex_grid_addr(u) else {
-                            continue;
-                        };
-                        let row0 = pc.row();
-                        if row0 < sr0 || row0 > er0 {
-                            continue;
-                        }
-                        match engine.graph.get_vertex_kind(u) {
-                            VertexKind::FormulaScalar | VertexKind::FormulaArray => {
-                                if (engine.graph.is_dirty(u) || engine.graph.is_volatile(u))
-                                    && u != v
-                                {
-                                    deps.push(u);
-                                }
-                            }
-                            _ => {}
-                        }
+                // The in-rect formula-vertex list depends only on the graph's
+                // shape, so it is memoised alongside the anchor sets. The
+                // `is_dirty`/`is_volatile` and `u != v` filters vary between
+                // passes and per candidate, so they stay outside the cache.
+                for &u in memo
+                    .formula_vertices_in_region(
+                        engine,
+                        (
+                            sheet_id,
+                            sr.saturating_sub(1),
+                            sc.saturating_sub(1),
+                            er.saturating_sub(1),
+                            ec.saturating_sub(1),
+                        ),
+                    )
+                    .iter()
+                {
+                    if (engine.graph.is_dirty(u) || engine.graph.is_volatile(u)) && u != v {
+                        deps.push(u);
                     }
                 }
             }
@@ -600,6 +596,10 @@ impl RangeVirtualDepProvider {
 pub(crate) struct AnchorRegionMemo {
     anchors: std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
     potential: std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
+    /// Raw in-rect formula-vertex lists (kind-filtered only) for the
+    /// dirty-formula region scan; see [`Self::formula_vertices_in_region`].
+    region_formulas:
+        std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
     /// `(topology_epoch, output_footprint_epoch)` the cached answers belong
     /// to; `None` until the first refresh.
     epochs: std::cell::Cell<Option<(u64, u64)>>,
@@ -616,6 +616,7 @@ impl Default for AnchorRegionMemo {
         Self {
             anchors: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
             potential: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            region_formulas: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
             epochs: std::cell::Cell::new(None),
             cached_ids: std::cell::Cell::new(0),
         }
@@ -634,6 +635,7 @@ impl AnchorRegionMemo {
         }
         self.anchors.borrow_mut().clear();
         self.potential.borrow_mut().clear();
+        self.region_formulas.borrow_mut().clear();
         self.cached_ids.set(0);
         self.epochs.set(Some(now));
     }
@@ -681,6 +683,60 @@ impl AnchorRegionMemo {
             .into();
         if self.record(computed.len()) {
             self.potential
+                .borrow_mut()
+                .insert(key, std::sync::Arc::clone(&computed));
+        }
+        computed
+    }
+
+    /// Every formula vertex (scalar or array) placed inside the rect, in
+    /// ascending vertex order.
+    ///
+    /// The dirty-formula region scan in
+    /// [`RangeVirtualDepProvider::get_virtual_deps_memoized`] walks the whole
+    /// column band returned by `vertices_in_col_range` and row-filters it, for
+    /// every range read; on the Rev FIA child that band is the source of the
+    /// great majority of the virtual-dependency edges, and the three build
+    /// passes of one schedule repeat it over the same regions. Which vertices
+    /// lie in a rect and what kind they are cannot change while the builder
+    /// holds `&Engine`, and any change to the vertex set moves the topology
+    /// epoch, so the raw list is cached exactly like the anchor sets.
+    ///
+    /// Like the anchor maps, this caches only the RAW list: the caller's
+    /// `is_dirty`/`is_volatile` test (which changes between passes) and its
+    /// self-exclusion must stay outside the cache.
+    pub(crate) fn formula_vertices_in_region<R: EvaluationContext>(
+        &self,
+        engine: &Engine<R>,
+        key: RegionKey,
+    ) -> std::sync::Arc<[VertexId]> {
+        if let Some(hit) = self.region_formulas.borrow().get(&key) {
+            return std::sync::Arc::clone(hit);
+        }
+        let (sheet_id, sr0, sc0, er0, ec0) = key;
+        let mut found: Vec<VertexId> = Vec::new();
+        if let Some(index) = engine.graph.sheet_index(sheet_id) {
+            for u in index.vertices_in_col_range(sc0, ec0) {
+                let Some(pc) = engine.graph.vertex_grid_addr(u) else {
+                    continue;
+                };
+                let row0 = pc.row();
+                if row0 < sr0 || row0 > er0 {
+                    continue;
+                }
+                if matches!(
+                    engine.graph.get_vertex_kind(u),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                ) {
+                    found.push(u);
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        let computed: std::sync::Arc<[VertexId]> = found.into();
+        if self.record(computed.len()) {
+            self.region_formulas
                 .borrow_mut()
                 .insert(key, std::sync::Arc::clone(&computed));
         }
