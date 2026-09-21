@@ -615,15 +615,16 @@ fn external_precedent_edit_reruns_the_retained_scc() {
 }
 
 #[test]
-fn same_value_rewrite_of_a_precedent_still_reruns_the_scc() {
+fn same_value_rewrite_of_a_precedent_keeps_the_retained_scc() {
     let _epoch = epoch_stable();
-    // Today's dirty semantics: writing a cell dirties its dependents even if
-    // the value is unchanged. Retention follows the dirty graph, so the SCC
-    // re-runs (and lands on the same fixed point).
+    // Rewriting a literal cell with the value it already holds is dropped
+    // before it reaches the graph (see `Engine::is_unchanged_literal_write`),
+    // so nothing is dirtied and the retained SCC is reused exactly as it is
+    // after a no-change recalc.
     let mut engine = retained_engine(3.0);
     set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Number(3.0));
     engine.evaluate_all().unwrap();
-    assert_eq!(reuse_telemetry(&engine), (1, 0, 0));
+    assert_eq!(reuse_telemetry(&engine), (0, 1, 2));
     assert_eq!(num(&engine, "Sheet1", 1, 1), 3.0);
 
     engine.evaluate_all().unwrap();

@@ -85,7 +85,7 @@ impl crate::traits::FunctionProvider for RegistryFunctionProvider {
 }
 
 #[inline]
-fn normalize_stored_literal(value: LiteralValue) -> LiteralValue {
+pub(crate) fn normalize_stored_literal(value: LiteralValue) -> LiteralValue {
     match value {
         // Public contract: store numerics as Number(f64).
         LiteralValue::Int(i) => LiteralValue::Number(i as f64),

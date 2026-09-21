@@ -2161,6 +2161,12 @@ impl Workbook {
         col: u32,
         value: LiteralValue,
     ) -> Result<(), IoError> {
+        // Re-sending a value the cell already holds is a no-op end to end:
+        // nothing is journalled and no dependent is dirtied. See
+        // `Engine::is_unchanged_literal_write` for the exact conditions.
+        if self.engine.is_unchanged_literal_write(sheet, row, col, &value) {
+            return Ok(());
+        }
         self.ensure_arrow_sheet_capacity(sheet, row as usize, col as usize);
         let staged_before = self
             .enable_changelog
@@ -2607,6 +2613,11 @@ impl Workbook {
                 let r = start_row + ri as u32;
                 for (ci, v) in rvals.iter().enumerate() {
                     let c = start_col + ci as u32;
+                    // Cells that already hold this value contribute no graph
+                    // edit, no journal entry and no dirty mark.
+                    if self.engine.is_unchanged_literal_write(sheet, r, c, v) {
+                        continue;
+                    }
                     let cell = formualizer_eval::reference::CellRef::new(
                         sheet_id,
                         formualizer_eval::reference::Coord::from_excel(r, c, true, true),

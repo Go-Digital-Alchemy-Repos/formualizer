@@ -1900,6 +1900,14 @@ where
         value: LiteralValue,
     ) -> Result<(), crate::engine::EditorError> {
         if self.capture.is_some() {
+            // Re-sending an input the cell already holds journals nothing and
+            // dirties nothing; see `Engine::is_unchanged_literal_write`. The
+            // non-capture arm below reaches the same check inside
+            // `Engine::set_cell_value`, after it observes the function
+            // semantic epoch.
+            if self.engine.is_unchanged_literal_write(sheet, row, col, &value) {
+                return Ok(());
+            }
             let old_value = self.engine.read_cell_value(sheet, row, col);
             let mut old_formula = self.engine.read_cell_formula_ast(sheet, row, col);
             let addr = self.addr_for(sheet, row, col);
@@ -20079,6 +20087,126 @@ where
         }
     }
 
+    /// True when writing `value` into `(sheet, row, col)` cannot change anything
+    /// the engine or its consumers observe, so the write can be dropped instead
+    /// of dirtying every dependent of the cell.
+    ///
+    /// Callers that reach this are re-sending an input they already sent, which
+    /// is the common case for a SheetPort session or a Python `set_value` loop
+    /// that rewrites a whole input block. Without the check, the identical write
+    /// marks the cell dirty and the whole downstream cone is recomputed.
+    ///
+    /// The predicate is deliberately narrow; it only holds when every side
+    /// effect of the full write path is provably an identity:
+    ///
+    /// * `Empty` is excluded. Writing `Empty` has to create the vertex and the
+    ///   Arrow capacity for an absent cell, and undoing a logged
+    ///   `SetValue { old_value: None, new: Empty }` removes the vertex rather
+    ///   than restoring it, so the skip would not be undo-equivalent.
+    /// * `Error` is excluded on both sides. Arrow stores only the error code;
+    ///   the message and extras live in `rich_error_details` /
+    ///   `spill_error_details`, so a plain `Error(kind)` compares equal to a
+    ///   stored rich error of the same kind while actually replacing it.
+    /// * The cell must already hold a plain literal vertex (`VertexKind::Cell`)
+    ///   that carries no structural `#REF!` marking and no staged formula text,
+    ///   both of which the write would clear.
+    /// * No FormulaPlane span may cover the cell: a span cell is materialised
+    ///   only on demotion, so skipping the write would let the next recalc
+    ///   re-materialise the formula over it.
+    /// * No spill may currently be blocked, since a blocked spill is retried
+    ///   from the invalidation the write would otherwise publish.
+    /// * Temporal literals are excluded, and the cell must carry no number
+    ///   format: a real write clears the format and re-derives one only for
+    ///   temporal values, so those are the cases where the skip would keep a
+    ///   format the write would have dropped.
+    /// * Any NaN on either side is treated as unequal, because `NaN != NaN`
+    ///   cannot prove the stored payload is unchanged.
+    pub fn is_unchanged_literal_write(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: &LiteralValue,
+    ) -> bool {
+        if matches!(
+            value,
+            LiteralValue::Empty
+                | LiteralValue::Error(_)
+                | LiteralValue::Date(_)
+                | LiteralValue::DateTime(_)
+                | LiteralValue::Time(_)
+                | LiteralValue::Duration(_)
+        ) {
+            return false;
+        }
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else {
+            return false;
+        };
+        let addr = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        let Some(&vertex_id) = self.graph.get_vertex_id_for_address(&addr) else {
+            return false;
+        };
+        if !matches!(self.graph.get_vertex_kind(vertex_id), VertexKind::Cell) {
+            return false;
+        }
+        if self.graph.is_ref_error(vertex_id) {
+            return false;
+        }
+        if self.get_staged_formula_text(sheet, row, col).is_some() {
+            return false;
+        }
+        if !self.blocked_pending_spills.is_empty() {
+            return false;
+        }
+        if self.config.formula_plane_mode != FormulaPlaneMode::Off {
+            let placement =
+                PlacementCoord::new(sheet_id, row.saturating_sub(1), col.saturating_sub(1));
+            if self
+                .graph
+                .formula_authority()
+                .plane
+                .spans
+                .find_at(placement)
+                .is_some()
+            {
+                return false;
+            }
+        }
+        // A real write clears the cell's number format and re-derives one only
+        // for temporal values, which this predicate already excludes. So the
+        // write is a format identity only when the cell carries no format to
+        // lose -- otherwise the skip would silently keep a format the write
+        // would have dropped, and a formatted serial would keep reading back
+        // as a date.
+        if !matches!(
+            self.effective_format_id(sheet, row, col),
+            None | Some(crate::format::FormatId::GENERAL)
+        ) {
+            return false;
+        }
+        let Some(current) = self.read_cell_value(sheet, row, col) else {
+            return false;
+        };
+        if matches!(current, LiteralValue::Error(_)) {
+            return false;
+        }
+        let incoming = crate::engine::graph::normalize_stored_literal(value.clone());
+        if Self::literal_has_nan(&current) || Self::literal_has_nan(&incoming) {
+            return false;
+        }
+        current == incoming
+    }
+
+    fn literal_has_nan(value: &LiteralValue) -> bool {
+        match value {
+            LiteralValue::Number(n) => n.is_nan(),
+            LiteralValue::Array(rows) => rows
+                .iter()
+                .any(|row| row.iter().any(Self::literal_has_nan)),
+            _ => false,
+        }
+    }
+
     /// Set a cell value
     pub fn set_cell_value(
         &mut self,
@@ -20088,6 +20216,9 @@ where
         value: LiteralValue,
     ) -> Result<(), ExcelError> {
         self.observe_function_semantic_epoch()?;
+        if self.is_unchanged_literal_write(sheet, row, col, &value) {
+            return Ok(());
+        }
         let sheet_existed = self.graph.sheet_id(sheet).is_some();
         let sheet_id = self.graph.sheet_id_mut(sheet);
         let cell_ref = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
