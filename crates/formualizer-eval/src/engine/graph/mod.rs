@@ -1522,6 +1522,7 @@ impl DependencyGraph {
             TableEntrySnapshot, TableRegistryView,
         };
 
+        let formula_plane_mode = self.config.formula_plane_mode;
         let DependencyGraph {
             data_store,
             sheet_reg,
@@ -1645,6 +1646,7 @@ impl DependencyGraph {
             function_provider,
             policy,
         )
+        .with_formula_plane_mode(formula_plane_mode)
     }
 
     /// Converts a `CellRef` to a fully qualified A1-style string (e.g., "SheetName!A1").

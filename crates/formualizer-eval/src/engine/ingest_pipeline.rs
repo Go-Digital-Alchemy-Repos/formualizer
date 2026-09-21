@@ -10,6 +10,7 @@ use crate::engine::arena::{
     AstNodeData, AstNodeId, AstNodeMetadata, CanonicalLabels, CompactRefType, DataStore, SheetKey,
     StringId, ValueRef,
 };
+use crate::engine::FormulaPlaneMode;
 use crate::engine::graph::DependencyGraph;
 use crate::engine::plan::{DependencyPlan, F_HAS_NAMES, F_HAS_RANGES, F_HAS_TABLES, F_VOLATILE};
 use crate::engine::sheet_registry::SheetRegistry;
@@ -159,6 +160,15 @@ pub(crate) struct IngestPipeline<'a> {
     function_provider: &'a dyn FunctionProvider,
     policy: CollectPolicy,
     function_semantics_enabled: bool,
+    /// FormulaPlane mode of the owning graph. When `Off` nothing downstream of
+    /// this pipeline reads the canonical-template products, so `ingest_formula`
+    /// skips producing them (see `formula_plane_products_enabled`).
+    formula_plane_mode: FormulaPlaneMode,
+    /// Set by the FormulaPlane analysis call sites that consume the canonical
+    /// products directly (`CandidateAnalysis::from_ingested` and the FP8 parity
+    /// harness). Those paths need the products regardless of the configured
+    /// mode, so they opt back in explicitly instead of relying on reachability.
+    force_formula_plane_products: bool,
 }
 
 impl<'a> IngestPipeline<'a> {
@@ -180,12 +190,32 @@ impl<'a> IngestPipeline<'a> {
             function_provider,
             policy,
             function_semantics_enabled: true,
+            formula_plane_mode: FormulaPlaneMode::Off,
+            force_formula_plane_products: false,
         }
     }
 
     pub(crate) fn enable_function_semantics(mut self) -> Self {
         self.function_semantics_enabled = true;
         self
+    }
+
+    /// Records the owning graph's FormulaPlane mode so `ingest_formula` can skip
+    /// canonical-template work that no consumer reads while the plane is off.
+    pub(crate) fn with_formula_plane_mode(mut self, mode: FormulaPlaneMode) -> Self {
+        self.formula_plane_mode = mode;
+        self
+    }
+
+    /// Forces production of the canonical-template / read-projection products
+    /// even when the FormulaPlane mode is `Off`.
+    pub(crate) fn enable_formula_plane_products(mut self) -> Self {
+        self.force_formula_plane_products = true;
+        self
+    }
+
+    fn formula_plane_products_enabled(&self) -> bool {
+        self.force_formula_plane_products || self.formula_plane_mode != FormulaPlaneMode::Off
     }
 
     pub(crate) fn ingest_formula(
@@ -228,6 +258,39 @@ impl<'a> IngestPipeline<'a> {
             placement,
             self.function_semantics_enabled,
         );
+        let mut dep_plan = DependencyPlanRow::default();
+        self.collect_dependencies_tree(&ast_for_oracles, placement.sheet_id, &mut dep_plan)?;
+        dep_plan.volatile = self.ast_is_volatile(&ast_for_oracles);
+        dep_plan.dynamic = metadata.labels.has_flag(CanonicalLabels::FLAG_DYNAMIC);
+        dep_plan.dedup_and_sort();
+
+        // With the FormulaPlane off, the only fields any caller reads are
+        // `ast_id`, `placement`, `dep_plan`, `labels` and `canonical_hash`. The
+        // canonical template, its slot map and the read projections cost ~40% of
+        // bulk prepare (`write_function_id_key` alone is 21.6% of it on a 602k
+        // formula workbook), so they are not produced at all in that mode.
+        if !self.formula_plane_products_enabled() {
+            return Ok(IngestedFormula {
+                ast_id,
+                placement,
+                canonical_hash: metadata.canonical_hash,
+                exact_canonical_hash: 0,
+                exact_canonical_key: empty_canonical_key(),
+                parameterized_canonical_hash: 0,
+                parameterized_canonical_key: empty_canonical_key(),
+                literal_slot_descriptors: empty_literal_slot_descriptors(),
+                literal_bindings: Vec::new().into_boxed_slice(),
+                value_ref_slot_descriptors: empty_value_ref_slot_descriptors(),
+                template_slot_map: TemplateSlotMap::default(),
+                labels: metadata.labels,
+                dep_plan,
+                read_summary: None,
+                read_projections: None,
+                read_projection_fallback: None,
+                formula_text,
+            });
+        }
+
         let anchor_row = placement.coord.row().saturating_add(1);
         let anchor_col = placement.coord.col().saturating_add(1);
         let canonical_template =
@@ -238,11 +301,6 @@ impl<'a> IngestPipeline<'a> {
                 self.function_semantics_enabled
                     .then_some(self.function_provider),
             );
-        let mut dep_plan = DependencyPlanRow::default();
-        self.collect_dependencies_tree(&ast_for_oracles, placement.sheet_id, &mut dep_plan)?;
-        dep_plan.volatile = self.ast_is_volatile(&ast_for_oracles);
-        dep_plan.dynamic = metadata.labels.has_flag(CanonicalLabels::FLAG_DYNAMIC);
-        dep_plan.dedup_and_sort();
 
         let (read_projections, read_projection_fallback) = match compute_read_projections(
             &ast_for_oracles,
@@ -1729,6 +1787,28 @@ fn fnv1a_literal_payload(tag: &[u8], bytes: &[u8]) -> u32 {
     (hash as u32 ^ (hash >> 32) as u32) & 0x0fff_ffff
 }
 
+thread_local! {
+    static EMPTY_CANONICAL_KEY: Arc<str> = Arc::<str>::from("");
+    static EMPTY_LITERAL_SLOT_DESCRIPTORS: Arc<[LiteralSlotDescriptor]> =
+        Arc::from(Vec::new().into_boxed_slice());
+    static EMPTY_VALUE_REF_SLOT_DESCRIPTORS: Arc<[ValueRefSlotDescriptor]> =
+        Arc::from(Vec::new().into_boxed_slice());
+}
+
+/// Shared empty placeholders for the FormulaPlane products. Allocating a fresh
+/// empty `Arc` per formula would reintroduce 602k allocations on bulk load.
+fn empty_canonical_key() -> Arc<str> {
+    EMPTY_CANONICAL_KEY.with(Arc::clone)
+}
+
+fn empty_literal_slot_descriptors() -> Arc<[LiteralSlotDescriptor]> {
+    EMPTY_LITERAL_SLOT_DESCRIPTORS.with(Arc::clone)
+}
+
+fn empty_value_ref_slot_descriptors() -> Arc<[ValueRefSlotDescriptor]> {
+    EMPTY_VALUE_REF_SLOT_DESCRIPTORS.with(Arc::clone)
+}
+
 impl DependencyGraph {
     pub(crate) fn ingest_pipeline<'a>(
         &'a mut self,
@@ -1755,7 +1835,7 @@ impl DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Engine, EvalConfig};
+    use crate::engine::{Engine, EvalConfig, FormulaPlaneMode};
     use crate::test_workbook::TestWorkbook;
     use formualizer_parse::parser::parse;
     use proptest::prelude::*;
@@ -1955,6 +2035,104 @@ mod tests {
             .unwrap();
         assert_eq!(ingested.placement, placement);
         assert_ne!(ingested.canonical_hash, 0);
+    }
+
+    /// Change A gate: with `FormulaPlaneMode::Off` the pipeline must skip the
+    /// canonical-template / read-projection products, but the facts the bulk
+    /// ingest path actually consumes (`ast_id`, `dep_plan`, `labels`,
+    /// `canonical_hash`) must be bit-identical to `Shadow` mode.
+    #[test]
+    fn ingest_formula_off_mode_skips_products_but_keeps_deps_and_ast_id() {
+        ensure_builtins_registered();
+        let formulas = [
+            "=A1+1",
+            "=SUM($A$1:$A10)+Sheet1!B2",
+            "=IF(A1>0,SUM(B1:B9),TODAY())",
+            "=OFFSET(A1,1,1)",
+        ];
+
+        for formula in formulas {
+            let ingest = |mode: FormulaPlaneMode| {
+                let mut engine = Engine::new(
+                    TestWorkbook::new(),
+                    EvalConfig::default().with_formula_plane_mode(mode),
+                );
+                let sheet = engine.graph.sheet_id_mut("Sheet1");
+                let placement = CellRef::new(sheet, Coord::from_excel(4, 3, true, true));
+                let ast = parse(formula).unwrap();
+                let mut pipeline = engine.ingest_pipeline();
+                pipeline
+                    .ingest_formula(FormulaAstInput::Tree(ast), placement, None)
+                    .unwrap()
+            };
+
+            let off = ingest(FormulaPlaneMode::Off);
+            let shadow = ingest(FormulaPlaneMode::Shadow);
+
+            assert_eq!(off.ast_id, shadow.ast_id, "ast_id differs for {formula}");
+            assert_eq!(
+                off.placement, shadow.placement,
+                "placement differs for {formula}"
+            );
+            assert_eq!(
+                off.canonical_hash, shadow.canonical_hash,
+                "canonical_hash differs for {formula}"
+            );
+            assert_eq!(off.labels, shadow.labels, "labels differ for {formula}");
+            assert_eq!(
+                off.dep_plan.direct_cell_deps, shadow.dep_plan.direct_cell_deps,
+                "direct cell deps differ for {formula}"
+            );
+            assert_eq!(
+                off.dep_plan.range_deps, shadow.dep_plan.range_deps,
+                "range deps differ for {formula}"
+            );
+            assert_eq!(
+                off.dep_plan.named_refs, shadow.dep_plan.named_refs,
+                "named refs differ for {formula}"
+            );
+            assert_eq!(
+                off.dep_plan.volatile, shadow.dep_plan.volatile,
+                "volatile flag differs for {formula}"
+            );
+            assert_eq!(
+                off.dep_plan.dynamic, shadow.dep_plan.dynamic,
+                "dynamic flag differs for {formula}"
+            );
+
+            // Off mode produces the cheap placeholders, Shadow the real thing.
+            assert!(off.exact_canonical_key.is_empty());
+            assert_eq!(off.exact_canonical_hash, 0);
+            assert_eq!(off.parameterized_canonical_hash, 0);
+            assert!(off.read_projections.is_none());
+            assert!(off.read_summary.is_none());
+            assert!(off.literal_slot_descriptors.is_empty());
+            assert!(off.value_ref_slot_descriptors.is_empty());
+            assert_eq!(off.template_slot_map, TemplateSlotMap::default());
+            assert!(!shadow.exact_canonical_key.is_empty());
+            assert_ne!(shadow.exact_canonical_hash, 0);
+        }
+    }
+
+    /// The explicit opt-in used by the FormulaPlane analysis call sites must
+    /// still yield the products while the configured mode is `Off`.
+    #[test]
+    fn ingest_formula_products_opt_in_overrides_off_mode() {
+        ensure_builtins_registered();
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_formula_plane_mode(FormulaPlaneMode::Off),
+        );
+        let sheet = engine.graph.sheet_id_mut("Sheet1");
+        let placement = CellRef::new(sheet, Coord::from_excel(4, 3, true, true));
+        let ast = parse("=SUM($A$1:$A10)").unwrap();
+        let mut pipeline = engine.ingest_pipeline().enable_formula_plane_products();
+        let ingested = pipeline
+            .ingest_formula(FormulaAstInput::Tree(ast), placement, None)
+            .unwrap();
+        assert!(!ingested.exact_canonical_key.is_empty());
+        assert_ne!(ingested.exact_canonical_hash, 0);
+        assert!(ingested.read_projections.is_some());
     }
 
     // Frozen from `engine/ingest_pipeline.rs` at `ccfeaf83`. Only method names

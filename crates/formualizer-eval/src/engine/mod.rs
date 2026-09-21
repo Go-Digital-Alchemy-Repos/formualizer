@@ -359,7 +359,9 @@ pub mod fp8_parity_test_support {
         let old = old_rewrite.and_then(|_| old_path(engine, &old_ast, placement));
 
         let new = {
-            let mut pipeline = engine.ingest_pipeline();
+            // The parity harness reads the canonical-template products, so it
+            // opts in explicitly rather than depending on the engine's mode.
+            let mut pipeline = engine.ingest_pipeline().enable_formula_plane_products();
             pipeline.ingest_formula(
                 crate::engine::ingest_pipeline::FormulaAstInput::Tree(parsed),
                 placement,

@@ -7563,6 +7563,7 @@ where
             if allow_function_closure {
                 pipeline = pipeline.enable_function_semantics();
             }
+            pipeline = pipeline.enable_formula_plane_products();
             pipeline.ingest_formula(
                 FormulaAstInput::RawArena(ast_id),
                 placement,
@@ -7810,6 +7811,7 @@ where
             .graph
             .ingest_pipeline(&snapshot)
             .enable_function_semantics()
+            .enable_formula_plane_products()
             .ingest_formula(
                 FormulaAstInput::RawArena(ast_id),
                 placement,
@@ -7917,6 +7919,7 @@ where
         let ingested = self
             .ingest_pipeline()
             .enable_function_semantics()
+            .enable_formula_plane_products()
             .ingest_formula(
                 FormulaAstInput::RawArena(ast_id),
                 placement,
@@ -8138,7 +8141,7 @@ where
             Vec<(FormulaPlacementCandidate, CandidateAnalysis)>,
         > = BTreeMap::new();
         {
-            let mut pipeline = self.ingest_pipeline();
+            let mut pipeline = self.ingest_pipeline().enable_formula_plane_products();
             for (batch, sheet_id) in batches.iter().zip(batch_sheet_ids.iter().copied()) {
                 for record in &batch.formulas {
                     if record.row == 0 || record.col == 0 {
@@ -8321,7 +8324,7 @@ where
         let mut plans_by_index: Vec<Option<DependencyPlanRow>> =
             (0..pending_candidates.len()).map(|_| None).collect();
         {
-            let mut pipeline = self.ingest_pipeline();
+            let mut pipeline = self.ingest_pipeline().enable_formula_plane_products();
             for (idx, (sheet_name, candidate)) in pending_candidates.iter_mut().enumerate() {
                 let placement = CellRef::new(
                     candidate.sheet_id,
