@@ -216,6 +216,14 @@ pub struct DependencyGraph {
     /// O(component), not O(sources × component).
     dirty_propagation_visits: u64,
 
+    /// Monotonic count of declared-output anchor-region queries
+    /// (`output_anchors_in_region` / `potential_output_anchors_in_region`).
+    /// Each one walks the sheet's `declared_output_rows` interval tree, which
+    /// on a workbook with tens of thousands of single-cell CSE fences is the
+    /// dominant cost of virtual-dependency analysis. Perf-shape tests assert
+    /// this counter is O(distinct regions), not O(reads).
+    output_anchor_queries: std::sync::atomic::AtomicU64,
+
     /// Nesting depth of active deferred-dirty scopes (`begin_deferred_dirty`
     /// / `end_deferred_dirty`). While > 0, dirty-propagation entry points
     /// queue their sources in `deferred_dirty_pending` instead of running a
@@ -1340,6 +1348,7 @@ impl DependencyGraph {
             declared_output_rows: FxHashMap::default(),
             pending_formula_authorship: FxHashMap::default(),
             dirty_propagation_visits: 0,
+            output_anchor_queries: std::sync::atomic::AtomicU64::new(0),
             deferred_dirty_depth: 0,
             deferred_dirty_pending: Vec::new(),
             volatile_vertices: FxHashSet::default(),
@@ -1699,6 +1708,10 @@ impl DependencyGraph {
         er: u32,
         ec: u32,
     ) -> Vec<VertexId> {
+        // `output_anchors_in_region` counts its own query; this adds the
+        // second interval-tree walk this function performs.
+        self.output_anchor_queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut out = self.output_anchors_in_region(sheet, sr, sc, er, ec);
         for vertex in self
             .declared_output_rows
@@ -1755,6 +1768,8 @@ impl DependencyGraph {
         end_row0: u32,
         end_col0: u32,
     ) -> Vec<VertexId> {
+        self.output_anchor_queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut anchors =
             self.spill_anchors_in_region(sheet_id, start_row0, start_col0, end_row0, end_col0);
         for vertex in self
@@ -2956,6 +2971,12 @@ impl DependencyGraph {
     /// creation (perf-shape observability; see `dirty_propagation_visits`).
     pub(crate) fn dirty_propagation_visits(&self) -> u64 {
         self.dirty_propagation_visits
+    }
+
+    /// See [`Self::output_anchor_queries`] on the field.
+    pub(crate) fn output_anchor_queries(&self) -> u64 {
+        self.output_anchor_queries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Begin a deferred-dirty scope for a multi-edit batch.

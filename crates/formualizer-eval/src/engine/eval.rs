@@ -20954,6 +20954,13 @@ where
         self.graph.dirty_propagation_visits()
     }
 
+    /// Declared-output anchor-region queries performed so far. Perf-shape
+    /// observability for virtual-dependency analysis; see
+    /// `DependencyGraph::output_anchor_queries`.
+    pub fn output_anchor_queries(&self) -> u64 {
+        self.graph.output_anchor_queries()
+    }
+
     /// Evaluate a single vertex.
     /// This is the core of the sequential evaluation logic for Milestone 3.1.
     #[inline]

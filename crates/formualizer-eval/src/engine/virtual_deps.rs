@@ -1,4 +1,5 @@
 use crate::engine::VertexId;
+use formualizer_common::SheetId;
 use crate::engine::VertexKind;
 use crate::engine::eval::Engine;
 use crate::engine::used_extent::{
@@ -403,16 +404,31 @@ impl RangeVirtualDepProvider {
         engine: &Engine<R>,
         v: VertexId,
     ) -> Vec<VertexId> {
+        Self::get_soft_producers_memoized(engine, v, &AnchorRegionMemo::default())
+    }
+
+    pub(crate) fn get_soft_producers_memoized<R: EvaluationContext>(
+        engine: &Engine<R>,
+        v: VertexId,
+        memo: &AnchorRegionMemo,
+    ) -> Vec<VertexId> {
         let mut out = Vec::new();
         for target in engine.graph.get_dependencies(v) {
             if let Some(cell) = engine.graph.get_cell_ref(target) {
-                out.extend(engine.graph.potential_output_anchors_in_region(
-                    cell.sheet_id,
-                    cell.coord.row(),
-                    cell.coord.col(),
-                    cell.coord.row(),
-                    cell.coord.col(),
-                ));
+                out.extend(
+                    memo.potential_output_anchors(
+                        engine,
+                        (
+                            cell.sheet_id,
+                            cell.coord.row(),
+                            cell.coord.col(),
+                            cell.coord.row(),
+                            cell.coord.col(),
+                        ),
+                    )
+                    .iter()
+                    .copied(),
+                );
             }
         }
         if let Some(ranges) = engine.graph.get_range_dependencies(v) {
@@ -429,13 +445,20 @@ impl RangeVirtualDepProvider {
                 else {
                     continue;
                 };
-                out.extend(engine.graph.potential_output_anchors_in_region(
-                    sheet,
-                    extent.start_row.saturating_sub(1),
-                    extent.start_column.saturating_sub(1),
-                    extent.end_row.saturating_sub(1),
-                    extent.end_column.saturating_sub(1),
-                ));
+                out.extend(
+                    memo.potential_output_anchors(
+                        engine,
+                        (
+                            sheet,
+                            extent.start_row.saturating_sub(1),
+                            extent.start_column.saturating_sub(1),
+                            extent.end_row.saturating_sub(1),
+                            extent.end_column.saturating_sub(1),
+                        ),
+                    )
+                    .iter()
+                    .copied(),
+                );
             }
         }
         out.retain(|&u| u != v && (engine.graph.is_dirty(u) || engine.graph.is_volatile(u)));
@@ -448,23 +471,33 @@ impl RangeVirtualDepProvider {
         engine: &Engine<R>,
         v: VertexId,
     ) -> Vec<VertexId> {
+        Self::get_virtual_deps_memoized(engine, v, &AnchorRegionMemo::default())
+    }
+
+    pub(crate) fn get_virtual_deps_memoized<R: EvaluationContext>(
+        engine: &Engine<R>,
+        v: VertexId,
+        memo: &AnchorRegionMemo,
+    ) -> Vec<VertexId> {
         let mut deps = Vec::new();
         // Direct cell reads have physical placeholder dependencies before a spill.
         // Resolve those points to their output producer as well.
         for target in engine.graph.get_dependencies(v) {
             if let Some(cell) = engine.graph.get_cell_ref(target) {
                 deps.extend(
-                    engine
-                        .graph
-                        .output_anchors_in_region(
+                    memo.output_anchors(
+                        engine,
+                        (
                             cell.sheet_id,
                             cell.coord.row(),
                             cell.coord.col(),
                             cell.coord.row(),
                             cell.coord.col(),
-                        )
-                        .into_iter()
-                        .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
+                        ),
+                    )
+                    .iter()
+                    .copied()
+                    .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
                 );
             }
         }
@@ -486,17 +519,19 @@ impl RangeVirtualDepProvider {
                 let ec = extent.end_column;
 
                 deps.extend(
-                    engine
-                        .graph
-                        .output_anchors_in_region(
+                    memo.output_anchors(
+                        engine,
+                        (
                             sheet_id,
                             sr.saturating_sub(1),
                             sc.saturating_sub(1),
                             er.saturating_sub(1),
                             ec.saturating_sub(1),
-                        )
-                        .into_iter()
-                        .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
+                        ),
+                    )
+                    .iter()
+                    .copied()
+                    .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
                 );
                 if let Some(index) = engine.graph.sheet_index(sheet_id) {
                     let sr0 = sr.saturating_sub(1);
@@ -531,6 +566,69 @@ impl RangeVirtualDepProvider {
     }
 }
 
+
+/// Memo for declared-output anchor-region lookups, valid for the lifetime of
+/// ONE [`VirtualDepBuilder::build`] pass.
+///
+/// `output_anchors_in_region` walks the sheet's `declared_output_rows`
+/// interval tree, and `potential_output_anchors_in_region` walks it twice.
+/// A workbook with tens of thousands of single-cell CSE fences makes each walk
+/// return a large candidate list, and a build asks the same question once per
+/// range read — on the Rev FIA child, hundreds of thousands of reads over a
+/// handful of distinct blocks. The graph cannot change during a build (the
+/// builder holds `&Engine`), so the answer for a region is stable and is
+/// computed once per distinct region instead of once per read.
+///
+/// The memo deliberately caches only the RAW anchor sets. Callers filter them
+/// by `is_dirty`/`is_volatile` afterwards, and those flags do change between
+/// builds, so the filter must stay outside the cache. The memo lives no longer
+/// than one build, so a fence added between two builds is seen by the second.
+#[derive(Default)]
+pub(crate) struct AnchorRegionMemo {
+    anchors: std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
+    potential: std::cell::RefCell<rustc_hash::FxHashMap<RegionKey, std::sync::Arc<[VertexId]>>>,
+}
+
+type RegionKey = (SheetId, u32, u32, u32, u32);
+
+impl AnchorRegionMemo {
+    fn output_anchors<R: EvaluationContext>(
+        &self,
+        engine: &Engine<R>,
+        key: RegionKey,
+    ) -> std::sync::Arc<[VertexId]> {
+        if let Some(hit) = self.anchors.borrow().get(&key) {
+            return std::sync::Arc::clone(hit);
+        }
+        let computed: std::sync::Arc<[VertexId]> = engine
+            .graph
+            .output_anchors_in_region(key.0, key.1, key.2, key.3, key.4)
+            .into();
+        self.anchors
+            .borrow_mut()
+            .insert(key, std::sync::Arc::clone(&computed));
+        computed
+    }
+
+    fn potential_output_anchors<R: EvaluationContext>(
+        &self,
+        engine: &Engine<R>,
+        key: RegionKey,
+    ) -> std::sync::Arc<[VertexId]> {
+        if let Some(hit) = self.potential.borrow().get(&key) {
+            return std::sync::Arc::clone(hit);
+        }
+        let computed: std::sync::Arc<[VertexId]> = engine
+            .graph
+            .potential_output_anchors_in_region(key.0, key.1, key.2, key.3, key.4)
+            .into();
+        self.potential
+            .borrow_mut()
+            .insert(key, std::sync::Arc::clone(&computed));
+        computed
+    }
+}
+
 pub struct VirtualDepBuilder<'a, R: EvaluationContext> {
     engine: &'a Engine<R>,
 }
@@ -550,9 +648,18 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             rustc_hash::FxHashMap::default();
         let mut augmented_vertices: Vec<VertexId> = Vec::new();
 
+        // One memo for this whole pass: the graph cannot change while the
+        // builder holds `&Engine`, and it is dropped with the pass so no
+        // answer survives into a later build.
+        let memo = AnchorRegionMemo::default();
         for &v in candidates {
-            augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers(self.engine, v));
-            let mut deps = RangeVirtualDepProvider::get_virtual_deps(self.engine, v);
+            augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers_memoized(
+                self.engine,
+                v,
+                &memo,
+            ));
+            let mut deps =
+                RangeVirtualDepProvider::get_virtual_deps_memoized(self.engine, v, &memo);
             let dynamic_deps = DynamicRefVirtualDepProvider::get_virtual_deps(self.engine, v);
 
             deps.extend(dynamic_deps);
