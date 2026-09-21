@@ -499,3 +499,117 @@ fn bulk_ingest_then_eval_then_edit() {
     assert_eq!(engine.get_cell_value("Sheet1", 1, 2), Some(Number(30.0))); // B1=15*2
     assert_eq!(engine.get_cell_value("Sheet1", 1, 3), Some(Number(65.0))); // C1=15+20+30
 }
+
+/// Change B, first-load arm. On the deferred-graph path the value cells are
+/// loaded before the formulas, so the graph already has vertices when the bulk
+/// ingest starts. The builder must still recognise this as a first load (no
+/// pre-existing formula vertex), skip the `mark_dirty_many` propagation over
+/// every target, and leave every new formula vertex dirty and correct.
+#[test]
+fn bulk_ingest_first_load_after_value_cells_marks_all_formulas_dirty() {
+    let mut engine = Engine::new(TestWorkbook::default(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(2.0))
+        .unwrap();
+    assert_ne!(
+        engine.graph.vertex_count(),
+        0,
+        "value cells must already be in the graph for this to exercise the deferred path"
+    );
+    assert_eq!(engine.graph.formula_vertex_count(), 0);
+
+    ingest(
+        &mut engine,
+        "Sheet1",
+        vec![
+            (1, 2, parse("=A1+1")),
+            (2, 2, parse("=B1+A2")),
+            (3, 2, parse("=SUM(B1:B2)")),
+        ],
+    );
+
+    for (row, col) in [(1u32, 2u32), (2, 2), (3, 2)] {
+        let addr = crate::reference::CellRef::new(
+            engine.graph.sheet_id("Sheet1").unwrap(),
+            crate::reference::Coord::from_excel(row, col, true, true),
+        );
+        let vid = *engine
+            .graph
+            .get_vertex_id_for_address(&addr)
+            .expect("formula vertex exists");
+        assert!(
+            engine.graph.is_dirty(vid),
+            "formula at ({row},{col}) must be dirty after a first-load bulk ingest"
+        );
+    }
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(2.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 2),
+        Some(LiteralValue::Number(4.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 2),
+        Some(LiteralValue::Number(6.0))
+    );
+}
+
+/// Change B, incremental arm. When the graph already holds a formula that
+/// consumes the cell being bulk-ingested, the propagation from the new targets
+/// must still run so the pre-existing consumer is invalidated.
+#[test]
+fn bulk_ingest_into_cell_with_existing_consumer_dirties_that_consumer() {
+    let mut engine = Engine::new(TestWorkbook::default(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=A1+1"))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(2.0))
+    );
+
+    let consumer = {
+        let addr = crate::reference::CellRef::new(
+            engine.graph.sheet_id("Sheet1").unwrap(),
+            crate::reference::Coord::from_excel(1, 2, true, true),
+        );
+        *engine
+            .graph
+            .get_vertex_id_for_address(&addr)
+            .expect("consumer vertex exists")
+    };
+    assert!(
+        !engine.graph.is_dirty(consumer),
+        "consumer must be clean after evaluation"
+    );
+    assert_ne!(engine.graph.formula_vertex_count(), 0);
+
+    // A1 turns from a value cell into a formula through the bulk path.
+    ingest(&mut engine, "Sheet1", vec![(1, 1, parse("=10"))]);
+
+    assert!(
+        engine.graph.is_dirty(consumer),
+        "pre-existing consumer of A1 must be dirty after the bulk ingest"
+    );
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(10.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(11.0))
+    );
+}

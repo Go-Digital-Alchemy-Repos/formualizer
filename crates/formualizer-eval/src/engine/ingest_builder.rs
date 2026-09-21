@@ -350,7 +350,14 @@ impl<'g> BulkIngestBuilder<'g> {
                 .map_err(crate::engine::ResourceLedgerError::into_excel_error)?;
         }
 
-        let had_vertices = self.g.vertex_count() != 0;
+        // `dirty_roots` exists to invalidate the PRE-EXISTING consumers of the
+        // cells we are about to turn into formulas; the new formula vertices
+        // themselves are already marked by `mark_vertices_dirty_batch` below.
+        // Only a formula-bearing vertex can be such a consumer, so testing
+        // `vertex_count() != 0` was wrong on the deferred-graph path: value
+        // cells are loaded before `prepare_graph`, which made every first load
+        // propagate from all ~600k roots for nothing (30% of prepare).
+        let had_formula_vertices = self.g.formula_vertex_count() != 0;
         let mut dirty_roots = Vec::new();
         let mut total_vertices = 0usize;
         let mut total_formulas = 0usize;
@@ -519,7 +526,7 @@ impl<'g> BulkIngestBuilder<'g> {
                         }
                     }
                     self.g.mark_vertices_dirty_batch(&target_vids);
-                    if had_vertices {
+                    if had_formula_vertices {
                         dirty_roots.extend_from_slice(&target_vids);
                     }
                     total_formulas += target_vids.len();
@@ -700,7 +707,9 @@ impl<'g> BulkIngestBuilder<'g> {
 
         // Replacing a formula also invalidates its existing consumers. Do this
         // once, after all new edges are installed, rather than one BFS per row.
-        // On a complete first load every formula is already dirty.
+        // On a first load (`had_formula_vertices == false`) `dirty_roots` is
+        // empty: there is no pre-existing formula that could consume the new
+        // targets, and the targets themselves are already dirty.
         if !dirty_roots.is_empty() {
             self.g.mark_dirty_many(&dirty_roots);
         }

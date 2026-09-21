@@ -1151,6 +1151,29 @@ impl DependencyGraph {
         self.store.len()
     }
 
+    /// Number of vertices that currently carry a formula: cell/formula vertices
+    /// in `vertex_formulas`, plus named-formula vertices (defined names whose
+    /// definition is a formula are *not* recorded in `vertex_formulas`; they
+    /// live in the name registries).
+    ///
+    /// Used by bulk ingest to tell a first load (values only, nothing that can
+    /// consume the incoming formulas) from an incremental ingest into a graph
+    /// that already has formula consumers.
+    pub(crate) fn formula_vertex_count(&self) -> usize {
+        let named_formulas = self
+            .named_ranges
+            .values()
+            .chain(self.sheet_named_ranges.values())
+            .filter(|entry| {
+                matches!(
+                    entry.definition,
+                    crate::engine::named_range::NamedDefinition::Formula { .. }
+                )
+            })
+            .count();
+        self.vertex_formulas.len() + named_formulas
+    }
+
     /// Replace CSR edges in one shot from adjacency and coords
     pub fn build_edges_from_adjacency(
         &mut self,
