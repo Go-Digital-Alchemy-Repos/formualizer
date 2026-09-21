@@ -5240,7 +5240,18 @@ where
         &mut self,
         mode: crate::engine::DeterministicMode,
     ) -> Result<(), ExcelError> {
+        // Build first, so an invalid mode is rejected whether or not it
+        // matches the current one.
         let clock = mode.build_clock()?;
+        if self.config.deterministic_mode == mode {
+            // Same mode, same timestamp, same timezone: the clock has not
+            // moved, so nothing parked as a clock-only constant went stale.
+            // A host that re-pins the same deterministic clock on every
+            // request (as the session runtime does when it acquires a
+            // retained workbook) must not pay a re-dirty of the whole
+            // clock-dependent cone for it.
+            return Ok(());
+        }
         let frozen = mode.is_enabled();
         self.config.deterministic_mode = mode;
         self.clock = crate::timezone::SnapshotClock::new(clock);
@@ -5262,9 +5273,16 @@ where
     pub fn set_clock(&mut self, clock: Arc<dyn crate::timezone::ClockProvider>) {
         self.clock = crate::timezone::SnapshotClock::new(clock);
         // An injected provider is a live clock as far as the engine knows, so
-        // clock-only volatiles go back to refreshing every recalc.
+        // clock-only volatiles go back to refreshing every recalc. Only a
+        // frozen->live transition has cells parked to wake up; with a clock
+        // that was already live they are dirty from the last recalc's redirty
+        // anyway, and this path then behaves exactly as it did before the
+        // frozen-clock skip existed.
+        let was_frozen = self.graph.clock_frozen();
         self.graph.set_clock_frozen(false);
-        self.graph.redirty_all_volatiles();
+        if was_frozen {
+            self.graph.redirty_all_volatiles();
+        }
     }
 
     fn validate_deterministic_mode(&self) -> Result<(), ExcelError> {

@@ -272,3 +272,86 @@ fn frozen_clock_does_not_park_non_clock_volatiles() {
         "RAND() and its dependent must re-evaluate under a frozen clock"
     );
 }
+
+/// Re-pinning the *same* deterministic clock is idempotent: it must not wake
+/// the clock-only volatiles. The session runtime calls
+/// `set_deterministic_clock` with the same timestamp on every acquire of a
+/// retained workbook, so a re-dirty here would reinstate the whole clean-pass
+/// floor on every request (measured: 0.83 s per repeat request on the Avocet
+/// parent). Re-pinning a *different* timestamp must still wake exactly the
+/// clock cone.
+#[test]
+fn repinning_the_same_deterministic_clock_evaluates_nothing() {
+    const CLOCK_DEPENDENTS: u32 = 500;
+
+    let fixed = chrono::Utc
+        .with_ymd_and_hms(2025, 1, 15, 10, 0, 0)
+        .single()
+        .expect("valid fixed timestamp");
+    let same = DeterministicMode::Enabled {
+        timestamp_utc: fixed,
+        timezone: TimeZoneSpec::Utc,
+    };
+    let cfg = EvalConfig {
+        temporal_egress: crate::engine::TemporalEgress::Serial,
+        deterministic_mode: same.clone(),
+        ..Default::default()
+    };
+    let mut engine = Engine::new(TestWorkbook::new(), cfg);
+
+    engine
+        .set_cell_formula("Sheet1", 1, 1, clock_fn("TODAY"))
+        .unwrap();
+    for row in 1..=CLOCK_DEPENDENTS {
+        engine
+            .set_cell_formula("Sheet1", row, 2, plus_one(1, 1, "A1"))
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.evaluate_all().unwrap().computed_vertices, 0);
+
+    // Identical mode, timestamp and timezone: nothing to recompute.
+    engine.set_deterministic_mode(same.clone()).unwrap();
+    assert_eq!(
+        engine.evaluate_all().unwrap().computed_vertices,
+        0,
+        "re-pinning the same deterministic clock must not dirty anything"
+    );
+
+    // Repeated re-pins stay idempotent.
+    for _ in 0..3 {
+        engine.set_deterministic_mode(same.clone()).unwrap();
+        assert_eq!(engine.evaluate_all().unwrap().computed_vertices, 0);
+    }
+
+    // A different timestamp still wakes the clock cell and its cone.
+    let moved = chrono::Utc
+        .with_ymd_and_hms(2025, 6, 2, 10, 0, 0)
+        .single()
+        .expect("valid fixed timestamp");
+    engine
+        .set_deterministic_mode(DeterministicMode::Enabled {
+            timestamp_utc: moved,
+            timezone: TimeZoneSpec::Utc,
+        })
+        .unwrap();
+    assert_eq!(
+        engine.evaluate_all().unwrap().computed_vertices,
+        1 + CLOCK_DEPENDENTS as usize,
+        "moving the deterministic clock must recompute the clock cone"
+    );
+    assert_eq!(engine.evaluate_all().unwrap().computed_vertices, 0);
+
+    // Same timestamp, different timezone is also a move.
+    engine
+        .set_deterministic_mode(DeterministicMode::Enabled {
+            timestamp_utc: moved,
+            timezone: TimeZoneSpec::FixedOffsetSeconds(3600),
+        })
+        .unwrap();
+    assert_eq!(
+        engine.evaluate_all().unwrap().computed_vertices,
+        1 + CLOCK_DEPENDENTS as usize,
+        "changing the deterministic timezone must recompute the clock cone"
+    );
+}

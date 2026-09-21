@@ -3070,6 +3070,10 @@ impl DependencyGraph {
         self.clock_frozen = frozen;
     }
 
+    pub(crate) fn clock_frozen(&self) -> bool {
+        self.clock_frozen
+    }
+
     /// Re-dirty every volatile vertex regardless of the frozen-clock skip.
     /// Used when the clock source itself moves, so cells that were parked as
     /// clock-only constants pick up the new timestamp.
