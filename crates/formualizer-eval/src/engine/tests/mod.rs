@@ -83,6 +83,7 @@ mod issue_306_structural_delete_dirty;
 mod issue_313_insert_invalidation;
 mod spill_atomic;
 mod anchor_region_memo;
+mod virtual_dep_recheck_guard;
 mod spill_basic;
 mod spill_identical_recommit;
 mod spill_config_defaults;

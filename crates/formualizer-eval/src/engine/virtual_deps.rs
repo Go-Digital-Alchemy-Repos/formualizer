@@ -713,6 +713,10 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             rustc_hash::FxHashMap::default();
         let mut augmented_vertices: Vec<VertexId> = Vec::new();
 
+        // The virtual dependencies this pass produces describe the output
+        // footprint as it stands now; the post-pass recheck compares against
+        // it to decide whether anything could have changed them.
+        self.engine.record_vdep_build_footprint_epoch();
         // One memo for every pass this builder runs; `refresh` drops its
         // contents if a fence or the graph moved since the previous pass.
         self.memo.refresh(self.engine);

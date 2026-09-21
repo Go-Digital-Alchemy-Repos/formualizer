@@ -1675,6 +1675,18 @@ pub struct Engine<R> {
     pending_iterative_redirty: Vec<VertexId>,
     pending_output_invalidations: std::sync::Mutex<FxHashSet<VertexId>>,
     output_invalidation_epoch: std::sync::atomic::AtomicU64,
+    /// `DependencyGraph::output_footprint_epoch` as it stood the last time a
+    /// `VirtualDepBuilder` pass read the graph. The post-pass recheck compares
+    /// it with the current one to tell whether a declared fence or a committed
+    /// spill moved since the virtual dependencies it is checking were built.
+    vdep_build_footprint_epoch: std::sync::atomic::AtomicU64,
+
+    /// Post-pass virtual-dependency rechecks that rebuilt the whole
+    /// comparison domain, and those the guard in
+    /// [`Self::changed_virtual_dep_vertices`] answered without a rebuild.
+    /// Monotonic over the engine's life; perf-shape observability only.
+    virtual_dep_recheck_rebuilds: u64,
+    virtual_dep_recheck_skips: u64,
     finalized_output_cycle_vertices: FxHashSet<VertexId>,
 
     /// Formula results persisted in the source workbook. Excel uses these as
@@ -3727,6 +3739,9 @@ where
             pending_iterative_redirty: Vec::new(),
             pending_output_invalidations: std::sync::Mutex::new(FxHashSet::default()),
             output_invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
+            vdep_build_footprint_epoch: std::sync::atomic::AtomicU64::new(0),
+            virtual_dep_recheck_rebuilds: 0,
+            virtual_dep_recheck_skips: 0,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             rich_error_details: FxHashMap::default(),
@@ -3903,6 +3918,9 @@ where
             pending_iterative_redirty: Vec::new(),
             pending_output_invalidations: std::sync::Mutex::new(FxHashSet::default()),
             output_invalidation_epoch: std::sync::atomic::AtomicU64::new(0),
+            vdep_build_footprint_epoch: std::sync::atomic::AtomicU64::new(0),
+            virtual_dep_recheck_rebuilds: 0,
+            virtual_dep_recheck_skips: 0,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             rich_error_details: FxHashMap::default(),
@@ -20960,6 +20978,25 @@ where
         self.graph.dirty_propagation_visits()
     }
 
+    /// Called by every `VirtualDepBuilder::build` pass: the virtual
+    /// dependencies it is about to produce describe the output footprint as it
+    /// stands right now.
+    pub(crate) fn record_vdep_build_footprint_epoch(&self) {
+        self.vdep_build_footprint_epoch.store(
+            self.graph.output_footprint_epoch(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Post-pass virtual-dependency rechecks: `(rebuilt, skipped)`. See
+    /// `Engine::virtual_dep_recheck_rebuilds`.
+    pub fn virtual_dep_recheck_counts(&self) -> (u64, u64) {
+        (
+            self.virtual_dep_recheck_rebuilds,
+            self.virtual_dep_recheck_skips,
+        )
+    }
+
     /// Declared-output anchor-region queries performed so far. Perf-shape
     /// observability for virtual-dependency analysis; see
     /// `DependencyGraph::output_anchor_queries`.
@@ -26123,6 +26160,54 @@ where
             self.force_virtual_dep_changes_remaining_for_test -= 1;
             return vec![vertex];
         }
+        // Post-pass recheck guard.
+        //
+        // This rebuilds the virtual dependencies of the whole comparison
+        // domain to see whether the pass changed any of them; on the Rev FIA
+        // child that is 17-22 s per evaluation and it has never found a
+        // change. It can only find one if something the builder reads moved
+        // during the pass, and only two things move during a pass:
+        //
+        //  * a runtime-reference formula (`OFFSET`, `INDIRECT`, ...) can read
+        //    somewhere else once its precedents have values, so any dynamic
+        //    vertex in the domain means the answer can differ;
+        //  * a committed output footprint — a spill growing, shrinking or
+        //    appearing — changes which anchors a region read resolves to.
+        //    Every such commit records the formulas it invalidated in
+        //    `pending_output_invalidations` (bumping
+        //    `output_invalidation_epoch`), which this function drains into its
+        //    result anyway, and moves the graph's `output_footprint_epoch`.
+        //    The epoch is the load-bearing half: a producer whose own spill
+        //    reaches a cell it reads is excluded from the invalidation set (it
+        //    is the anchor), and its self-cycle is exactly what the recheck
+        //    exists to find.
+        //
+        // With none of those, the builder would be handed the same graph, the
+        // same fences and the same dirty flags it was handed before the pass —
+        // the dirty flags are only cleared afterwards, by
+        // `clear_scheduled_dirty_flags` — so it can only reproduce
+        // `old_vdeps`. Skip it.
+        let has_pending_invalidation = !self
+            .pending_output_invalidations
+            .get_mut()
+            .unwrap()
+            .is_empty();
+        let footprint_moved = self.graph.output_footprint_epoch()
+            != self
+                .vdep_build_footprint_epoch
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if !has_pending_invalidation
+            && !footprint_moved
+            && !to_evaluate
+                .iter()
+                .chain(old_vdeps.keys())
+                .any(|&v| self.graph.is_dynamic(v))
+        {
+            self.virtual_dep_recheck_skips = self.virtual_dep_recheck_skips.saturating_add(1);
+            return Vec::new();
+        }
+        self.virtual_dep_recheck_rebuilds = self.virtual_dep_recheck_rebuilds.saturating_add(1);
+
         let builder = VirtualDepBuilder::new(self);
         let mut comparison_domain = to_evaluate.to_vec();
         comparison_domain.extend(old_vdeps.keys().copied());
