@@ -38,6 +38,16 @@ fn chain_config() -> EvalConfig {
     }
 }
 
+/// `chain_config` with the read-site guard pinned on, so the two guard tests
+/// assert the guard's behaviour rather than the ambient
+/// `FZ_SPEC_CHAIN_READ_GUARD` of whoever ran the suite.
+fn read_guard_config() -> EvalConfig {
+    EvalConfig {
+        spec_chain_read_guard: true,
+        ..chain_config()
+    }
+}
+
 fn plain_config() -> EvalConfig {
     EvalConfig {
         speculative_chain: false,
@@ -67,6 +77,59 @@ fn build_range_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, Exce
     }
     engine.set_cell_formula("Sheet1", 1, 3, parse("=SUM($B$1:$B$40)").unwrap())?;
     Ok(engine)
+}
+
+/// Two independent islands in one book, so an edit can dirty one without
+/// touching the other.
+///
+/// * The range island: A1:A20 values feed B1..B20 (each `SUM($A$1:$A$20)`),
+///   which feed C1 (`SUM($B$1:$B$20)`) — the same range shape the static
+///   schedule cache refuses.
+/// * The isolated island: the value E1 feeds F1 (`=$E$1+1`) and nothing else.
+///
+/// Editing E1 dirties `{F1}` alone, and editing A-column dirties the range
+/// island alone. That is what makes a *partial* bank and then a request on
+/// either side of its member set constructible.
+fn build_two_island_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, ExcelError> {
+    let mut engine = Engine::new(TestWorkbook::new(), config);
+    for row in 1..=20u32 {
+        engine.set_cell_value("Sheet1", row, 1, LiteralValue::Int(row as i64))?;
+    }
+    for row in 1..=20u32 {
+        engine.set_cell_formula("Sheet1", row, 2, parse("=SUM($A$1:$A$20)").unwrap())?;
+    }
+    engine.set_cell_formula("Sheet1", 1, 3, parse("=SUM($B$1:$B$20)").unwrap())?;
+    engine.set_cell_value("Sheet1", 1, 5, LiteralValue::Int(1))?;
+    engine.set_cell_formula("Sheet1", 1, 6, parse("=$E$1+1").unwrap())?;
+    Ok(engine)
+}
+
+/// Every formula cell of [`build_two_island_workbook`], for a whole-book
+/// value comparison against an engine that never had the chain enabled.
+fn two_island_formula_values(engine: &Engine<TestWorkbook>) -> Vec<(u32, u32, Option<LiteralValue>)> {
+    let mut values = Vec::new();
+    for row in 1..=20u32 {
+        values.push((row, 2, engine.get_cell_value("Sheet1", row, 2)));
+    }
+    values.push((1, 3, engine.get_cell_value("Sheet1", 1, 3)));
+    values.push((1, 6, engine.get_cell_value("Sheet1", 1, 6)));
+    values
+}
+
+/// Bank a chain over `{F1}` alone: run the full recalc, retire its chain with
+/// a topology edit on the isolated island, and let the narrow pass that
+/// follows bank. Returns the telemetry of the partial bank.
+///
+/// The one topology edit after a banking pass is the drop budget these
+/// sequences declare to `chain_sequence_with_expected_drops`.
+fn bank_partial_chain_over_the_isolated_island(
+    engine: &mut Engine<TestWorkbook>,
+) -> Result<(), ExcelError> {
+    engine.evaluate_all()?;
+    assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
+    engine.set_cell_formula("Sheet1", 1, 6, parse("=$E$1+2").unwrap())?;
+    engine.evaluate_all()?;
+    Ok(())
 }
 
 /// A workbook whose schedule contains a genuine SCC: B1 and C1 are mutually
@@ -137,12 +200,27 @@ fn build_growing_spill_workbook(config: EvalConfig) -> Result<Engine<TestWorkboo
 /// No sleep: a retry is needed only when a registration actually landed inside
 /// the window, and a fresh attempt opens a fresh window.
 fn chain_sequence<T>(
+    attempt: impl FnMut() -> Result<(T, SpecChainTelemetry), ExcelError>,
+) -> Result<T, ExcelError> {
+    chain_sequence_with_expected_drops(0, attempt)
+}
+
+/// `chain_sequence` for a closure that retires the chain itself.
+///
+/// A sequence that needs a *partial* bank has to retire the full-recalc chain
+/// first, and the only lever for that is a topology edit — which is a drop
+/// like any other (`clear_cached_static_schedule`). Such a closure therefore
+/// cannot run under `chain_sequence`, whose signature is "any drop at all";
+/// it states how many drops it causes itself, and only a drop beyond that
+/// budget is treated as the concurrent-registration flake and retried.
+fn chain_sequence_with_expected_drops<T>(
+    expected_drops: u32,
     mut attempt: impl FnMut() -> Result<(T, SpecChainTelemetry), ExcelError>,
 ) -> Result<T, ExcelError> {
     let mut observed: Vec<SpecChainTelemetry> = Vec::new();
     for _ in 0..3 {
         let (value, telemetry) = attempt()?;
-        if telemetry.chain_drops > 0 {
+        if telemetry.chain_drops > expected_drops {
             observed.push(telemetry);
             continue;
         }
@@ -150,6 +228,7 @@ fn chain_sequence<T>(
     }
     panic!(
         "the banked chain was retired during the sequence on all 3 attempts \
+         beyond the {expected_drops} drop(s) the sequence causes itself \
          (a concurrent `register_function` moves the semantic epoch and \
          `observe_function_semantic_epoch` drops the chain); telemetry per \
          attempt: {observed:#?}"
@@ -598,5 +677,288 @@ fn spec_chain_falls_back_when_a_spill_grows_during_the_walk() -> Result<(), Exce
     // admission, the dirty set `{D1}` is inside the chain, and no demotion
     // round ran.
     assert_eq!(telemetry.last_reason, Some("spill_footprint_moved_mid_walk"));
+    Ok(())
+}
+
+/// A request whose dirty set is inside a *partial* chain's members is served
+/// by the walk, exactly as one inside a full-recalc chain is.
+///
+/// The partial chain here covers `{F1}` alone. Re-editing E1 dirties `{F1}`
+/// again, which is inside it, so the gate admits the request and the walk
+/// runs — the whole point of banking from an edit rather than only from a
+/// full recalc.
+#[test]
+fn request_inside_banked_members_walks_chain_after_partial_bank() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let (values, reference_values, telemetry) = chain_sequence_with_expected_drops(1, || {
+        let mut engine = build_two_island_workbook(chain_config())?;
+        let mut reference = build_two_island_workbook(plain_config())?;
+        bank_partial_chain_over_the_isolated_island(&mut engine)?;
+        reference.evaluate_all()?;
+        reference.set_cell_formula("Sheet1", 1, 6, parse("=$E$1+2").unwrap())?;
+        reference.evaluate_all()?;
+
+        assert!(
+            engine.spec_chain_is_installed(),
+            "the narrow pass banked a chain"
+        );
+        let partial_members = engine.spec_chain_telemetry().members_at_bank;
+        assert_eq!(partial_members, 1, "the chain covers F1 and nothing else");
+
+        // Dirties {F1} only: E1 is a value cell read by F1 alone.
+        engine.set_cell_value("Sheet1", 1, 5, LiteralValue::Int(9))?;
+        engine.evaluate_all()?;
+        reference.set_cell_value("Sheet1", 1, 5, LiteralValue::Int(9))?;
+        reference.evaluate_all()?;
+
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok((
+            (
+                two_island_formula_values(&engine),
+                two_island_formula_values(&reference),
+                telemetry.clone(),
+            ),
+            telemetry,
+        ))
+    })?;
+
+    assert_eq!(
+        telemetry.chain_walks, 1,
+        "the request inside the partial chain was walked"
+    );
+    assert_eq!(telemetry.last_path, Some("chain"));
+    assert_eq!(telemetry.last_reason, None, "the walk completed");
+    assert_eq!(
+        telemetry.chain_builds, 2,
+        "the full recalc and the narrow pass, and no rebank on the walk"
+    );
+    assert_eq!(telemetry.partial_banks, 1);
+    assert_eq!(values, reference_values);
+    Ok(())
+}
+
+/// A request whose dirty set leaves a partial chain's members is refused by
+/// the existing gate, and the exact pass that serves it banks a WIDER chain
+/// that the next such request walks.
+///
+/// This is what keeps a session from being stuck with the narrow chain its
+/// first edit happened to produce: one exact pass is paid, once, per widening.
+#[test]
+fn request_outside_banked_members_falls_back_and_rebanks_wider() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let (narrow_members, wide_members, values, reference_values, telemetry) =
+        chain_sequence_with_expected_drops(1, || {
+            let mut engine = build_two_island_workbook(chain_config())?;
+            let mut reference = build_two_island_workbook(plain_config())?;
+            bank_partial_chain_over_the_isolated_island(&mut engine)?;
+            reference.evaluate_all()?;
+            reference.set_cell_formula("Sheet1", 1, 6, parse("=$E$1+2").unwrap())?;
+            reference.evaluate_all()?;
+            let narrow_members = engine.spec_chain_telemetry().members_at_bank;
+
+            // The range island: dirties B1..B20 and C1, none of which is in
+            // the banked `{F1}`.
+            engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(99))?;
+            engine.evaluate_all()?;
+            reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(99))?;
+            reference.evaluate_all()?;
+            let refused = engine.spec_chain_telemetry().clone();
+            assert_eq!(
+                refused.last_reason,
+                Some("dirty_vertex_outside_chain"),
+                "the gate refused the request, and the bank that followed \
+                 wrote no reason of its own"
+            );
+            let wide_members = refused.members_at_bank;
+
+            // The same dirty set again: now inside the chain the refused
+            // request's exact pass left behind.
+            engine.set_cell_value("Sheet1", 2, 1, LiteralValue::Int(77))?;
+            engine.evaluate_all()?;
+            reference.set_cell_value("Sheet1", 2, 1, LiteralValue::Int(77))?;
+            reference.evaluate_all()?;
+
+            let telemetry = engine.spec_chain_telemetry().clone();
+            Ok((
+                (
+                    narrow_members,
+                    wide_members,
+                    two_island_formula_values(&engine),
+                    two_island_formula_values(&reference),
+                    telemetry.clone(),
+                ),
+                telemetry,
+            ))
+        })?;
+
+    assert_eq!(narrow_members, 1, "the first bank covered F1 alone");
+    assert_eq!(
+        wide_members, 21,
+        "the refused request's exact pass banked over B1..B20 and C1"
+    );
+    assert_eq!(
+        telemetry.chain_builds, 3,
+        "full recalc, narrow bank, wider rebank"
+    );
+    assert_eq!(telemetry.partial_banks, 2, "neither rebank was a full recalc");
+    assert_eq!(
+        telemetry.chain_walks, 1,
+        "only the last request was inside the chain"
+    );
+    assert_eq!(telemetry.last_path, Some("chain"));
+    assert_eq!(telemetry.last_reason, None);
+    assert_eq!(values, reference_values);
+    Ok(())
+}
+
+/// Two successive edits served off a partial bank produce, cell for cell,
+/// what a never-chained engine produces.
+///
+/// The r9 digest gate in miniature: the edits straddle the partial chain's
+/// members, so the sequence exercises the walk, the gate refusal and the
+/// rebank in one engine, and every formula cell is compared.
+#[test]
+fn second_edit_after_partial_bank_matches_exact_digest() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let mut engine = build_two_island_workbook(chain_config())?;
+    let mut reference = build_two_island_workbook(plain_config())?;
+
+    bank_partial_chain_over_the_isolated_island(&mut engine)?;
+    reference.evaluate_all()?;
+    reference.set_cell_formula("Sheet1", 1, 6, parse("=$E$1+2").unwrap())?;
+    reference.evaluate_all()?;
+    assert_eq!(
+        two_island_formula_values(&engine),
+        two_island_formula_values(&reference),
+        "the partial bank's own pass already diverged"
+    );
+
+    // First edit: inside the banked members, so it is walked.
+    engine.set_cell_value("Sheet1", 1, 5, LiteralValue::Int(9))?;
+    engine.evaluate_all()?;
+    reference.set_cell_value("Sheet1", 1, 5, LiteralValue::Int(9))?;
+    reference.evaluate_all()?;
+    assert_eq!(
+        two_island_formula_values(&engine),
+        two_island_formula_values(&reference),
+        "first edit diverged"
+    );
+
+    // Second edit: outside them, so it is refused, served exactly and rebanked.
+    engine.set_cell_value("Sheet1", 3, 1, LiteralValue::Int(50))?;
+    engine.evaluate_all()?;
+    reference.set_cell_value("Sheet1", 3, 1, LiteralValue::Int(50))?;
+    reference.evaluate_all()?;
+    assert_eq!(
+        two_island_formula_values(&engine),
+        two_island_formula_values(&reference),
+        "second edit diverged"
+    );
+
+    // Third: back inside the rebanked members, walked again.
+    engine.set_cell_value("Sheet1", 4, 1, LiteralValue::Int(60))?;
+    engine.evaluate_all()?;
+    reference.set_cell_value("Sheet1", 4, 1, LiteralValue::Int(60))?;
+    reference.evaluate_all()?;
+    assert_eq!(
+        two_island_formula_values(&engine),
+        two_island_formula_values(&reference),
+        "third edit diverged"
+    );
+    Ok(())
+}
+
+/// The read-site guard fires when a reader is walked before a producer of a
+/// range it reads, and the request's values are still the exact path's.
+///
+/// No scheduler output can produce that order, so the banked order is
+/// corrupted deliberately through `spec_chain_reverse_banked_units_for_test`:
+/// reversing the units puts C1 (`SUM($B$1:$B$40)`) ahead of the layer that
+/// produces B1..B40. The guard sees 40 vertices still pending inside the rect
+/// C1 is about to read, stops the walk at the end of that unit, and returns
+/// before `clear_dirty_flags`, so the exact path redoes everything and the bad
+/// read's values are discarded.
+#[test]
+fn read_guard_detects_reader_before_later_layer_producer() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let (values, reference_values, telemetry) = chain_sequence(|| {
+        let mut engine = build_range_workbook(read_guard_config())?;
+        let mut reference = build_range_workbook(plain_config())?;
+        engine.evaluate_all()?;
+        reference.evaluate_all()?;
+        assert!(engine.spec_chain_is_installed());
+        assert!(
+            engine.spec_chain_reverse_banked_units_for_test(),
+            "the banked order must exist to be corrupted"
+        );
+
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        engine.evaluate_all()?;
+        reference.evaluate_all()?;
+
+        let values: Vec<Option<LiteralValue>> = (1..=40u32)
+            .map(|row| engine.get_cell_value("Sheet1", row, 2))
+            .chain(std::iter::once(engine.get_cell_value("Sheet1", 1, 3)))
+            .collect();
+        let reference_values: Vec<Option<LiteralValue>> = (1..=40u32)
+            .map(|row| reference.get_cell_value("Sheet1", row, 2))
+            .chain(std::iter::once(reference.get_cell_value("Sheet1", 1, 3)))
+            .collect();
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok((
+            (values, reference_values, telemetry.clone()),
+            telemetry,
+        ))
+    })?;
+
+    assert_eq!(
+        telemetry.last_reason,
+        Some("read_guard_out_of_order"),
+        "the walk stopped on the guard, not on anything else"
+    );
+    assert_eq!(telemetry.last_path, Some("full"));
+    assert_eq!(telemetry.chain_walks, 0, "no walk completed");
+    assert!(
+        telemetry.read_guard_violations >= 1,
+        "the violation is counted: {telemetry:#?}"
+    );
+    assert!(telemetry.read_guard_checks >= 1);
+    assert_eq!(
+        values, reference_values,
+        "the fallback's values are the exact path's"
+    );
+    Ok(())
+}
+
+/// A sound chain walk probes reads and flags none of them.
+///
+/// The counterpart assertion to the one above, and the one that matters for
+/// the flip: a false positive costs a whole request's chain gain, so "the
+/// guard is silent on an ordinary range-shaped walk" is the property under
+/// test. `read_guard_checks > 0` is what makes the zero meaningful — without
+/// it the test would pass on a guard that never ran.
+#[test]
+fn read_guard_is_silent_on_gate_workbook_shaped_walk() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let telemetry = chain_sequence(|| {
+        let mut engine = build_range_workbook(read_guard_config())?;
+        engine.evaluate_all()?;
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        engine.evaluate_all()?;
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok((telemetry.clone(), telemetry))
+    })?;
+
+    assert_eq!(telemetry.chain_walks, 1, "the value edit was walked");
+    assert_eq!(telemetry.last_path, Some("chain"));
+    assert!(
+        telemetry.read_guard_checks > 0,
+        "the walk resolved range reads and the guard saw them: {telemetry:#?}"
+    );
+    assert_eq!(
+        telemetry.read_guard_violations, 0,
+        "a correctly ordered walk must not be flagged: {telemetry:#?}"
+    );
     Ok(())
 }
