@@ -73,6 +73,8 @@ pub(crate) fn merge_python_eval_config(base: &mut EvalConfig, python_config: &Ev
     base.formula_plane_mode = python_config.formula_plane_mode;
     base.evaluation_budgets = python_config.evaluation_budgets.clone();
     base.cycle = python_config.cycle;
+    base.speculative_chain = python_config.speculative_chain;
+    base.spec_chain_read_guard = python_config.spec_chain_read_guard;
 }
 
 #[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
@@ -168,6 +170,32 @@ impl PyEvaluationConfig {
     #[getter]
     pub fn get_span_evaluation(&self) -> bool {
         self.inner.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental
+    }
+
+    /// Bank and reuse the Excel-style calculation chain.
+    ///
+    /// The default is the engine's own — `FZ_SPEC_CHAIN`'s reader, so the
+    /// binding never diverges from a Rust host on the same environment.
+    #[setter]
+    pub fn set_speculative_chain(&mut self, value: bool) {
+        self.inner.speculative_chain = value;
+    }
+
+    #[getter]
+    pub fn get_speculative_chain(&self) -> bool {
+        self.inner.speculative_chain
+    }
+
+    /// Read-site out-of-order backstop for the chain. Only meaningful when
+    /// `speculative_chain` is set; default from `FZ_SPEC_CHAIN_READ_GUARD`.
+    #[setter]
+    pub fn set_spec_chain_read_guard(&mut self, value: bool) {
+        self.inner.spec_chain_read_guard = value;
+    }
+
+    #[getter]
+    pub fn get_spec_chain_read_guard(&self) -> bool {
+        self.inner.spec_chain_read_guard
     }
 
     /// Maximum evaluation work units for one outer request.

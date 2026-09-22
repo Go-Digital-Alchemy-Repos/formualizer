@@ -1097,6 +1097,43 @@ impl PyWorkbook {
         ))
     }
 
+    /// The chain build/walk/fallback and read-guard counters for this
+    /// engine's life, and which path the last evaluation took.
+    ///
+    /// Example:
+    /// ```python
+    ///     t = wb.spec_chain_telemetry()
+    ///     print(t.chain_walks, t.read_guard_coarse_hits, t.read_guard_violations)
+    /// ```
+    pub fn spec_chain_telemetry(&self) -> PyResult<PySpecChainTelemetry> {
+        let wb = self.read_inner()?;
+        Ok(PySpecChainTelemetry::from_engine(
+            wb.engine().spec_chain_telemetry(),
+        ))
+    }
+
+    /// Turn the calculation chain on or off on the live engine.
+    ///
+    /// Turning it off drops any banked chain with it. Turning it on banks
+    /// nothing by itself: the next converged exact pass banks, which is what
+    /// makes a *partial* bank constructible from Python — construct with the
+    /// chain off, warm the workbook with `evaluate_all()`, call
+    /// `set_speculative_chain(True)`, then edit, and that edit's exact pass
+    /// banks over its own dirty members.
+    pub fn set_speculative_chain(&self, enabled: bool) -> PyResult<()> {
+        self.write_inner()?
+            .engine_mut()
+            .set_speculative_chain(enabled);
+        Ok(())
+    }
+
+    /// Whether the calculation chain is enabled on the live engine.
+    #[getter]
+    pub fn speculative_chain(&self) -> PyResult<bool> {
+        let wb = self.read_inner()?;
+        Ok(wb.engine().speculative_chain_enabled())
+    }
+
     /// Enable formula-free first-witness cycle diagnostics for a bounded set
     /// of 1-based workbook addresses.
     pub fn set_cycle_instrumentation_targets(
@@ -1546,6 +1583,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWorkbookConfig>()?;
     m.add_class::<PyRangeAddress>()?;
     m.add_class::<PyCycleTelemetry>()?;
+    m.add_class::<PySpecChainTelemetry>()?;
     m.add_class::<PyCell>()?;
     Ok(())
 }
@@ -1653,6 +1691,106 @@ impl PyCycleTelemetry {
             self.reused_sccs,
             self.reused_scc_members,
             self.elapsed_ms,
+        )
+    }
+}
+
+/// Which path the engine's evaluations took and what the chain's read-site
+/// guard saw, for the r11 chain instrument.
+///
+/// Counters are cumulative over the engine's life; `last_path` and
+/// `last_reason` describe the most recent evaluation only.
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pyclass)]
+#[pyclass(
+    name = "SpecChainTelemetry",
+    module = "formualizer.formualizer_py",
+    from_py_object
+)]
+#[derive(Clone, Debug)]
+pub struct PySpecChainTelemetry {
+    /// Chains banked.
+    #[pyo3(get)]
+    pub chain_builds: usize,
+    /// Of those, banked from a pass in which some formula vertex was clean.
+    #[pyo3(get)]
+    pub partial_banks: usize,
+    /// Members of the last banked chain.
+    #[pyo3(get)]
+    pub members_at_bank: usize,
+    /// Requests served by walking the chain.
+    #[pyo3(get)]
+    pub chain_walks: usize,
+    /// Walk rounds that demoted vertices back to the exact path.
+    #[pyo3(get)]
+    pub demotion_rounds: usize,
+    /// Vertices demoted, totalled.
+    #[pyo3(get)]
+    pub demoted_vertices: usize,
+    /// Requests the chain could not serve.
+    #[pyo3(get)]
+    pub fallbacks: usize,
+    /// Installed chains taken away out of band.
+    #[pyo3(get)]
+    pub chain_drops: u32,
+    /// Range reads the read-site guard probed.
+    #[pyo3(get)]
+    pub read_guard_checks: u64,
+    /// Probes the guard's coarse per-column filter flagged.
+    #[pyo3(get)]
+    pub read_guard_coarse_hits: u64,
+    /// Probes the guard's exact test confirmed as out of order.
+    #[pyo3(get)]
+    pub read_guard_violations: u64,
+    /// Why the last evaluation did not use the chain, if it did not.
+    #[pyo3(get)]
+    pub last_reason: Option<String>,
+    /// Path the last evaluation ran: `"chain"` or `"full"`.
+    #[pyo3(get)]
+    pub last_path: Option<String>,
+}
+
+impl PySpecChainTelemetry {
+    pub(crate) fn from_engine(t: &formualizer::eval::engine::SpecChainTelemetry) -> Self {
+        Self {
+            chain_builds: t.chain_builds,
+            partial_banks: t.partial_banks,
+            members_at_bank: t.members_at_bank,
+            chain_walks: t.chain_walks,
+            demotion_rounds: t.demotion_rounds,
+            demoted_vertices: t.demoted_vertices,
+            fallbacks: t.fallbacks,
+            chain_drops: t.chain_drops,
+            read_guard_checks: t.read_guard_checks,
+            read_guard_coarse_hits: t.read_guard_coarse_hits,
+            read_guard_violations: t.read_guard_violations,
+            last_reason: t.last_reason.map(str::to_owned),
+            last_path: t.last_path.map(str::to_owned),
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "emscripten"), gen_stub_pymethods)]
+#[pymethods]
+impl PySpecChainTelemetry {
+    fn __repr__(&self) -> String {
+        format!(
+            "SpecChainTelemetry(chain_builds={}, partial_banks={}, members_at_bank={}, \
+             chain_walks={}, demotion_rounds={}, demoted_vertices={}, fallbacks={}, \
+             chain_drops={}, read_guard_checks={}, read_guard_coarse_hits={}, \
+             read_guard_violations={}, last_reason={:?}, last_path={:?})",
+            self.chain_builds,
+            self.partial_banks,
+            self.members_at_bank,
+            self.chain_walks,
+            self.demotion_rounds,
+            self.demoted_vertices,
+            self.fallbacks,
+            self.chain_drops,
+            self.read_guard_checks,
+            self.read_guard_coarse_hits,
+            self.read_guard_violations,
+            self.last_reason,
+            self.last_path,
         )
     }
 }

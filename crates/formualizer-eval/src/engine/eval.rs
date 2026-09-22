@@ -7304,6 +7304,29 @@ where
         self.spec_chain.is_some()
     }
 
+    /// Turn the calculation chain on or off on a live engine.
+    ///
+    /// Turning it off also drops any banked chain, because a chain banked
+    /// before the flip describes an order nothing will re-validate: leaving it
+    /// installed would let a later re-enable walk a stale one.
+    ///
+    /// Turning it *on* banks nothing by itself. The next converged exact pass
+    /// banks, so the instrument that wants a partial bank warms the workbook
+    /// with the chain off, flips it on, and edits: that edit's exact pass is
+    /// then the first pass that can bank, and it banks over its own dirty
+    /// members rather than a full recalc's.
+    pub fn set_speculative_chain(&mut self, enabled: bool) {
+        self.config.speculative_chain = enabled;
+        if !enabled {
+            self.drop_spec_chain();
+        }
+    }
+
+    /// Whether the calculation chain is enabled on this engine.
+    pub fn speculative_chain_enabled(&self) -> bool {
+        self.config.speculative_chain
+    }
+
     /// Reverse the banked chain's unit order, so the next walk runs a
     /// deliberately wrong one. Returns false when no chain is installed.
     ///
