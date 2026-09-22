@@ -1,14 +1,34 @@
 //! Tests for the Excel-style speculative calculation chain
 //! (`EvalConfig::speculative_chain`).
 
-use crate::engine::{Engine, EvalConfig, SpecChainTelemetry};
+use crate::engine::{CycleConfig, Engine, EvalConfig, SpecChainTelemetry, TemporalEgress};
 use crate::function::{FnCaps, Function};
 use crate::function_registry;
 use crate::test_workbook::TestWorkbook;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_parse::parser::parse;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Serializes this module's tests against each other.
+///
+/// `spec_chain_retired_by_a_function_registration` calls `register_function`,
+/// which moves the process-global registry's semantic epoch and retires any
+/// banked chain in the same binary. Without this lock it can land in the
+/// middle of a sibling test's bank-then-walk sequence and force that test onto
+/// the retry path (or, in the counting test, change which path a pass took).
+/// The lock removes the interference this module creates for itself;
+/// `chain_sequence` still covers registrations from the other eight test
+/// modules, which take no lock.
+static SPEC_CHAIN_TESTS: Mutex<()> = Mutex::new(());
+
+/// Poisoning-tolerant: a panicking test has already failed, and its poison
+/// must not cascade into every other test in the module.
+fn spec_chain_test_guard() -> MutexGuard<'static, ()> {
+    SPEC_CHAIN_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn chain_config() -> EvalConfig {
     EvalConfig {
@@ -26,6 +46,15 @@ fn plain_config() -> EvalConfig {
     }
 }
 
+fn iterative_config(speculative_chain: bool) -> EvalConfig {
+    EvalConfig {
+        speculative_chain,
+        enable_virtual_dep_telemetry: true,
+        temporal_egress: TemporalEgress::Serial,
+        ..EvalConfig::default().with_cycle(CycleConfig::iterate(100, 0.001))
+    }
+}
+
 fn build_range_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, ExcelError> {
     let mut engine = Engine::new(TestWorkbook::new(), config);
     for row in 1..=40u32 {
@@ -40,6 +69,29 @@ fn build_range_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, Exce
     Ok(engine)
 }
 
+/// A workbook whose schedule contains a genuine SCC: B1 and C1 are mutually
+/// dependent, settled by `CyclePolicy::Iterate`. A1 is an ordinary value, so
+/// the book can also be value-edited.
+fn build_cycle_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, ExcelError> {
+    let mut engine = Engine::new(TestWorkbook::new(), config);
+    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(10))?;
+    engine.set_cell_formula("Sheet1", 1, 2, parse("=0.5*$A$1+0.5*C1").unwrap())?;
+    engine.set_cell_formula("Sheet1", 1, 3, parse("=0.5*B1+0.5*20").unwrap())?;
+    Ok(engine)
+}
+
+/// The `virtual_dep_recheck_guard::a_spill_that_grows_during_the_pass_still_rechecks`
+/// fixture: D1 spills A1 rows down column D, and F5 reads only the tail of the
+/// possible footprint, so with a one-row spill it is not ordered behind D1 and
+/// is not even dirty when A1 changes.
+fn build_growing_spill_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, ExcelError> {
+    let mut engine = Engine::new(TestWorkbook::new(), config);
+    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))?;
+    engine.set_cell_formula("Sheet1", 1, 4, parse("=SEQUENCE($A$1)").unwrap())?;
+    engine.set_cell_formula("Sheet1", 5, 6, parse("=SUM($D$5:$D$8)").unwrap())?;
+    Ok(engine)
+}
+
 /// Run a bank-then-walk sequence, retrying it if the process-global function
 /// registry moved underneath it.
 ///
@@ -50,9 +102,19 @@ fn build_range_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, Exce
 /// `register_function` call sites in eight other test modules, running
 /// concurrently with these tests, so a registration landing between a
 /// spec-chain test's banking pass and its walking pass retires the banked
-/// chain; the walking pass then falls back and reports
-/// `last_reason == Some("no_chain")`. That is the signature, and it is the
-/// only thing retried here.
+/// chain and that pass runs the exact path instead.
+///
+/// The signature is `SpecChainTelemetry::chain_drops > 0`: an installed chain
+/// was taken away from this engine during the attempt. `last_reason` cannot
+/// serve. It is a single slot written several times per `evaluate_all` —
+/// `try_spec_chain_evaluate` writes "no_chain" first and `install_spec_chain`
+/// overwrites it later in the same request — so a drop that lands in the
+/// middle of a multi-edit sequence leaves no trace in it at all: the pass that
+/// observed the drop re-banks (in these fixtures a value edit dirties every
+/// formula vertex, so the bank succeeds and writes nothing), the next pass
+/// walks normally and sets `last_reason` to `None`, and the sequence ends
+/// looking clean while one of its passes ran the exact path. That is the r9b2
+/// flake in `spec_chain_matches_the_full_path_on_value_edits`.
 ///
 /// There is no shared lock to join: `scc_reuse.rs` has an `EPOCH_LOCK`, but it
 /// is module-private and none of the registering modules take it, so holding
@@ -71,14 +133,14 @@ fn chain_sequence<T>(
     let mut observed: Vec<SpecChainTelemetry> = Vec::new();
     for _ in 0..3 {
         let (value, telemetry) = attempt()?;
-        if telemetry.last_reason == Some("no_chain") {
+        if telemetry.chain_drops > 0 {
             observed.push(telemetry);
             continue;
         }
         return Ok(value);
     }
     panic!(
-        "the banked chain was retired before the walking pass on all 3 attempts \
+        "the banked chain was retired during the sequence on all 3 attempts \
          (a concurrent `register_function` moves the semantic epoch and \
          `observe_function_semantic_epoch` drops the chain); telemetry per \
          attempt: {observed:#?}"
@@ -87,6 +149,7 @@ fn chain_sequence<T>(
 
 #[test]
 fn spec_chain_second_evaluate_all_reuses_the_chain() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
     let (engine, telemetry) = chain_sequence(|| {
         let mut engine = build_range_workbook(chain_config())?;
 
@@ -117,6 +180,7 @@ fn spec_chain_second_evaluate_all_reuses_the_chain() -> Result<(), ExcelError> {
 
 #[test]
 fn spec_chain_matches_the_full_path_on_value_edits() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
     let (with_counts, without_counts, telemetry) = chain_sequence(|| {
         let mut with = build_range_workbook(chain_config())?;
         let mut without = build_range_workbook(plain_config())?;
@@ -147,6 +211,16 @@ fn spec_chain_matches_the_full_path_on_value_edits() -> Result<(), ExcelError> {
         Ok(((with_counts, without_counts, telemetry.clone()), telemetry))
     })?;
 
+    // Count equality is guaranteed for THIS fixture, which is why it is still
+    // asserted here even though counts are not a chain-vs-exact gate in
+    // general. The chain walk evaluates only dirty vertices while the exact
+    // path also evaluates the pass-through vertices the demand subgraph admits
+    // unconditionally — `NamedScalar`, `NamedArray`, `Range`, `InfiniteRange`
+    // (that is the 68,983-vs-68,980 gap the Avocet flip measured). This book
+    // defines no names, and no `Range`/`InfiniteRange` vertex is ever
+    // constructed in this crate: `VertexKind::Range` appears only in the
+    // discriminant decode and in three kind matches, never in a vertex
+    // creation. So both paths cover exactly the 41 dirty formula vertices.
     assert_eq!(with_counts, without_counts, "computed counts must match");
     assert_eq!(telemetry.chain_walks, 3);
     Ok(())
@@ -154,6 +228,7 @@ fn spec_chain_matches_the_full_path_on_value_edits() -> Result<(), ExcelError> {
 
 #[test]
 fn spec_chain_invalidated_by_a_topology_edit() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
     let (mut engine, telemetry) = chain_sequence(|| {
         let mut engine = build_range_workbook(chain_config())?;
         engine.evaluate_all()?;
@@ -188,6 +263,7 @@ fn spec_chain_invalidated_by_a_topology_edit() -> Result<(), ExcelError> {
 
 #[test]
 fn spec_chain_refuses_to_bank_from_a_partial_pass() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
     let mut engine = build_range_workbook(chain_config())?;
     engine.evaluate_all()?;
     assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
@@ -224,13 +300,36 @@ fn spec_chain_refuses_to_bank_from_a_partial_pass() -> Result<(), ExcelError> {
 
 #[test]
 fn spec_chain_handles_a_new_formula_vertex_by_falling_back() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
     let mut engine = build_range_workbook(chain_config())?;
     engine.evaluate_all()?;
+    assert!(engine.spec_chain_is_installed(), "the full pass banks");
+
+    // Adding a formula bumps the topology epoch, which retires the chain at the
+    // edit through `clear_cached_static_schedule` — so the next request does
+    // not even reach a staleness check, it finds no chain at all.
     engine.set_cell_formula("Sheet1", 3, 5, parse("=$A$1+1").unwrap())?;
+    assert!(!engine.spec_chain_is_installed());
+
     engine.evaluate_all()?;
     assert_eq!(
         engine.get_cell_value("Sheet1", 3, 5),
         Some(LiteralValue::Number(2.0))
+    );
+
+    let telemetry = engine.spec_chain_telemetry().clone();
+    assert_eq!(telemetry.last_path, Some("full"), "the request fell back");
+    assert_eq!(telemetry.chain_walks, 0, "nothing was walked");
+    assert_eq!(
+        telemetry.fallbacks, 2,
+        "both requests reached the exact path"
+    );
+    // `last_reason` is the LAST thing written in the request, and the fallback's
+    // own "no_chain" is overwritten later in the same `evaluate_all` by the bank
+    // refusal: the post-edit pass dirties only E3, not every formula vertex.
+    assert_eq!(
+        telemetry.last_reason,
+        Some("producers_not_all_dirty_at_bank_time")
     );
     Ok(())
 }
@@ -270,6 +369,7 @@ impl Function for SpecChainRegistryProbe {
 /// engine that never had the chain enabled at all.
 #[test]
 fn spec_chain_retired_by_a_function_registration() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
     let mut engine = build_range_workbook(chain_config())?;
     let mut reference = build_range_workbook(plain_config())?;
     engine.evaluate_all()?;
@@ -294,6 +394,10 @@ fn spec_chain_retired_by_a_function_registration() -> Result<(), ExcelError> {
     );
     assert_eq!(telemetry.last_path, Some("full"));
     assert_eq!(telemetry.chain_walks, 0, "the retired chain was not walked");
+    assert_eq!(
+        telemetry.chain_drops, 1,
+        "the drop is what `chain_sequence` retries on"
+    );
 
     for row in 1..=40u32 {
         assert_eq!(
@@ -305,6 +409,132 @@ fn spec_chain_retired_by_a_function_registration() -> Result<(), ExcelError> {
     assert_eq!(
         engine.get_cell_value("Sheet1", 1, 3),
         reference.get_cell_value("Sheet1", 1, 3)
+    );
+    Ok(())
+}
+
+/// A schedule containing an SCC is never banked (clause (f) of the safety
+/// argument).
+///
+/// The banked SCC would be the whole strongly connected component, while a
+/// later request's SCC comes from Tarjan over that request's dirty-filtered
+/// candidates: with retained/iterative members held clean the two sets differ,
+/// and settling the banked superset would stamp `#CIRC!` over — and tear down
+/// spills anchored by — members the exact path would not have touched. The
+/// walk can also fall back mid-request, which would let one request settle the
+/// same SCC twice and double-advance its iteration budget. Refusing the bank
+/// puts both out of reach; the price is that cyclic books never get a chain.
+#[test]
+fn spec_chain_refuses_to_bank_a_schedule_containing_a_cycle() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let mut engine = build_cycle_workbook(iterative_config(true))?;
+    let mut reference = build_cycle_workbook(iterative_config(false))?;
+
+    engine.evaluate_all()?;
+    reference.evaluate_all()?;
+
+    let telemetry = engine.spec_chain_telemetry().clone();
+    assert_eq!(
+        telemetry.chain_builds, 0,
+        "a schedule with a cycle unit must not be banked"
+    );
+    assert_eq!(telemetry.last_reason, Some("cycle_unit_in_schedule"));
+    assert!(!engine.spec_chain_is_installed());
+    assert_eq!(telemetry.chain_walks, 0);
+
+    // And it stays refused across later requests, so the walk's defensive
+    // cycle branch is never reached.
+    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(30))?;
+    reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(30))?;
+    engine.evaluate_all()?;
+    reference.evaluate_all()?;
+
+    let telemetry = engine.spec_chain_telemetry().clone();
+    assert_eq!(telemetry.chain_builds, 0);
+    assert_eq!(telemetry.chain_walks, 0);
+    assert_eq!(telemetry.last_reason, Some("cycle_unit_in_schedule"));
+
+    // The values the flag-on engine produces are the flag-off engine's.
+    for col in 2..=3u32 {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 1, col),
+            reference.get_cell_value("Sheet1", 1, col),
+            "column {col} diverged"
+        );
+    }
+    Ok(())
+}
+
+/// The mid-walk spill check: a dynamic array that grows during a chain walk
+/// hands the rest of the request to the exact path, and the request's values
+/// are the ones a never-chained engine produces.
+///
+/// D1 spills `SEQUENCE($A$1)` down column D. F5 reads only D5:D8, so with a
+/// one-row spill it is neither a dependent of D1 nor dirty when A1 changes:
+/// the walk's dirty set is `{D1}` alone. Growing the spill to eight rows
+/// commits a footprint that invalidates F5 *during* the walk, which is exactly
+/// what the mid-walk check exists to catch.
+#[test]
+fn spec_chain_falls_back_when_a_spill_grows_during_the_walk() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let mut engine = build_growing_spill_workbook(chain_config())?;
+    let mut reference = build_growing_spill_workbook(plain_config())?;
+
+    engine.evaluate_all()?;
+    reference.evaluate_all()?;
+    assert!(
+        engine.spec_chain_is_installed(),
+        "the full pass banks a chain over {{D1, F5}}"
+    );
+    assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
+    let fallbacks_before = engine.spec_chain_telemetry().fallbacks;
+
+    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Number(8.0))?;
+    reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Number(8.0))?;
+    engine.evaluate_all()?;
+    reference.evaluate_all()?;
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 5, 6),
+        Some(LiteralValue::Number(26.0)),
+        "5+6+7+8, i.e. the reader saw the grown spill"
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 5, 6),
+        reference.get_cell_value("Sheet1", 5, 6)
+    );
+    for row in 1..=8u32 {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row, 4),
+            reference.get_cell_value("Sheet1", row, 4),
+            "spilled row {row} diverged"
+        );
+    }
+
+    let telemetry = engine.spec_chain_telemetry().clone();
+    assert_eq!(telemetry.last_path, Some("full"), "the walk did not finish");
+    assert_eq!(telemetry.chain_walks, 0, "no walk completed");
+    assert_eq!(
+        telemetry.fallbacks,
+        fallbacks_before + 1,
+        "exactly one fallback, and the only one this request could take"
+    );
+    assert_eq!(
+        telemetry.demotion_rounds, 0,
+        "the fallback was not the demotion cap"
+    );
+    // The fallback's own reason, "spill_footprint_moved_mid_walk", is not
+    // readable at the end of the request: the exact path runs next and its
+    // converged branch overwrites `last_reason` with the bank refusal. The
+    // walk had already evaluated and cleared D1 before re-dirtying F5, so that
+    // pass is partial and refuses to bank. The fallback itself is pinned by
+    // `fallbacks` above: the chain was installed, the topology and footprint
+    // epochs were unmoved at admission, the dirty set `{D1}` is inside the
+    // chain, and no demotion round ran — the mid-walk spill check is the only
+    // remaining source of a fallback on this request.
+    assert_eq!(
+        telemetry.last_reason,
+        Some("producers_not_all_dirty_at_bank_time")
     );
     Ok(())
 }

@@ -363,6 +363,14 @@ fn virtual_dep_telemetry_static_workbook_has_no_dynamic_changes() {
     assert_eq!(t.changed_vdeps_total, 0);
 }
 
+/// The default config publishes no populated virtual-dependency record, on
+/// every evaluation path.
+///
+/// The engine deliberately takes `speculative_chain` from `EvalConfig::default()`
+/// (i.e. from the ambient `FZ_SPEC_CHAIN`) rather than pinning it false: the
+/// second pass below is the one the chain walk serves, and the walk used to
+/// publish a populated record regardless of the flag. With the flag off the
+/// second pass is the ordinary exact path and the assertions are unchanged.
 #[test]
 fn virtual_dep_telemetry_disabled_by_default() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
@@ -377,5 +385,22 @@ fn virtual_dep_telemetry_disabled_by_default() {
     engine.evaluate_all().unwrap();
     let t = engine.last_virtual_dep_telemetry();
     assert_eq!(t.candidate_vertices_total, 0);
+    assert_eq!(t.schedule_virtual_passes + t.schedule_static_passes, 0);
+
+    // A value edit against the banked chain: this is the pass a walk serves.
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(9.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(10.0))
+    );
+    let t = engine.last_virtual_dep_telemetry();
+    assert_eq!(
+        t.candidate_vertices_total, 0,
+        "a disabled-telemetry engine must not publish a populated record, \
+         chain walk or not"
+    );
     assert_eq!(t.schedule_virtual_passes + t.schedule_static_passes, 0);
 }
