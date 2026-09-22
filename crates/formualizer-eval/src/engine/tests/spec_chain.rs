@@ -1,10 +1,14 @@
 //! Tests for the Excel-style speculative calculation chain
 //! (`EvalConfig::speculative_chain`).
 
-use crate::engine::{Engine, EvalConfig};
+use crate::engine::{Engine, EvalConfig, SpecChainTelemetry};
+use crate::function::{FnCaps, Function};
+use crate::function_registry;
 use crate::test_workbook::TestWorkbook;
+use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_parse::parser::parse;
+use std::sync::Arc;
 
 fn chain_config() -> EvalConfig {
     EvalConfig {
@@ -36,21 +40,73 @@ fn build_range_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, Exce
     Ok(engine)
 }
 
+/// Run a bank-then-walk sequence, retrying it if the process-global function
+/// registry moved underneath it.
+///
+/// The registry is process-global and every `evaluate_all` observes it:
+/// `evaluate_all_unobserved` calls `observe_function_semantic_epoch`, which on
+/// a moved semantic epoch with a non-empty change set clears both
+/// `cached_static_schedule` and `spec_chain`. The eval test binary has
+/// `register_function` call sites in eight other test modules, running
+/// concurrently with these tests, so a registration landing between a
+/// spec-chain test's banking pass and its walking pass retires the banked
+/// chain; the walking pass then falls back and reports
+/// `last_reason == Some("no_chain")`. That is the signature, and it is the
+/// only thing retried here.
+///
+/// There is no shared lock to join: `scc_reuse.rs` has an `EPOCH_LOCK`, but it
+/// is module-private and none of the registering modules take it, so holding
+/// it would not exclude them. The engine-side alternative — not dropping the
+/// chain at `observe_function_semantic_epoch` when no walked formula calls a
+/// changed function — is a behaviour change and a separate decision.
+///
+/// `attempt` must build a *fresh* engine each call and return the telemetry
+/// the walking pass produced. Every outcome other than the signature above is
+/// handed straight back to the caller, so nothing a test asserts is weakened.
+/// No sleep: a retry is needed only when a registration actually landed inside
+/// the window, and a fresh attempt opens a fresh window.
+fn chain_sequence<T>(
+    mut attempt: impl FnMut() -> Result<(T, SpecChainTelemetry), ExcelError>,
+) -> Result<T, ExcelError> {
+    let mut observed: Vec<SpecChainTelemetry> = Vec::new();
+    for _ in 0..3 {
+        let (value, telemetry) = attempt()?;
+        if telemetry.last_reason == Some("no_chain") {
+            observed.push(telemetry);
+            continue;
+        }
+        return Ok(value);
+    }
+    panic!(
+        "the banked chain was retired before the walking pass on all 3 attempts \
+         (a concurrent `register_function` moves the semantic epoch and \
+         `observe_function_semantic_epoch` drops the chain); telemetry per \
+         attempt: {observed:#?}"
+    );
+}
+
 #[test]
 fn spec_chain_second_evaluate_all_reuses_the_chain() -> Result<(), ExcelError> {
-    let mut engine = build_range_workbook(chain_config())?;
+    let (engine, telemetry) = chain_sequence(|| {
+        let mut engine = build_range_workbook(chain_config())?;
 
-    engine.evaluate_all()?;
-    // First call builds through the ordinary schedule path and banks a chain.
-    assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
-    assert_eq!(engine.spec_chain_telemetry().chain_walks, 0);
-    assert_eq!(engine.spec_chain_telemetry().last_path, Some("full"));
+        engine.evaluate_all()?;
+        // First call builds through the ordinary schedule path and banks a chain.
+        assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
+        assert_eq!(engine.spec_chain_telemetry().chain_walks, 0);
+        assert_eq!(engine.spec_chain_telemetry().last_path, Some("full"));
 
-    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
-    engine.evaluate_all()?;
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        engine.evaluate_all()?;
 
-    let telemetry = engine.spec_chain_telemetry().clone();
-    assert_eq!(telemetry.chain_walks, 1, "second evaluate must walk the chain");
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok(((engine, telemetry.clone()), telemetry))
+    })?;
+
+    assert_eq!(
+        telemetry.chain_walks, 1,
+        "second evaluate must walk the chain"
+    );
     assert_eq!(telemetry.chain_builds, 1, "no rebuild on the second call");
     assert_eq!(telemetry.fallbacks, 1, "only the first call fell back");
     assert_eq!(telemetry.last_path, Some("chain"));
@@ -61,47 +117,59 @@ fn spec_chain_second_evaluate_all_reuses_the_chain() -> Result<(), ExcelError> {
 
 #[test]
 fn spec_chain_matches_the_full_path_on_value_edits() -> Result<(), ExcelError> {
-    let mut with = build_range_workbook(chain_config())?;
-    let mut without = build_range_workbook(plain_config())?;
+    let (with_counts, without_counts, telemetry) = chain_sequence(|| {
+        let mut with = build_range_workbook(chain_config())?;
+        let mut without = build_range_workbook(plain_config())?;
 
-    let mut with_counts = vec![with.evaluate_all()?.computed_vertices];
-    let mut without_counts = vec![without.evaluate_all()?.computed_vertices];
+        let mut with_counts = vec![with.evaluate_all()?.computed_vertices];
+        let mut without_counts = vec![without.evaluate_all()?.computed_vertices];
 
-    for value in [7i64, 11, 13] {
-        with.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(value))?;
-        with_counts.push(with.evaluate_all()?.computed_vertices);
-        without.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(value))?;
-        without_counts.push(without.evaluate_all()?.computed_vertices);
+        for value in [7i64, 11, 13] {
+            with.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(value))?;
+            with_counts.push(with.evaluate_all()?.computed_vertices);
+            without.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(value))?;
+            without_counts.push(without.evaluate_all()?.computed_vertices);
 
-        for row in 1..=40u32 {
+            for row in 1..=40u32 {
+                assert_eq!(
+                    with.get_cell_value("Sheet1", row, 2),
+                    without.get_cell_value("Sheet1", row, 2),
+                    "row {row} diverged at value {value}"
+                );
+            }
             assert_eq!(
-                with.get_cell_value("Sheet1", row, 2),
-                without.get_cell_value("Sheet1", row, 2),
-                "row {row} diverged at value {value}"
+                with.get_cell_value("Sheet1", 1, 3),
+                without.get_cell_value("Sheet1", 1, 3)
             );
         }
-        assert_eq!(
-            with.get_cell_value("Sheet1", 1, 3),
-            without.get_cell_value("Sheet1", 1, 3)
-        );
-    }
+
+        let telemetry = with.spec_chain_telemetry().clone();
+        Ok(((with_counts, without_counts, telemetry.clone()), telemetry))
+    })?;
 
     assert_eq!(with_counts, without_counts, "computed counts must match");
-    assert_eq!(with.spec_chain_telemetry().chain_walks, 3);
+    assert_eq!(telemetry.chain_walks, 3);
     Ok(())
 }
 
 #[test]
 fn spec_chain_invalidated_by_a_topology_edit() -> Result<(), ExcelError> {
-    let mut engine = build_range_workbook(chain_config())?;
-    engine.evaluate_all()?;
-    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(5))?;
-    engine.evaluate_all()?;
-    assert_eq!(engine.spec_chain_telemetry().chain_walks, 1);
+    let (mut engine, telemetry) = chain_sequence(|| {
+        let mut engine = build_range_workbook(chain_config())?;
+        engine.evaluate_all()?;
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(5))?;
+        engine.evaluate_all()?;
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok(((engine, telemetry.clone()), telemetry))
+    })?;
+    assert_eq!(telemetry.chain_walks, 1);
 
     // A formula edit bumps the topology epoch and must retire the chain.
     engine.set_cell_formula("Sheet1", 2, 4, parse("=SUM($A$1:$A$20)").unwrap())?;
-    assert!(!engine.spec_chain_is_installed(), "topology edit retires chain");
+    assert!(
+        !engine.spec_chain_is_installed(),
+        "topology edit retires chain"
+    );
 
     engine.evaluate_all()?;
     let telemetry = engine.spec_chain_telemetry().clone();
@@ -163,6 +231,80 @@ fn spec_chain_handles_a_new_formula_vertex_by_falling_back() -> Result<(), Excel
     assert_eq!(
         engine.get_cell_value("Sheet1", 3, 5),
         Some(LiteralValue::Number(2.0))
+    );
+    Ok(())
+}
+
+/// Registered by `spec_chain_retired_by_a_function_registration` only, so that
+/// the registration it performs is this test's own and is guaranteed to move
+/// the registry's semantic epoch.
+struct SpecChainRegistryProbe;
+
+impl Function for SpecChainRegistryProbe {
+    fn caps(&self) -> FnCaps {
+        FnCaps::PURE
+    }
+
+    fn name(&self) -> &'static str {
+        "SPEC_CHAIN_REGISTRY_PROBE"
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        _args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(1.0)))
+    }
+}
+
+/// Pins the signature `chain_sequence` retries, so the retry is anchored to an
+/// asserted mechanism rather than to a guess about a flake.
+///
+/// A `register_function` call moves the registry's semantic epoch with a
+/// non-empty change set; the next `evaluate_all` observes it in
+/// `observe_function_semantic_epoch` and drops the banked chain, so the
+/// request falls back to the exact path and reports
+/// `last_reason == Some("no_chain")` with `last_path == Some("full")`. The
+/// values it produces still have to be right, which is checked against an
+/// engine that never had the chain enabled at all.
+#[test]
+fn spec_chain_retired_by_a_function_registration() -> Result<(), ExcelError> {
+    let mut engine = build_range_workbook(chain_config())?;
+    let mut reference = build_range_workbook(plain_config())?;
+    engine.evaluate_all()?;
+    reference.evaluate_all()?;
+    assert!(
+        engine.spec_chain_is_installed(),
+        "the full pass banks a chain"
+    );
+
+    function_registry::register_function(Arc::new(SpecChainRegistryProbe));
+
+    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+    engine.evaluate_all()?;
+    reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+    reference.evaluate_all()?;
+
+    let telemetry = engine.spec_chain_telemetry().clone();
+    assert_eq!(
+        telemetry.last_reason,
+        Some("no_chain"),
+        "a registration between the two passes retires the banked chain"
+    );
+    assert_eq!(telemetry.last_path, Some("full"));
+    assert_eq!(telemetry.chain_walks, 0, "the retired chain was not walked");
+
+    for row in 1..=40u32 {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row, 2),
+            reference.get_cell_value("Sheet1", row, 2),
+            "row {row} diverged after the registration"
+        );
+    }
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 3),
+        reference.get_cell_value("Sheet1", 1, 3)
     );
     Ok(())
 }
