@@ -29,7 +29,9 @@ use crate::engine::target_preparation::{
 use crate::engine::used_extent::{
     ExtentPolicy, OpenRangeBounds, resolve_used_extent_with_fallback,
 };
-use crate::engine::virtual_deps::{DynamicRefVirtualDepProvider, VirtualDepBuilder};
+use crate::engine::virtual_deps::{
+    DynamicRefVirtualDepProvider, RegionizedBuild, VdepSnapshot, VirtualDepBuilder,
+};
 use crate::engine::{
     ChangeLogger, CycleDetection, CyclePolicy, DependencyGraph, EvalConfig, EvaluationRequestKind,
     EvaluationRequestOutcome, EvaluationResourceBaselineStats, EvaluationResourceReason,
@@ -3118,13 +3120,13 @@ fn estimated_span_bindings_bytes(
 
 type ScheduleBuildOutput = (
     crate::engine::scheduler::Schedule,
-    FxHashMap<VertexId, Vec<VertexId>>,
+    VdepSnapshot,
     ScheduleBuildMeta,
 );
 
 type EvaluationScheduleBuildOutput = (
     EvaluationSchedule,
-    FxHashMap<VertexId, Vec<VertexId>>,
+    VdepSnapshot,
     ScheduleBuildMeta,
 );
 
@@ -22029,6 +22031,7 @@ where
         const MAX_REPLAN: usize = 5;
         loop {
             let (precedents_to_eval, old_vdeps) = self.build_demand_subgraph(&root_vertices);
+            let old_vdeps = VdepSnapshot::per_cell(old_vdeps);
             if precedents_to_eval.is_empty() {
                 break;
             }
@@ -22664,7 +22667,8 @@ where
                 );
                 self.cancellation_checkpoint("Evaluation cancelled after legacy island")?;
             }
-            let old_virtual_dependencies = VirtualDepBuilder::new(self).build(&legacy_vertices).0;
+            let old_virtual_dependencies =
+                VdepSnapshot::per_cell(VirtualDepBuilder::new(self).build(&legacy_vertices).0);
             let old_dynamic_regions = self.dynamic_virtual_regions(&legacy_vertices);
 
             #[cfg(test)]
@@ -25928,13 +25932,19 @@ where
                 }
                 return Ok((
                     EvaluationSchedule::Shared(Arc::clone(&cached.schedule)),
-                    FxHashMap::default(),
+                    VdepSnapshot::default(),
                     meta,
                 ));
             }
 
             let (schedule, vdeps, mut meta) =
                 self.create_evaluation_schedule_uncached(to_evaluate)?;
+            // A cacheable candidate set has no range dependencies, so a
+            // region-node build over it can never allocate a relay.
+            debug_assert!(
+                vdeps.canon.as_ref().is_none_or(|c| c.producers.is_empty()),
+                "static schedule cache candidate produced region nodes"
+            );
             meta.schedule_cache_hit = false;
             meta.schedule_cache_eligible = true;
             #[cfg(any(test, feature = "benchmark_internal"))]
@@ -26009,16 +26019,15 @@ where
             .config
             .enable_virtual_dep_telemetry
             .then(crate::instant::FzInstant::now);
-        let (mut vdeps, mut region_edges, augmented, mut plan) = if use_region_nodes {
-            builder.build_regionized(to_evaluate)
+        let mut regionized: Option<RegionizedBuild> = None;
+        let (mut vdeps, augmented) = if use_region_nodes {
+            let built = builder.build_regionized(to_evaluate);
+            let vdeps = built.vdeps.clone();
+            let augmented = built.augmented.clone();
+            regionized = Some(built);
+            (vdeps, augmented)
         } else {
-            let (vdeps, augmented) = builder.build(to_evaluate);
-            (
-                vdeps,
-                FxHashMap::default(),
-                augmented,
-                crate::engine::virtual_deps::RegionNodePlan::default(),
-            )
+            builder.build(to_evaluate)
         };
 
         let mut final_evaluate = to_evaluate.to_vec();
@@ -26041,37 +26050,40 @@ where
             if final_evaluate != baseline {
                 if use_region_nodes {
                     let rebuilt = builder.build_regionized(&final_evaluate);
-                    vdeps = rebuilt.0;
-                    region_edges = rebuilt.1;
-                    plan = rebuilt.3;
+                    vdeps = rebuilt.vdeps.clone();
+                    regionized = Some(rebuilt);
                 } else {
                     vdeps = builder.build(&final_evaluate).0;
                 }
             }
         }
 
-        // Merge the relay layer into one adjacency map for the scheduler:
-        // reader -> region nodes, and region node -> its dirty producers.
-        let mut sched_vdeps = vdeps.clone();
-        let mut sched_vertices = final_evaluate.clone();
-        let mut synthetic_base = None;
-        if use_region_nodes && !plan.is_empty() {
-            for (reader, regions) in region_edges.iter() {
+        // With region nodes, merge the relay layer into one adjacency map for
+        // the scheduler: reader -> region nodes, and region node -> its dirty
+        // producers. `vdeps` itself stays region-free for the recheck. Without
+        // region nodes the map is used as it is, no copy.
+        let mut relay: Option<(Vec<VertexId>, FxHashMap<VertexId, Vec<VertexId>>)> = None;
+        if let Some(built) = regionized.as_ref()
+            && !built.plan.is_empty()
+        {
+            let mut sched_vdeps = vdeps.clone();
+            let mut sched_vertices = final_evaluate.clone();
+            for (reader, regions) in built.region_edges.iter() {
                 let slot = sched_vdeps.entry(*reader).or_default();
                 slot.extend(regions.iter().copied());
                 slot.sort_unstable();
                 slot.dedup();
             }
-            for (node, producers) in plan.producers.iter() {
+            for (node, producers) in built.plan.producers.iter() {
                 if !producers.is_empty() {
                     sched_vdeps.insert(*node, producers.clone());
                 }
             }
-            sched_vertices.extend(plan.node_ids());
-            synthetic_base = Some(crate::engine::vertex::VertexId::new(
-                crate::engine::virtual_deps::REGION_NODE_BASE,
-            ));
+            sched_vertices.extend(built.plan.node_ids());
+            relay = Some((sched_vertices, sched_vdeps));
         }
+        let sched_vdeps: &FxHashMap<VertexId, Vec<VertexId>> =
+            relay.as_ref().map(|(_, m)| m).unwrap_or(&vdeps);
 
         let builder_elapsed_ms = build_started.map(|t| t.elapsed().as_millis()).unwrap_or(0);
         let vdeps_edges = if self.config.enable_virtual_dep_telemetry {
@@ -26079,21 +26091,30 @@ where
         } else {
             0
         };
+        // Both telemetry figures count the map the scheduler was given.
+        let vdeps_vertices = sched_vdeps.len();
 
         let use_virtual = !sched_vdeps.is_empty();
 
         let scheduler = Scheduler::new(&self.graph);
-        let schedule = if let (true, Some(base)) = (use_virtual, synthetic_base) {
-            scheduler.create_schedule_with_virtual_synthetic(&sched_vertices, &sched_vdeps, base)?
+        let schedule = if let Some((sched_vertices, sched_vdeps)) = relay.as_ref() {
+            scheduler.create_schedule_with_virtual_synthetic(
+                sched_vertices,
+                sched_vdeps,
+                crate::engine::vertex::VertexId::new(
+                    crate::engine::virtual_deps::REGION_NODE_BASE,
+                ),
+            )?
         } else if use_virtual {
             scheduler.create_schedule_with_virtual(&final_evaluate, &vdeps)?
         } else {
             scheduler.create_schedule(&final_evaluate)?
         };
+        drop(relay);
 
         let meta = ScheduleBuildMeta {
             candidate_vertices: to_evaluate.len(),
-            vdeps_vertices: vdeps.len(),
+            vdeps_vertices,
             vdeps_edges,
             builder_elapsed_ms,
             used_virtual_schedule: use_virtual,
@@ -26101,6 +26122,10 @@ where
             schedule_cache_eligible: false,
         };
 
+        let vdeps = VdepSnapshot {
+            map: vdeps,
+            canon: regionized.map(|built| built.canon),
+        };
         Ok((schedule, vdeps, meta))
     }
 
@@ -26215,7 +26240,7 @@ where
     fn changed_virtual_dep_vertices(
         &mut self,
         to_evaluate: &[VertexId],
-        old_vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
+        old_vdeps: &VdepSnapshot,
     ) -> Vec<VertexId> {
         #[cfg(test)]
         if self.force_virtual_dep_changes_remaining_for_test > 0
@@ -26275,27 +26300,38 @@ where
         let builder = VirtualDepBuilder::new(self);
         let mut comparison_domain = to_evaluate.to_vec();
         comparison_domain.extend(old_vdeps.keys().copied());
+        if let Some(canon) = old_vdeps.canon.as_ref() {
+            comparison_domain.extend(canon.vdeps.keys().copied());
+            comparison_domain.extend(canon.regions.keys().copied());
+        }
         comparison_domain.sort_unstable();
         comparison_domain.dedup();
-        // PROTOTYPE (r8a): compare like with like. When the region-node path is
-        // on, the schedule build stored the region-FREE map in `old_vdeps`, so
-        // the rebuild must be region-free too.
-        let new_vdeps = if self.config.virtual_region_nodes {
-            builder.build_regionized(&comparison_domain).0
-        } else {
-            builder.build(&comparison_domain).0
-        };
-
-        let mut candidates = FxHashSet::default();
-        candidates.extend(old_vdeps.keys().copied());
-        candidates.extend(new_vdeps.keys().copied());
-
-        let mut changed = Vec::new();
-        for v in candidates {
-            if old_vdeps.get(&v) != new_vdeps.get(&v) {
-                changed.push(v);
+        // Compare like with like: the rebuild takes the form the old map was
+        // built in, whatever the current config says. A per-cell old map (the
+        // targeted/demand path, the FormulaPlane legacy island) is compared
+        // with a per-cell rebuild; a region-node old map is compared canon to
+        // canon, which is independent of the candidate set and charges a
+        // region's producer change to every reader of that region.
+        let mut changed = match old_vdeps.canon.as_ref() {
+            Some(old_canon) => {
+                let new_canon = builder.build_regionized(&comparison_domain).canon;
+                let domain: FxHashSet<VertexId> = comparison_domain.iter().copied().collect();
+                old_canon.changed_readers(&new_canon, &domain)
             }
-        }
+            None => {
+                let new_vdeps = builder.build(&comparison_domain).0;
+                let mut candidates = FxHashSet::default();
+                candidates.extend(old_vdeps.keys().copied());
+                candidates.extend(new_vdeps.keys().copied());
+                let mut changed = Vec::new();
+                for v in candidates {
+                    if old_vdeps.get(&v) != new_vdeps.get(&v) {
+                        changed.push(v);
+                    }
+                }
+                changed
+            }
+        };
         changed.extend(std::mem::take(
             self.pending_output_invalidations.get_mut().unwrap(),
         ));

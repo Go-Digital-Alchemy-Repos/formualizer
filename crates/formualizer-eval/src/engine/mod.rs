@@ -985,8 +985,10 @@ pub struct EvalConfig {
     /// per reader (r8: 130.8M edges to 301k on the Rev FIA child, first
     /// evaluation 12.2 s to 7.9 s, digests identical).
     ///
-    /// Default is `true`. `FZ_REGION_NODES=0` (or `false`) in the environment
-    /// restores the per-cell edges for A/B measurement without a rebuild.
+    /// Default is `true`. `FZ_REGION_NODES` set to `0`, `false`, `off` or `no`
+    /// (case-insensitive, whitespace trimmed) restores the per-cell edges for
+    /// A/B measurement without a rebuild; `1`, `true`, `on`, `yes` or an
+    /// empty value keep the default. Any other value keeps the default too.
     pub virtual_region_nodes: bool,
 
     /// FormulaPlane ingest/planning mode. Defaults to `Off`; span evaluation is
@@ -1060,7 +1062,12 @@ impl Default for EvalConfig {
             defer_graph_building: false,
             enable_virtual_dep_telemetry: false,
             virtual_region_nodes: std::env::var("FZ_REGION_NODES")
-                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no"
+                    )
+                })
                 .unwrap_or(true),
             formula_plane_mode: FormulaPlaneMode::Off,
             max_formula_plane_cache_candidates: 100_000,

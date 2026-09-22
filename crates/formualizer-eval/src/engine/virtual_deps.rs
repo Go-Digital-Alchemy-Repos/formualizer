@@ -652,8 +652,9 @@ impl RangeVirtualDepProvider {
 }
 
 /// First synthetic region-node id. Real `VertexId`s are allocated densely from
-/// zero, so 2^31 leaves the whole real range untouched; the builder refuses to
-/// use region nodes at all if a real candidate ever reaches it.
+/// zero, so 2^31 leaves the whole real range untouched. [`VirtualDepBuilder::
+/// build_regionized`] checks every candidate against it and falls back to the
+/// per-cell build (no region nodes at all) if a real id ever reaches it.
 pub const REGION_NODE_BASE: u32 = 0x8000_0000;
 
 /// PROTOTYPE (r8a) per-build registry of synthetic region nodes.
@@ -679,6 +680,10 @@ impl RegionNodePlan {
         if let Some(&id) = self.ids.get(&key) {
             return id;
         }
+        assert!(
+            self.ids.len() < (u32::MAX - REGION_NODE_BASE) as usize,
+            "region node id space exhausted"
+        );
         let id = VertexId::new(REGION_NODE_BASE + self.ids.len() as u32);
         let producers: Vec<VertexId> = memo
             .formula_vertices_in_region(engine, key)
@@ -700,6 +705,131 @@ impl RegionNodePlan {
 
     pub fn is_empty(&self) -> bool {
         self.producers.is_empty()
+    }
+
+    /// The build-independent form of this plan: region keys instead of the
+    /// per-build node ids. Taken before single-reader inlining so that every
+    /// interned region and its producers are present.
+    fn canon(
+        &self,
+        vdeps: &rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+        region_edges: &rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    ) -> RegionCanon {
+        let key_of: rustc_hash::FxHashMap<VertexId, RegionKey> =
+            self.ids.iter().map(|(k, &id)| (id, *k)).collect();
+        let mut regions: rustc_hash::FxHashMap<VertexId, Vec<RegionKey>> =
+            rustc_hash::FxHashMap::default();
+        for (reader, nodes) in region_edges {
+            let mut keys: Vec<RegionKey> = nodes.iter().map(|n| key_of[n]).collect();
+            keys.sort_unstable();
+            regions.insert(*reader, keys);
+        }
+        let producers = self
+            .producers
+            .iter()
+            .map(|(id, p)| (key_of[id], p.clone()))
+            .collect();
+        RegionCanon {
+            vdeps: vdeps.clone(),
+            regions,
+            producers,
+        }
+    }
+}
+
+/// What a region-node build says about every reader, in a form that does not
+/// depend on which other readers were in the build: the reader's ordinary
+/// (region-free) virtual dependencies before any single-reader inlining, the
+/// regions it reads, and each region's dirty producers. Two canons built from
+/// the same graph state are equal reader for reader whatever the candidate
+/// set, so the post-pass recheck can compare them without a false positive
+/// from the inlining heuristic, and a change in a region's producer set is
+/// visible as a change for every reader of that region.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct RegionCanon {
+    pub vdeps: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    pub regions: rustc_hash::FxHashMap<VertexId, Vec<RegionKey>>,
+    pub producers: rustc_hash::FxHashMap<RegionKey, Vec<VertexId>>,
+}
+
+impl RegionCanon {
+    /// Readers whose dependencies differ between `self` (the schedule-time
+    /// build) and `new` (the post-pass rebuild): a different region-free dep
+    /// list, a different region list, or a region whose producers changed.
+    /// Only readers in `domain` are compared; a region's producer change is
+    /// charged to its readers on either side.
+    pub(crate) fn changed_readers(
+        &self,
+        new: &RegionCanon,
+        domain: &rustc_hash::FxHashSet<VertexId>,
+    ) -> Vec<VertexId> {
+        let mut changed: rustc_hash::FxHashSet<VertexId> = rustc_hash::FxHashSet::default();
+        for &v in domain {
+            if self.vdeps.get(&v) != new.vdeps.get(&v) || self.regions.get(&v) != new.regions.get(&v) {
+                changed.insert(v);
+            }
+        }
+        let mut changed_regions: rustc_hash::FxHashSet<RegionKey> = rustc_hash::FxHashSet::default();
+        for (key, producers) in &self.producers {
+            if new.producers.get(key) != Some(producers) {
+                changed_regions.insert(*key);
+            }
+        }
+        for key in new.producers.keys() {
+            if !self.producers.contains_key(key) {
+                changed_regions.insert(*key);
+            }
+        }
+        if !changed_regions.is_empty() {
+            for canon in [self, new] {
+                for (reader, keys) in &canon.regions {
+                    if domain.contains(reader) && keys.iter().any(|k| changed_regions.contains(k)) {
+                        changed.insert(*reader);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<VertexId> = changed.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Result of [`VirtualDepBuilder::build_regionized`].
+pub(crate) struct RegionizedBuild {
+    /// Region-free virtual dependencies per reader (anchors, resolved direct
+    /// cells, dynamic reads, self-overlap fallbacks and inlined single-reader
+    /// regions).
+    pub vdeps: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    /// Reader -> region nodes it must wait for (after inlining).
+    pub region_edges: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    /// Soft producers admitted by kind, as in [`VirtualDepBuilder::build`].
+    pub augmented: Vec<VertexId>,
+    /// Region node -> dirty producers (after inlining).
+    pub plan: RegionNodePlan,
+    /// The build-independent form, taken before inlining.
+    pub canon: RegionCanon,
+}
+
+/// The old virtual-dependency map a post-pass recheck compares against, plus
+/// how it was built, so the rebuild is made in the same form.
+#[derive(Default)]
+pub(crate) struct VdepSnapshot {
+    pub map: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    /// `Some` when `map` came from a region-node build.
+    pub canon: Option<RegionCanon>,
+}
+
+impl VdepSnapshot {
+    pub(crate) fn per_cell(map: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>) -> Self {
+        Self { map, canon: None }
+    }
+}
+
+impl std::ops::Deref for VdepSnapshot {
+    type Target = rustc_hash::FxHashMap<VertexId, Vec<VertexId>>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
     }
 }
 
@@ -750,7 +880,7 @@ pub(crate) struct AnchorRegionMemo {
 /// Cached vertex ids retained by one memo before it stops inserting.
 const ANCHOR_MEMO_MAX_IDS: usize = 4 << 20;
 
-type RegionKey = (SheetId, u32, u32, u32, u32);
+pub(crate) type RegionKey = (SheetId, u32, u32, u32, u32);
 
 impl Default for AnchorRegionMemo {
     fn default() -> Self {
@@ -952,15 +1082,23 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
     /// cells, dynamic reads, and the per-cell fallback for self-overlapping
     /// readers), `region_edges` maps a reader to the region nodes it must wait
     /// for, and `plan` owns each region node's producer list.
-    pub fn build_regionized(
-        &self,
-        candidates: &[VertexId],
-    ) -> (
-        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
-        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
-        Vec<VertexId>,
-        RegionNodePlan,
-    ) {
+    pub(crate) fn build_regionized(&self, candidates: &[VertexId]) -> RegionizedBuild {
+        // Real ids are allocated densely from zero; a candidate at or above
+        // the synthetic base would be misread as a relay by the scheduler, so
+        // such a build takes the per-cell path with no region nodes at all.
+        if candidates.iter().any(|v| v.0 >= REGION_NODE_BASE) {
+            let (vdeps, augmented) = self.build(candidates);
+            return RegionizedBuild {
+                canon: RegionCanon {
+                    vdeps: vdeps.clone(),
+                    ..RegionCanon::default()
+                },
+                vdeps,
+                region_edges: rustc_hash::FxHashMap::default(),
+                augmented,
+                plan: RegionNodePlan::default(),
+            };
+        }
         let mut vdeps: rustc_hash::FxHashMap<VertexId, Vec<VertexId>> =
             rustc_hash::FxHashMap::default();
         let mut region_edges: rustc_hash::FxHashMap<VertexId, Vec<VertexId>> =
@@ -1001,6 +1139,8 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             }
         }
 
+        let canon = plan.canon(&vdeps, &region_edges);
+
         // A region with a single reader gains nothing from the relay hop: the
         // edge count is the same either way and the extra node only lengthens
         // the layer chain. Inline those back into the reader's own deps and
@@ -1035,7 +1175,13 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
 
         augmented_vertices.sort_unstable();
         augmented_vertices.dedup();
-        (vdeps, region_edges, augmented_vertices, plan)
+        RegionizedBuild {
+            vdeps,
+            region_edges,
+            augmented: augmented_vertices,
+            plan,
+            canon,
+        }
     }
 }
 

@@ -96,8 +96,8 @@ fn region_nodes_preserve_reader_after_producer_ordering() {
         candidates, region_candidates,
         "both engines must produce the same vertex ids for the comparison to mean anything"
     );
-    let (vdeps, region_edges, _augmented, plan) =
-        VirtualDepBuilder::new(&region_engine).build_regionized(&region_candidates);
+    let built = VirtualDepBuilder::new(&region_engine).build_regionized(&region_candidates);
+    let (vdeps, region_edges, plan) = (built.vdeps, built.region_edges, built.plan);
     assert!(
         !plan.is_empty(),
         "the fixture must allocate at least one region node"
@@ -304,6 +304,75 @@ fn indirect_cycle_through_a_region_node_is_still_detected() {
             engine.get_cell_value("Sheet1", 3, 7),
             Some(LiteralValue::Number(1.0)),
             "region_nodes={region_nodes}: G3 = I1"
+        );
+    }
+}
+
+/// The targeted path (`evaluate_cells`) builds its old virtual-dependency
+/// map per cell and schedules without relays. Its post-pass recheck must
+/// therefore rebuild per cell too, whatever the region-node flag says;
+/// otherwise every reader of a shared region reports as changed, the path
+/// replans until `MAX_REPLAN` and returns an error. A dynamic reader
+/// (`INDIRECT`) in the domain is what makes the recheck run at all.
+#[test]
+fn targeted_evaluation_with_dynamic_reader_and_shared_region_converges() {
+    let build = |region_nodes: bool| {
+        let mut engine = Engine::new(TestWorkbook::new(), config(region_nodes));
+        engine
+            .set_cell_value("Sheet1", 1, 3, LiteralValue::Number(2.0))
+            .unwrap(); // C1
+        for row in 1..=6u32 {
+            let f = parse(&format!("=$C$1*{row}")).unwrap();
+            engine.set_cell_formula("Sheet1", row, 1, f).unwrap(); // A1:A6
+        }
+        engine
+            .set_cell_formula("Sheet1", 1, 2, parse("=SUM(A1:A4)").unwrap())
+            .unwrap(); // B1
+        engine
+            .set_cell_formula("Sheet1", 2, 2, parse("=COUNT(A1:A4)").unwrap())
+            .unwrap(); // B2, second reader of A1:A4
+        engine
+            .set_cell_formula("Sheet1", 3, 2, parse("=INDIRECT(\"B1\")+B2").unwrap())
+            .unwrap(); // B3, dynamic
+        engine
+            .set_cell_formula("Sheet1", 4, 2, parse("=SUM(B1:B3)").unwrap())
+            .unwrap(); // B4
+        engine
+    };
+    let mut plain = build(false);
+    let mut region = build(true);
+    let targets = [("Sheet1", 4, 2), ("Sheet1", 3, 2)];
+    let expected = plain.evaluate_cells(&targets).expect("per-cell targeted evaluation");
+    let got = region
+        .evaluate_cells(&targets)
+        .expect("targeted evaluation with region nodes must converge");
+    assert_eq!(expected, got);
+    assert_eq!(got[0], Some(LiteralValue::Number(20.0 + 4.0 + 24.0)));
+
+    // Second request after an input change: the same path again, warm.
+    for engine in [&mut plain, &mut region] {
+        engine
+            .set_cell_value("Sheet1", 1, 3, LiteralValue::Number(3.0))
+            .unwrap();
+    }
+    let expected = plain.evaluate_cells(&targets).unwrap();
+    let got = region.evaluate_cells(&targets).unwrap();
+    assert_eq!(expected, got);
+    assert_eq!(got[0], Some(LiteralValue::Number(30.0 + 4.0 + 34.0)));
+
+    // And a full evaluation with the dynamic reader present, so the
+    // region-node recheck path itself runs (canon against canon).
+    for engine in [&mut plain, &mut region] {
+        engine
+            .set_cell_value("Sheet1", 1, 3, LiteralValue::Number(5.0))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+    }
+    for (row, col) in [(1, 2), (2, 2), (3, 2), (4, 2)] {
+        assert_eq!(
+            plain.get_cell_value("Sheet1", row, col),
+            region.get_cell_value("Sheet1", row, col),
+            "r{row}c{col}"
         );
     }
 }
