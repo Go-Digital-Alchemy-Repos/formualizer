@@ -25954,7 +25954,18 @@ where
                     .unwrap()
                     .schedule_cache_misses += 1;
             }
-            let schedule = if vdeps.is_empty() {
+            // Store only a schedule that carries no virtual dependencies in
+            // either form: the per-cell map must be empty and, when region
+            // nodes ran, no relay may have been allocated. A relay-derived
+            // schedule is ordered by the dirty set that built it and must not
+            // be reused under `(topology_epoch, candidates)` alone (r8 review
+            // follow-up N1; the debug_assert above stays as the loud form).
+            let cacheable = vdeps.is_empty()
+                && vdeps
+                    .canon
+                    .as_ref()
+                    .is_none_or(|c| c.producers.is_empty());
+            let schedule = if cacheable {
                 // Clone previously discarded builder spare capacity. Keep that compact
                 // retained payload while sharing it with the current request.
                 let mut schedule = schedule;
