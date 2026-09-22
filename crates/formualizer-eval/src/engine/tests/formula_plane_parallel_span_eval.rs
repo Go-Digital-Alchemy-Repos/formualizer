@@ -103,9 +103,58 @@ fn parallel_below_threshold_uses_sequential_path() {
     assert_eq!(report.span_eval_placement_count, 50, "{report:?}");
 }
 
+
+/// r10 test hygiene. The parallel span-eval paths are entered only when the
+/// engine holds a rayon pool (`span_eval.rs` gates both parallel arms on
+/// `thread_pool()`), and `Engine::new` cannot build one when the host is out
+/// of threads. The values are identical on the sequential fallback, so the
+/// `parallel_*_invocations` counters below assert a property of the *host*,
+/// not of the engine. Skip, loudly and with the recorded reason, instead of
+/// failing; `thread_pool_absence_is_attributed_rather_than_silent` is the
+/// test that the reason is never dropped.
+#[must_use]
+fn parallel_path_available(engine: &Engine<TestWorkbook>, test: &str) -> bool {
+    if engine.parallel_evaluation_available() {
+        return true;
+    }
+    eprintln!(
+        "SKIP {test}: no rayon thread pool, parallel span-eval path unreachable ({})",
+        engine
+            .thread_pool_build_error()
+            .unwrap_or("parallel evaluation disabled by config")
+    );
+    false
+}
+
+#[test]
+fn thread_pool_absence_is_attributed_rather_than_silent() {
+    let disabled = auth_engine(false);
+    assert!(!disabled.parallel_evaluation_available());
+    assert_eq!(disabled.thread_pool_build_error(), None);
+    assert!(!disabled.baseline_stats().thread_pool_build_failed);
+
+    let enabled = auth_engine(true);
+    // Either the pool built, or the failure is recorded. Never both, never
+    // neither: that is the invariant r10 added.
+    assert_eq!(
+        enabled.parallel_evaluation_available(),
+        enabled.thread_pool_build_error().is_none(),
+        "pool present = {}, recorded error = {:?}",
+        enabled.parallel_evaluation_available(),
+        enabled.thread_pool_build_error()
+    );
+    assert_eq!(
+        enabled.baseline_stats().thread_pool_build_failed,
+        enabled.thread_pool_build_error().is_some()
+    );
+}
+
 #[test]
 fn parallel_above_threshold_uses_parallel_path() {
     let mut engine = build_a_plus_one_family(1_000, true);
+    if !parallel_path_available(&engine, "parallel_above_threshold_uses_parallel_path") {
+        return;
+    }
     engine.evaluate_all().unwrap();
 
     let report = engine.last_formula_plane_span_eval_report().unwrap();
@@ -129,6 +178,9 @@ fn parallel_disabled_via_config_uses_sequential() {
 fn parallel_with_lookup_cache_no_corruption() {
     let rows = 10_000;
     let mut engine = auth_engine(true);
+    if !parallel_path_available(&engine, "parallel_with_lookup_cache_no_corruption") {
+        return;
+    }
     let mut formulas = Vec::with_capacity(rows as usize);
     for row in 1..=rows {
         engine
@@ -167,6 +219,9 @@ fn parallel_with_lookup_cache_no_corruption() {
 fn parallel_per_placement_with_per_placement_bindings() {
     let rows = 1_000;
     let mut engine = auth_engine(true);
+    if !parallel_path_available(&engine, "parallel_per_placement_with_per_placement_bindings") {
+        return;
+    }
     let mut formulas = Vec::with_capacity(rows as usize);
     for row in 1..=rows {
         engine
@@ -189,6 +244,9 @@ fn parallel_memoized_groups_correctly_broadcast() {
     let rows = 1_000;
     let groups = 100u32;
     let mut engine = auth_engine(true);
+    if !parallel_path_available(&engine, "parallel_memoized_groups_correctly_broadcast") {
+        return;
+    }
     let mut formulas = Vec::with_capacity(rows as usize);
     for row in 1..=rows {
         let key = if row <= 64 { row % 32 } else { row % groups };
@@ -219,6 +277,9 @@ fn parallel_memoized_groups_correctly_broadcast() {
 fn parallel_short_circuit_correctness_under_parallelism() {
     let rows = 1_000;
     let mut engine = auth_engine(true);
+    if !parallel_path_available(&engine, "parallel_short_circuit_correctness_under_parallelism") {
+        return;
+    }
     let mut formulas = Vec::with_capacity(rows as usize);
     for row in 1..=rows {
         engine

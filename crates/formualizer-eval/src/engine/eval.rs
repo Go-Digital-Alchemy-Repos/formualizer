@@ -1525,6 +1525,12 @@ pub struct Engine<R> {
     /// one recalc — including SCC iteration passes — agree (spec §7.11).
     clock: crate::timezone::SnapshotClock,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Why the shared thread pool is absent when `enable_parallel` asked for
+    /// one. `ThreadPoolBuilder::build` fails under host thread pressure, and
+    /// the engine then runs every parallel-capable path sequentially with
+    /// identical values. Before r10 that failure was dropped, which made a
+    /// degraded engine indistinguishable from `enable_parallel: false`.
+    thread_pool_build_error: Option<String>,
     pub recalc_epoch: u64,
     snapshot_id: std::sync::atomic::AtomicU64,
     topology_epoch: u64,
@@ -2526,6 +2532,9 @@ pub struct EngineBaselineStats {
     /// Members of exactly converged iterative SCCs currently retained across
     /// recalcs (#368).
     pub retained_scc_members: usize,
+    /// True when `enable_parallel` was requested and the rayon pool could not
+    /// be built, so every parallel-capable path ran sequentially (r10).
+    pub thread_pool_build_failed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3700,21 +3709,24 @@ where
         });
 
         // Initialize thread pool based on config
-        let thread_pool = if config.enable_parallel {
+        let (thread_pool, thread_pool_build_error) = if config.enable_parallel {
             let mut builder = ThreadPoolBuilder::new();
             if let Some(max_threads) = config.max_threads {
                 builder = builder.num_threads(max_threads);
             }
 
             match builder.build() {
-                Ok(pool) => Some(Arc::new(pool)),
-                Err(_) => {
-                    // Fall back to sequential evaluation if thread pool creation fails
-                    None
+                Ok(pool) => (Some(Arc::new(pool)), None),
+                Err(err) => {
+                    // Fall back to sequential evaluation if thread pool creation
+                    // fails, but record why: the degradation is observable
+                    // through `thread_pool_build_error` and the
+                    // `thread_pool_build_failed` baseline counter.
+                    (None, Some(err.to_string()))
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         // C1a retained/cache budgets are observational; cache defaults stay explicit.
@@ -3727,6 +3739,7 @@ where
             workbook_load_limits: crate::engine::WorkbookLoadLimits::default(),
             clock: crate::timezone::SnapshotClock::new(clock),
             thread_pool,
+            thread_pool_build_error,
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
             topology_epoch: 0,
@@ -3908,6 +3921,7 @@ where
             workbook_load_limits: crate::engine::WorkbookLoadLimits::default(),
             clock: crate::timezone::SnapshotClock::new(clock),
             thread_pool: Some(thread_pool),
+            thread_pool_build_error: None,
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
             topology_epoch: 0,
@@ -5993,6 +6007,7 @@ where
             formula_plane_array_result_span_demotions: self
                 .formula_plane_array_result_span_demotions,
             retained_scc_members: self.retained_scc_members.len(),
+            thread_pool_build_failed: self.thread_pool_build_error.is_some(),
         }
     }
 
@@ -28195,6 +28210,19 @@ where
     /// Get access to the shared thread pool for parallel evaluation
     pub fn thread_pool(&self) -> Option<&Arc<rayon::ThreadPool>> {
         self.thread_pool.as_ref()
+    }
+
+    /// True when parallel evaluation was requested *and* a rayon pool exists,
+    /// so parallel-capable paths can actually be taken.
+    pub fn parallel_evaluation_available(&self) -> bool {
+        self.thread_pool.is_some()
+    }
+
+    /// The `ThreadPoolBuilder::build` failure that left this engine without a
+    /// pool, if any. `None` means either the pool exists or `enable_parallel`
+    /// was false; it never hides a failure.
+    pub fn thread_pool_build_error(&self) -> Option<&str> {
+        self.thread_pool_build_error.as_deref()
     }
 }
 
