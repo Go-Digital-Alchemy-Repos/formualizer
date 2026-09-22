@@ -25683,6 +25683,36 @@ where
             visited.sort_unstable();
             self.graph.clear_dirty_flags(&visited);
 
+            // A spill committed during the walk records the formulas it
+            // invalidated and moves the footprint epoch. The chain's order is
+            // no longer known-good for those, so re-dirty them (same filter the
+            // full path's recheck applies) and hand the rest of the request to
+            // the exact path.
+            let spill_invalidations: FxHashSet<VertexId> = std::mem::take(
+                self.pending_output_invalidations.get_mut().unwrap(),
+            );
+            let footprint_moved = self.graph.output_footprint_epoch() != chain.footprint_epoch;
+            if !spill_invalidations.is_empty() || footprint_moved {
+                for vertex in spill_invalidations {
+                    if self.graph.vertex_exists(vertex)
+                        && matches!(
+                            self.graph.get_vertex_kind(vertex),
+                            VertexKind::FormulaScalar
+                                | VertexKind::FormulaArray
+                                | VertexKind::NamedScalar
+                                | VertexKind::NamedArray
+                        )
+                        && !self.finalized_output_cycle_vertices.contains(&vertex)
+                    {
+                        self.graph.set_dirty(vertex, true);
+                    }
+                }
+                self.spec_chain_telemetry.last_reason = Some("spill_footprint_moved_mid_walk");
+                self.spec_chain_telemetry.last_path = Some("full");
+                self.spec_chain_telemetry.fallbacks += 1;
+                return Ok(None);
+            }
+
             let residual: Vec<VertexId> = self
                 .graph
                 .get_evaluation_vertices()
