@@ -25999,17 +25999,27 @@ where
             self.recalc_reuse_probe.lock().unwrap().schedule_builds += 1;
         }
         let builder = VirtualDepBuilder::new(self);
-        let (mut vdeps, augmented, builder_elapsed_ms, vdeps_edges) =
-            if self.config.enable_virtual_dep_telemetry {
-                let build_started = crate::instant::FzInstant::now();
-                let (vdeps, augmented) = builder.build(to_evaluate);
-                let builder_elapsed_ms = build_started.elapsed().as_millis();
-                let vdeps_edges = vdeps.values().map(|deps| deps.len()).sum::<usize>();
-                (vdeps, augmented, builder_elapsed_ms, vdeps_edges)
-            } else {
-                let (vdeps, augmented) = builder.build(to_evaluate);
-                (vdeps, augmented, 0, 0)
-            };
+        // PROTOTYPE (r8a): with `virtual_region_nodes` the range producer edges
+        // are routed through one synthetic node per distinct region. `vdeps`
+        // stays region-free (it is what the post-pass recheck compares), while
+        // `region_edges` + `plan` describe the relay layer handed to the
+        // scheduler.
+        let use_region_nodes = self.config.virtual_region_nodes;
+        let build_started = self
+            .config
+            .enable_virtual_dep_telemetry
+            .then(crate::instant::FzInstant::now);
+        let (mut vdeps, mut region_edges, augmented, mut plan) = if use_region_nodes {
+            builder.build_regionized(to_evaluate)
+        } else {
+            let (vdeps, augmented) = builder.build(to_evaluate);
+            (
+                vdeps,
+                FxHashMap::default(),
+                augmented,
+                crate::engine::virtual_deps::RegionNodePlan::default(),
+            )
+        };
 
         let mut final_evaluate = to_evaluate.to_vec();
         if !augmented.is_empty() {
@@ -26029,14 +26039,53 @@ where
             baseline.sort_unstable();
             baseline.dedup();
             if final_evaluate != baseline {
-                vdeps = builder.build(&final_evaluate).0;
+                if use_region_nodes {
+                    let rebuilt = builder.build_regionized(&final_evaluate);
+                    vdeps = rebuilt.0;
+                    region_edges = rebuilt.1;
+                    plan = rebuilt.3;
+                } else {
+                    vdeps = builder.build(&final_evaluate).0;
+                }
             }
         }
 
-        let use_virtual = !vdeps.is_empty();
+        // Merge the relay layer into one adjacency map for the scheduler:
+        // reader -> region nodes, and region node -> its dirty producers.
+        let mut sched_vdeps = vdeps.clone();
+        let mut sched_vertices = final_evaluate.clone();
+        let mut synthetic_base = None;
+        if use_region_nodes && !plan.is_empty() {
+            for (reader, regions) in region_edges.iter() {
+                let slot = sched_vdeps.entry(*reader).or_default();
+                slot.extend(regions.iter().copied());
+                slot.sort_unstable();
+                slot.dedup();
+            }
+            for (node, producers) in plan.producers.iter() {
+                if !producers.is_empty() {
+                    sched_vdeps.insert(*node, producers.clone());
+                }
+            }
+            sched_vertices.extend(plan.node_ids());
+            synthetic_base = Some(crate::engine::vertex::VertexId::new(
+                crate::engine::virtual_deps::REGION_NODE_BASE,
+            ));
+        }
+
+        let builder_elapsed_ms = build_started.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+        let vdeps_edges = if self.config.enable_virtual_dep_telemetry {
+            sched_vdeps.values().map(|deps| deps.len()).sum::<usize>()
+        } else {
+            0
+        };
+
+        let use_virtual = !sched_vdeps.is_empty();
 
         let scheduler = Scheduler::new(&self.graph);
-        let schedule = if use_virtual {
+        let schedule = if let (true, Some(base)) = (use_virtual, synthetic_base) {
+            scheduler.create_schedule_with_virtual_synthetic(&sched_vertices, &sched_vdeps, base)?
+        } else if use_virtual {
             scheduler.create_schedule_with_virtual(&final_evaluate, &vdeps)?
         } else {
             scheduler.create_schedule(&final_evaluate)?
@@ -26228,7 +26277,14 @@ where
         comparison_domain.extend(old_vdeps.keys().copied());
         comparison_domain.sort_unstable();
         comparison_domain.dedup();
-        let (new_vdeps, _) = builder.build(&comparison_domain);
+        // PROTOTYPE (r8a): compare like with like. When the region-node path is
+        // on, the schedule build stored the region-FREE map in `old_vdeps`, so
+        // the rebuild must be region-free too.
+        let new_vdeps = if self.config.virtual_region_nodes {
+            builder.build_regionized(&comparison_domain).0
+        } else {
+            builder.build(&comparison_domain).0
+        };
 
         let mut candidates = FxHashSet::default();
         candidates.extend(old_vdeps.keys().copied());

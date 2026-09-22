@@ -115,7 +115,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // Cycle path: Kahn over the condensation (SCC-as-node).
-        let (units, layers) = self.build_condensation_units(&cycles, acyclic_sccs, None)?;
+        let (units, layers) = self.build_condensation_units(&cycles, acyclic_sccs, None, None)?;
         Ok(Schedule {
             units,
             cycles,
@@ -130,6 +130,39 @@ impl<'a> Scheduler<'a> {
         vertices: &[VertexId],
         vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
     ) -> Result<Schedule, ExcelError> {
+        self.create_schedule_with_virtual_inner(vertices, vdeps, None)
+    }
+
+    /// PROTOTYPE (r8a): schedule over a vertex set that also contains synthetic
+    /// nodes (ids at or above `synthetic_base`).
+    ///
+    /// Synthetic nodes exist only as ordering relays: they have no graph
+    /// adjacency, carry no formula, and are removed from the emitted layers and
+    /// cycles before the schedule is returned. Their incoming edges live in
+    /// `vdeps` exactly like any other virtual edge.
+    pub fn create_schedule_with_virtual_synthetic(
+        &self,
+        vertices: &[VertexId],
+        vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
+        synthetic_base: VertexId,
+    ) -> Result<Schedule, ExcelError> {
+        let mut schedule =
+            self.create_schedule_with_virtual_inner(vertices, vdeps, Some(synthetic_base))?;
+        for layer in schedule.layers.iter_mut() {
+            layer.vertices.retain(|v| v.0 < synthetic_base.0);
+        }
+        for cycle in schedule.cycles.iter_mut() {
+            cycle.retain(|v| v.0 < synthetic_base.0);
+        }
+        Ok(schedule)
+    }
+
+    fn create_schedule_with_virtual_inner(
+        &self,
+        vertices: &[VertexId],
+        vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
+        synthetic_base: Option<VertexId>,
+    ) -> Result<Schedule, ExcelError> {
         #[cfg(feature = "tracing")]
         let _span = tracing::info_span!(
             "scheduler_with_virtual",
@@ -140,22 +173,24 @@ impl<'a> Scheduler<'a> {
         // 1. SCC detection with virtual deps
         #[cfg(feature = "tracing")]
         let _scc_span = tracing::info_span!("tarjan_scc_with_virtual").entered();
-        let sccs = self.tarjan_scc_with_virtual(vertices, vdeps)?;
+        let sccs = self.tarjan_scc_impl(vertices, Some(vdeps), synthetic_base)?;
         #[cfg(feature = "tracing")]
         drop(_scc_span);
         // 2. Separate cycles and acyclic components
-        let (cycles, acyclic_sccs) = self.separate_cycles_with_virtual(sccs, Some(vdeps));
+        let (cycles, acyclic_sccs) =
+            self.separate_cycles_with_virtual(sccs, Some(vdeps), synthetic_base);
         // 3. Build layers over combined adjacency (graph + vdeps)
         #[cfg(feature = "tracing")]
         let _layers_span = tracing::info_span!("build_layers_with_virtual").entered();
         if cycles.is_empty() {
             // Fast path: byte-for-byte today's layer construction.
-            let layers = self.build_layers_with_virtual(acyclic_sccs, vdeps)?;
+            let layers = self.build_layers_with_virtual(acyclic_sccs, vdeps, synthetic_base)?;
             return Ok(Schedule::from_parts(layers, cycles));
         }
         // Cycle path: Kahn over the condensation (SCC-as-node), honoring
         // virtual deps as extra edges.
-        let (units, layers) = self.build_condensation_units(&cycles, acyclic_sccs, Some(vdeps))?;
+        let (units, layers) =
+            self.build_condensation_units(&cycles, acyclic_sccs, Some(vdeps), synthetic_base)?;
         Ok(Schedule {
             units,
             cycles,
@@ -165,16 +200,17 @@ impl<'a> Scheduler<'a> {
 
     /// Tarjan's strongly connected components algorithm
     pub fn tarjan_scc(&self, vertices: &[VertexId]) -> Result<Vec<Vec<VertexId>>, ExcelError> {
-        self.tarjan_scc_impl(vertices, None)
+        self.tarjan_scc_impl(vertices, None, None)
     }
 
     /// Tarjan with virtual deps
+    #[cfg(test)]
     fn tarjan_scc_with_virtual(
         &self,
         vertices: &[VertexId],
         vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
     ) -> Result<Vec<Vec<VertexId>>, ExcelError> {
-        self.tarjan_scc_impl(vertices, Some(vdeps))
+        self.tarjan_scc_impl(vertices, Some(vdeps), None)
     }
 
     /// Iterative Tarjan over the scheduled subgraph, optionally honoring
@@ -201,6 +237,7 @@ impl<'a> Scheduler<'a> {
         &self,
         vertices: &[VertexId],
         vdeps: Option<&FxHashMap<VertexId, Vec<VertexId>>>,
+        synthetic_base: Option<VertexId>,
     ) -> Result<Vec<Vec<VertexId>>, ExcelError> {
         /// One vertex's dependency list, materialized once per DFS frame.
         enum DepList<'g> {
@@ -217,7 +254,17 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        let is_synthetic = move |v: VertexId| synthetic_base.is_some_and(|b| v.0 >= b.0);
         let deps_of = |vertex: VertexId| -> DepList<'_> {
+            // Synthetic relay nodes have no graph adjacency at all.
+            if is_synthetic(vertex) {
+                return DepList::Owned(
+                    vdeps
+                        .and_then(|m| m.get(&vertex))
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
             // Edge order must match the recursive implementation: the base
             // adjacency (zero-copy slice when available), with the vertex's
             // virtual deps appended when present.
@@ -649,21 +696,23 @@ impl<'a> Scheduler<'a> {
         &self,
         sccs: Vec<Vec<VertexId>>,
     ) -> (Vec<Vec<VertexId>>, Vec<Vec<VertexId>>) {
-        self.separate_cycles_with_virtual(sccs, None)
+        self.separate_cycles_with_virtual(sccs, None, None)
     }
 
     fn separate_cycles_with_virtual(
         &self,
         sccs: Vec<Vec<VertexId>>,
         vdeps: Option<&rustc_hash::FxHashMap<VertexId, Vec<VertexId>>>,
+        synthetic_base: Option<VertexId>,
     ) -> (Vec<Vec<VertexId>>, Vec<Vec<VertexId>>) {
+        let is_synthetic = move |v: VertexId| synthetic_base.is_some_and(|b| v.0 >= b.0);
         let mut cycles = Vec::new();
         let mut acyclic = Vec::new();
 
         for scc in sccs {
             if scc.len() > 1
                 || (scc.len() == 1
-                    && (self.has_self_loop(scc[0])
+                    && ((!is_synthetic(scc[0]) && self.has_self_loop(scc[0]))
                         || vdeps
                             .and_then(|deps| deps.get(&scc[0]))
                             .is_some_and(|deps| deps.contains(&scc[0]))))
@@ -790,7 +839,9 @@ impl<'a> Scheduler<'a> {
         cycles: &[Vec<VertexId>],
         acyclic_sccs: Vec<Vec<VertexId>>,
         vdeps: Option<&FxHashMap<VertexId, Vec<VertexId>>>,
+        synthetic_base: Option<VertexId>,
     ) -> Result<(Vec<ScheduleUnit>, Vec<Layer>), ExcelError> {
+        let is_synthetic = move |v: VertexId| synthetic_base.is_some_and(|b| v.0 >= b.0);
         let singletons: Vec<VertexId> = acyclic_sccs.into_iter().flatten().collect();
         let cycle_node_count = cycles.len();
         let node_count = cycle_node_count + singletons.len();
@@ -824,7 +875,9 @@ impl<'a> Scheduler<'a> {
             }
         };
         for (&v, &n_v) in node_of.iter() {
-            if let Some(deps) = self.graph.dependencies_slice(v) {
+            if is_synthetic(v) {
+                // No graph adjacency; incoming edges are entirely virtual.
+            } else if let Some(deps) = self.graph.dependencies_slice(v) {
                 for &dep in deps {
                     scan_dep(n_v, dep, &mut in_degrees, &mut node_dependents);
                 }
@@ -900,7 +953,9 @@ impl<'a> Scheduler<'a> {
         &self,
         acyclic_sccs: Vec<Vec<VertexId>>,
         vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
+        synthetic_base: Option<VertexId>,
     ) -> Result<Vec<Layer>, ExcelError> {
+        let is_synthetic = move |v: VertexId| synthetic_base.is_some_and(|b| v.0 >= b.0);
         use std::collections::VecDeque;
         let vertices: Vec<VertexId> = acyclic_sccs.into_iter().flatten().collect();
         if vertices.is_empty() {
@@ -913,7 +968,9 @@ impl<'a> Scheduler<'a> {
         let mut combined_out: FxHashMap<VertexId, Vec<VertexId>> = FxHashMap::default();
         for &v in &vertices {
             let mut deps: Vec<VertexId> = Vec::new();
-            if let Some(base) = self.graph.dependencies_slice(v) {
+            if is_synthetic(v) {
+                // No graph adjacency; incoming edges are entirely virtual.
+            } else if let Some(base) = self.graph.dependencies_slice(v) {
                 deps.extend(base.iter().copied().filter(|d| vertex_set.contains(d)));
             } else {
                 deps.extend(

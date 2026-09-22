@@ -560,6 +560,147 @@ impl RangeVirtualDepProvider {
         deps.dedup();
         deps
     }
+
+    /// PROTOTYPE (r8a) variant of [`Self::get_virtual_deps_memoized`] that
+    /// routes each referenced region through a synthetic region node instead
+    /// of emitting one edge per dirty producer per reader.
+    ///
+    /// Returns the reader's ordinary (non-region) virtual dependencies; the
+    /// region nodes the reader must wait for are pushed onto `region_deps`,
+    /// and `plan` accumulates each region node's producer list.
+    ///
+    /// Self-overlap: when the reader itself is one of the region's dirty
+    /// producers, routing it through the region node would create a spurious
+    /// 2-cycle (`v -> R -> v`). Such a reader keeps the old per-cell edges,
+    /// minus itself, exactly as the per-cell path did.
+    pub(crate) fn get_virtual_deps_regionized<R: EvaluationContext>(
+        engine: &Engine<R>,
+        v: VertexId,
+        memo: &AnchorRegionMemo,
+        plan: &mut RegionNodePlan,
+        region_deps: &mut Vec<VertexId>,
+    ) -> Vec<VertexId> {
+        let mut deps = Vec::new();
+        for target in engine.graph.get_dependencies(v) {
+            if let Some(cell) = engine.graph.get_cell_ref(target) {
+                deps.extend(
+                    memo.output_anchors(
+                        engine,
+                        (
+                            cell.sheet_id,
+                            cell.coord.row(),
+                            cell.coord.col(),
+                            cell.coord.row(),
+                            cell.coord.col(),
+                        ),
+                    )
+                    .iter()
+                    .copied()
+                    .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
+                );
+            }
+        }
+        if let Some(ranges) = engine.graph.get_range_dependencies(v) {
+            let current_sheet_id = engine.graph.get_vertex_sheet_id(v);
+            for r in ranges {
+                let sheet_id = match r.sheet {
+                    formualizer_common::SheetLocator::Id(id) => id,
+                    _ => current_sheet_id,
+                };
+                let sheet_name = engine.graph.sheet_name(sheet_id);
+
+                let Some(extent) = Self::resolve_range(engine, sheet_name, r) else {
+                    continue;
+                };
+                let key: RegionKey = (
+                    sheet_id,
+                    extent.start_row.saturating_sub(1),
+                    extent.start_column.saturating_sub(1),
+                    extent.end_row.saturating_sub(1),
+                    extent.end_column.saturating_sub(1),
+                );
+
+                // Anchor edges are left exactly as they are: they stay
+                // per-reader, per-anchor.
+                deps.extend(
+                    memo.output_anchors(engine, key)
+                        .iter()
+                        .copied()
+                        .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u)),
+                );
+
+                let node = plan.intern(engine, memo, key);
+                let producers = plan
+                    .producers
+                    .get(&node)
+                    .expect("interned region node has a producer list");
+                if producers.is_empty() {
+                    continue;
+                }
+                if producers.binary_search(&v).is_ok() {
+                    // Self-overlap: fall back to per-cell edges minus self.
+                    deps.extend(producers.iter().copied().filter(|&u| u != v));
+                } else {
+                    region_deps.push(node);
+                }
+            }
+        }
+        deps.sort_unstable();
+        deps.dedup();
+        deps
+    }
+}
+
+/// First synthetic region-node id. Real `VertexId`s are allocated densely from
+/// zero, so 2^31 leaves the whole real range untouched; the builder refuses to
+/// use region nodes at all if a real candidate ever reaches it.
+pub const REGION_NODE_BASE: u32 = 0x8000_0000;
+
+/// PROTOTYPE (r8a) per-build registry of synthetic region nodes.
+///
+/// One node per distinct [`RegionKey`] seen in this build, carrying the
+/// region's dirty/volatile formula producers. Ids are assigned in first-seen
+/// order above [`REGION_NODE_BASE`]; they are meaningful only inside the
+/// schedule build that produced them.
+#[derive(Default)]
+pub struct RegionNodePlan {
+    /// region node id -> its dirty producers, ascending.
+    pub producers: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    ids: rustc_hash::FxHashMap<RegionKey, VertexId>,
+}
+
+impl RegionNodePlan {
+    fn intern<R: EvaluationContext>(
+        &mut self,
+        engine: &Engine<R>,
+        memo: &AnchorRegionMemo,
+        key: RegionKey,
+    ) -> VertexId {
+        if let Some(&id) = self.ids.get(&key) {
+            return id;
+        }
+        let id = VertexId::new(REGION_NODE_BASE + self.ids.len() as u32);
+        let producers: Vec<VertexId> = memo
+            .formula_vertices_in_region(engine, key)
+            .iter()
+            .copied()
+            .filter(|&u| engine.graph.is_dirty(u) || engine.graph.is_volatile(u))
+            .collect();
+        self.ids.insert(key, id);
+        self.producers.insert(id, producers);
+        id
+    }
+
+    /// Every region node allocated by this plan, ascending.
+    pub fn node_ids(&self) -> Vec<VertexId> {
+        let mut ids: Vec<VertexId> = self.producers.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.producers.is_empty()
+    }
 }
 
 
@@ -799,6 +940,70 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
         augmented_vertices.sort_unstable();
         augmented_vertices.dedup();
         (vdeps, augmented_vertices)
+    }
+
+    /// PROTOTYPE (r8a): as [`Self::build`], but the dirty-producer edges of a
+    /// referenced region are emitted once per region (producer -> region node)
+    /// plus one edge per reader (region node -> reader), instead of once per
+    /// (reader, producer) pair.
+    ///
+    /// Returns `(vdeps, region_edges, augmented, plan)` where `vdeps` is the
+    /// ordinary region-free virtual-dependency map (anchors, resolved direct
+    /// cells, dynamic reads, and the per-cell fallback for self-overlapping
+    /// readers), `region_edges` maps a reader to the region nodes it must wait
+    /// for, and `plan` owns each region node's producer list.
+    pub fn build_regionized(
+        &self,
+        candidates: &[VertexId],
+    ) -> (
+        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+        Vec<VertexId>,
+        RegionNodePlan,
+    ) {
+        let mut vdeps: rustc_hash::FxHashMap<VertexId, Vec<VertexId>> =
+            rustc_hash::FxHashMap::default();
+        let mut region_edges: rustc_hash::FxHashMap<VertexId, Vec<VertexId>> =
+            rustc_hash::FxHashMap::default();
+        let mut augmented_vertices: Vec<VertexId> = Vec::new();
+        let mut plan = RegionNodePlan::default();
+
+        self.engine.record_vdep_build_footprint_epoch();
+        self.memo.refresh(self.engine);
+        let memo = &self.memo;
+        for &v in candidates {
+            augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers_memoized(
+                self.engine,
+                v,
+                memo,
+            ));
+            let mut regions: Vec<VertexId> = Vec::new();
+            let mut deps = RangeVirtualDepProvider::get_virtual_deps_regionized(
+                self.engine,
+                v,
+                memo,
+                &mut plan,
+                &mut regions,
+            );
+            let dynamic_deps = DynamicRefVirtualDepProvider::get_virtual_deps(self.engine, v);
+
+            deps.extend(dynamic_deps);
+            deps.sort_unstable();
+            deps.dedup();
+
+            if !deps.is_empty() {
+                vdeps.insert(v, deps);
+            }
+            if !regions.is_empty() {
+                regions.sort_unstable();
+                regions.dedup();
+                region_edges.insert(v, regions);
+            }
+        }
+
+        augmented_vertices.sort_unstable();
+        augmented_vertices.dedup();
+        (vdeps, region_edges, augmented_vertices, plan)
     }
 }
 
