@@ -1,4 +1,4 @@
-//! PROTOTYPE (r8b): tests for the Excel-style speculative calculation chain
+//! Tests for the Excel-style speculative calculation chain
 //! (`EvalConfig::speculative_chain`).
 
 use crate::engine::{Engine, EvalConfig};

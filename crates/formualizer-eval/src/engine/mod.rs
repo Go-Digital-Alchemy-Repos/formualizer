@@ -1007,7 +1007,7 @@ pub struct EvalConfig {
     /// Maximum bytes for the engine-side lookup-index cache.
     pub lookup_index_cache_max_bytes: usize,
 
-    /// PROTOTYPE (r8b): Excel-style speculative calculation chain.
+    /// Excel-style speculative calculation chain.
     ///
     /// When set, `evaluate_all` keeps the flattened last-known-good schedule
     /// (the "calculation chain") on the engine and, on later calls, walks it
@@ -1016,18 +1016,24 @@ pub struct EvalConfig {
     /// the output footprint epoch moves, and any miss falls back to the exact
     /// per-request schedule path.
     ///
-    /// Default is `false`. For the prototype the default is read once from the
-    /// environment variable `FZ_SPEC_CHAIN` (set it to `1` to enable), so the
-    /// profile harness and the test suite can flip it without an API change.
+    /// Default is `false`. The default is read once from the environment
+    /// variable `FZ_SPEC_CHAIN` set to `1`, `true`, `on` or `yes`
+    /// (case-insensitive, whitespace trimmed); any other value, and an unset
+    /// variable, keep the default. This lets the profile harness and the test
+    /// suite flip it without an API change.
     pub speculative_chain: bool,
 }
 
-/// PROTOTYPE (r8b): read the `FZ_SPEC_CHAIN` default for `EvalConfig`.
+/// Read the `FZ_SPEC_CHAIN` default for `EvalConfig`.
 pub fn speculative_chain_env_default() -> bool {
-    matches!(
-        std::env::var("FZ_SPEC_CHAIN").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    std::env::var("FZ_SPEC_CHAIN")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl Default for EvalConfig {

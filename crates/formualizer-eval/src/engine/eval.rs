@@ -1532,7 +1532,7 @@ pub struct Engine<R> {
     /// must not use relocated span read summaries to prove disconnection.
     legacy_island_structural_summaries_trusted: bool,
     cached_static_schedule: Option<CachedScheduleEntry>,
-    /// PROTOTYPE (r8b): stored calculation chain (see `EvalConfig::speculative_chain`).
+    /// Stored calculation chain (see `EvalConfig::speculative_chain`).
     spec_chain: Option<SpecChain>,
     spec_chain_telemetry: SpecChainTelemetry,
     #[cfg(any(test, feature = "benchmark_internal"))]
@@ -2821,7 +2821,7 @@ fn schedule_probe_retained_bytes(schedule: &crate::engine::Schedule) -> usize {
 }
 
 #[derive(Debug, Clone)]
-/// PROTOTYPE (r8b): the Excel-style calculation chain.
+/// The Excel-style calculation chain.
 ///
 /// `schedule` is the last-known-good flattened evaluation order for the WHOLE
 /// formula set (every unit the build produced, in condensation order).
@@ -2842,7 +2842,7 @@ struct SpecChain {
     position: FxHashMap<VertexId, u32>,
 }
 
-/// PROTOTYPE (r8b): which path an `evaluate_all` took and why.
+/// Which path an `evaluate_all` took and why.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpecChainTelemetry {
     /// Chains installed after a full schedule build.
@@ -6983,13 +6983,12 @@ where
 
     fn clear_cached_static_schedule(&mut self) {
         self.cached_static_schedule = None;
-        // PROTOTYPE (r8b): a topology edit retires the calculation chain too.
+        // A topology edit retires the calculation chain too.
         self.spec_chain = None;
     }
 
-    /// PROTOTYPE (r8b): which evaluation path the most recent `evaluate_all`
-    /// used, and the chain build/walk/demotion/fallback counters for the
-    /// process so far.
+    /// Which evaluation path the most recent `evaluate_all` used, and the
+    /// chain build/walk/demotion/fallback counters for the process so far.
     pub fn spec_chain_telemetry(&self) -> &SpecChainTelemetry {
         &self.spec_chain_telemetry
     }
@@ -25417,10 +25416,10 @@ where
     /// one clock sample; request begin happens at the public entry points /
     /// coordinators instead.
     fn evaluate_all_legacy_impl(&mut self) -> Result<EvalResult, ExcelError> {
-        // PROTOTYPE (r8b): Excel-style speculative calculation chain. When a
-        // usable chain is installed this serves the whole request without
-        // touching the schedule builder; every miss returns `None` and drops
-        // through to the exact path below, which reinstalls a fresh chain.
+        // Excel-style speculative calculation chain. When a usable chain is
+        // installed this serves the whole request without touching the
+        // schedule builder; every miss returns `None` and drops through to the
+        // exact path below, which reinstalls a fresh chain.
         if self.config.speculative_chain
             && let Some(result) = self.try_spec_chain_evaluate()?
         {
@@ -25475,9 +25474,9 @@ where
                 if let Some(t) = telemetry.as_mut() {
                     t.bailout_reason = Some("converged");
                 }
-                // PROTOTYPE (r8b): bank this pass's order as the calculation
-                // chain. Only a first-pass converged build is banked: a replan
-                // means the order we just walked was not the final one.
+                // Bank this pass's order as the calculation chain. Only a
+                // first-pass converged build is banked: a replan means the
+                // order we just walked was not the final one.
                 if self.config.speculative_chain && replan_iterations == 0 {
                     // `to_evaluate` is this pass's DIRTY set (dirty formulas
                     // plus volatiles needing refresh,
@@ -25523,7 +25522,7 @@ where
         })
     }
 
-    /// PROTOTYPE (r8b): bank the just-walked schedule as the calculation chain.
+    /// Bank the just-walked schedule as the calculation chain.
     ///
     /// Eligibility is deliberately narrow: no vertex in the schedule may be a
     /// runtime-reference (`OFFSET`/`INDIRECT`) formula, because such a vertex
@@ -25711,7 +25710,7 @@ where
         self.spec_chain_telemetry.chain_builds += 1;
     }
 
-    /// PROTOTYPE (r8b): serve `evaluate_all` by walking the stored chain.
+    /// Serve `evaluate_all` by walking the stored chain.
     ///
     /// Returns `Ok(None)` when the chain cannot be trusted for this request, in
     /// which case the caller runs the ordinary per-request schedule path and
