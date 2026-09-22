@@ -980,6 +980,15 @@ pub struct EvalConfig {
     /// When disabled, the engine avoids per-pass timing/edge-count bookkeeping.
     pub enable_virtual_dep_telemetry: bool,
 
+    /// Route range virtual dependencies through one synthetic "region node"
+    /// per distinct referenced region instead of one edge per dirty producer
+    /// per reader (r8: 130.8M edges to 301k on the Rev FIA child, first
+    /// evaluation 12.2 s to 7.9 s, digests identical).
+    ///
+    /// Default is `true`. `FZ_REGION_NODES=0` (or `false`) in the environment
+    /// restores the per-cell edges for A/B measurement without a rebuild.
+    pub virtual_region_nodes: bool,
+
     /// FormulaPlane ingest/planning mode. Defaults to `Off`; span evaluation is
     /// explicitly opt-in while `AuthoritativeExperimental` remains experimental.
     /// `Shadow` may report candidate span opportunities but must still materialize
@@ -1050,6 +1059,9 @@ impl Default for EvalConfig {
             formula_parse_policy: FormulaParsePolicy::Strict,
             defer_graph_building: false,
             enable_virtual_dep_telemetry: false,
+            virtual_region_nodes: std::env::var("FZ_REGION_NODES")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true),
             formula_plane_mode: FormulaPlaneMode::Off,
             max_formula_plane_cache_candidates: 100_000,
             max_formula_plane_cache_edges: 100_000,
@@ -1123,6 +1135,12 @@ impl EvalConfig {
     #[inline]
     pub fn with_virtual_dep_telemetry(mut self, enable: bool) -> Self {
         self.enable_virtual_dep_telemetry = enable;
+        self
+    }
+
+    #[inline]
+    pub fn with_virtual_region_nodes(mut self, enable: bool) -> Self {
+        self.virtual_region_nodes = enable;
         self
     }
 

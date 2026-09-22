@@ -68,6 +68,7 @@ mod tarjan_scc;
 mod topo_layers;
 mod transactions;
 mod vertex_lifecycle;
+mod virtual_region_nodes;
 mod volatile_rng;
 
 mod engine_action_api_614;
