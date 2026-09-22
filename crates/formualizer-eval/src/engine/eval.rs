@@ -25573,8 +25573,8 @@ where
     /// The chain is an *order*, banked once and replayed for later requests
     /// that only refilter it by the current dirty set. It is sound exactly
     /// when, for every later request, the banked order is a topological order
-    /// of that request's edge set. The argument has one precondition and four
-    /// pinned quantities.
+    /// of that request's edge set. The argument has one precondition, five
+    /// pinned quantities and one rule for cycle units.
     ///
     /// **Precondition (checked here): every formula vertex was dirty in the
     /// banking pass.** A range reader has no real graph edge to the cells it
@@ -25620,8 +25620,8 @@ where
     /// chain, with identical digests. Computed counts are therefore not a
     /// chain-vs-exact gate; digests are.
     ///
-    /// Given the precondition, the four things the order depends on are each
-    /// pinned for the chain's lifetime:
+    /// Given the precondition, the things the order depends on are each pinned
+    /// for the chain's lifetime:
     ///
     /// (a) **Which formula vertices exist and where.** Region producer
     ///     membership is a function of the formula set and its placement;
@@ -25667,18 +25667,55 @@ where
     ///     on it anyway. A wrong order here produces a silently stale value,
     ///     not a caught error.
     ///
-    /// (f) **No cycles.** A schedule containing any cycle unit is refused at
-    ///     bank time (`cycle_unit_in_schedule`), so a chain never carries an
-    ///     SCC. That is deliberately conservative and it removes two hazards
-    ///     at once: the banked SCC is the whole component, whereas a later
-    ///     request's SCC comes from Tarjan over that request's dirty-filtered
-    ///     candidates — with retained/iterative members held clean the two
-    ///     sets differ, and settling the banked superset would stamp
-    ///     `#CIRC!` over (and tear down spills anchored by) members the exact
-    ///     path would not have touched; and, because the walk can fall back
-    ///     mid-request, an SCC it had already settled could be settled a
-    ///     second time within the same request, double-advancing an iteration
-    ///     budget.
+    /// (f) **Cycle units.** A cycle unit is banked like any other unit, and
+    ///     the walk settles it through the same `handle_cycle_unit` the exact
+    ///     path uses. What the walk must not do is settle a banked SCC that
+    ///     differs from the SCC this request's exact path would have built:
+    ///     the exact path's SCCs come from Tarjan over the request's
+    ///     dirty-filtered candidates, while the banked unit is the whole
+    ///     component. For an ordinary cycle the two cannot diverge —
+    ///     dirtiness is mutually reachable inside an SCC (`mark_dirty_many`
+    ///     BFS over dependents, closed under range readers per (d)), so if one
+    ///     member is dirty all are. They diverge only for members deliberately
+    ///     held clean: retained/iterative SCC members
+    ///     ([`Self::retained_scc_members`]), and members reachable only
+    ///     through the per-pass virtual/relay edges that made the component
+    ///     cyclic in the first place. There the banked set is a strict
+    ///     superset of the request's, and settling it would stamp `#CIRC!`
+    ///     over — and tear down spills anchored by — members the exact path
+    ///     would not have touched, re-key `retained_scc_members` and move the
+    ///     cycle telemetry.
+    ///
+    ///     The walk therefore classifies each cycle unit by its *settleable*
+    ///     members — the `FormulaScalar`/`FormulaArray`/`NamedScalar`/
+    ///     `NamedArray` members, i.e. exactly the kinds
+    ///     `DependencyGraph::get_evaluation_vertices` can emit; a banked unit
+    ///     may also carry pass-through `Range`/`InfiniteRange` members, which
+    ///     can never be pending and must not be counted, or every such unit
+    ///     would fall back forever. None pending: skip the unit, its values
+    ///     stand (the same rule `handle_cycle_unit` applies under
+    ///     `CycleDetection::Runtime`). All pending: settle the banked members,
+    ///     which are then exactly the request's SCC. Some but not all pending:
+    ///     the divergent case — hand the whole request to the exact path
+    ///     (`partially_pending_cycle_unit`) *before* touching the unit.
+    ///
+    ///     Known remaining divergence (r9, open follow-up). A mid-walk
+    ///     fallback taken *after* this walk already settled a cycle unit lets
+    ///     the exact path settle that same SCC a second time inside one
+    ///     request, double-advancing an iteration budget for an iterative SCC
+    ///     (`pending_iterative_redirty` duplication is idempotent, per
+    ///     [`Self::redirty_for_next_recalc`]; the double settle is not). The
+    ///     fallback path itself is exact, so the request's answer is the exact
+    ///     path's answer — what moves is iteration state. Reaching it needs a
+    ///     spill to grow (or the demotion cap to trip) during a chain walk in
+    ///     a workbook that also has iterative cycles; neither gate workbook
+    ///     does. It is made observable rather than fixed:
+    ///     `cycle_units_settled_this_walk` re-labels those two fallbacks as
+    ///     `spill_fallback_after_cycle_settle` /
+    ///     `demotion_fallback_after_cycle_settle` so the case can be counted
+    ///     in the field before anyone pays for a fix. The
+    ///     `partially_pending_cycle_unit` fallback can land after an earlier
+    ///     settle in the same walk too, and carries the same hazard.
     ///
     /// Why the per-request path does no virtual-dependency work at all: the
     /// only candidate check would be `changed_virtual_dep_vertices` against a
@@ -25713,18 +25750,12 @@ where
         schedule: &crate::engine::scheduler::Schedule,
         dirty: &[VertexId],
     ) {
-        // Clause (f): never bank a chain that carries an SCC. Refusing here is
-        // what keeps the banked-versus-per-request SCC divergence and the
-        // within-request double settle out of reach entirely.
-        if schedule
-            .units
-            .iter()
-            .any(|unit| matches!(unit, ScheduleUnit::Cycle(_)))
-        {
-            self.spec_chain = None;
-            self.spec_chain_telemetry.last_reason = Some("cycle_unit_in_schedule");
-            return;
-        }
+        // Cycle units are banked like any other unit; see clause (f) for the
+        // rule the walk applies to them. An earlier revision refused the whole
+        // schedule here (`cycle_unit_in_schedule`), which was measured on both
+        // r9 gate workbooks to refuse the chain outright: they report
+        // `cycles = 0` (no `#CIRC!` stamps) yet their schedules do contain
+        // cycle units — statically-cyclic SCCs that settle without error.
         let member_count: usize = schedule
             .layers
             .iter()
@@ -25796,6 +25827,31 @@ where
     /// which case the caller runs the ordinary per-request schedule path and
     /// reinstalls a chain from it. Every `None` return also drops the stored
     /// chain, so a miss is never retried against the same stale order.
+    ///
+    /// # Dirty-set bookkeeping on a mid-walk fallback
+    ///
+    /// The exact path runs next and takes its work from
+    /// `get_evaluation_vertices`, so every fallback has to leave a dirty set
+    /// consistent with what the walk already did. There are two shapes, and
+    /// both are safe:
+    ///
+    /// * **End-of-round fallbacks** (spill/footprint moved, demotion cap).
+    ///   These fire *after* this round's `clear_dirty_flags(&visited)`, so the
+    ///   vertices the walk evaluated are evaluated *and* clean: the exact path
+    ///   does not redo them. What stays dirty is exactly what still needs
+    ///   doing — the spill branch's re-dirtied invalidations, or the residual.
+    ///   The spill branch also puts `pending_output_invalidations` back,
+    ///   because the exact path reads that same set as its recheck guard.
+    /// * **Mid-unit fallback** (`partially_pending_cycle_unit`). This fires
+    ///   *before* the round's `clear_dirty_flags`, so every vertex walked so
+    ///   far is evaluated but still dirty, and the exact path simply redoes it
+    ///   from a correct schedule. Strictly more conservative than the
+    ///   end-of-round shape, and the only shape available to a fallback that
+    ///   must happen before a particular unit is touched. The cycle unit
+    ///   itself is untouched, which is the point.
+    ///
+    /// See clause (f) of [`Self::install_spec_chain`] for the cycle-unit rule
+    /// and the one divergence it knowingly leaves open.
     fn try_spec_chain_evaluate(&mut self) -> Result<Option<EvalResult>, ExcelError> {
         let Some(chain) = self.spec_chain.take() else {
             self.spec_chain_telemetry.last_reason = Some("no_chain");
@@ -25879,9 +25935,11 @@ where
         let mut evaluated: FxHashSet<VertexId> =
             FxHashSet::with_capacity_and_hasher(to_evaluate.len(), Default::default());
         let mut computed_vertices = 0usize;
-        // Always zero: clause (f) refuses to bank a schedule that contains a
-        // cycle unit, so a walked chain never settles an SCC.
-        let cycle_errors = 0usize;
+        let mut cycle_errors = 0usize;
+        // Clause (f)'s observability counter for the one known remaining
+        // divergence: a mid-walk fallback taken after an SCC was already
+        // settled in this request lets the exact path settle it again.
+        let mut cycle_units_settled_this_walk = 0usize;
         let mut demoted_total = 0usize;
         let mut rounds = 0usize;
         let mut scratch = crate::engine::scheduler::Layer {
@@ -25894,21 +25952,60 @@ where
                 match unit {
                     ScheduleUnit::Cycle(index) => {
                         let cycle_members = schedule.unit_cycle(index);
-                        if !cycle_members.iter().any(|v| pending.contains(v)) {
+                        // Clause (f). Classify by the *settleable* members
+                        // only: `get_evaluation_vertices` emits formula and
+                        // name kinds alone, so a pass-through `Range` /
+                        // `InfiniteRange` member banked inside the unit can
+                        // never be pending and counting it would make every
+                        // such unit look partial forever.
+                        let mut settleable = 0usize;
+                        let mut pending_members = 0usize;
+                        for &vertex in cycle_members {
+                            if !matches!(
+                                self.graph.get_vertex_kind(vertex),
+                                VertexKind::FormulaScalar
+                                    | VertexKind::FormulaArray
+                                    | VertexKind::NamedScalar
+                                    | VertexKind::NamedArray
+                            ) {
+                                continue;
+                            }
+                            settleable += 1;
+                            if pending.contains(&vertex) {
+                                pending_members += 1;
+                            }
+                        }
+                        if pending_members == 0 {
+                            // Values stand, exactly as `handle_cycle_unit`
+                            // would decide for itself under
+                            // `CycleDetection::Runtime`.
                             continue;
                         }
-                        // Defensive only. Clause (f) refuses to bank a schedule
-                        // carrying a cycle unit, so reaching one here means the
-                        // banked order is not what the bank check saw. Hand the
-                        // request to the exact path rather than settle an SCC
-                        // from a banked component. No member has been
-                        // evaluated or cleared, so they are still dirty and
-                        // the exact path picks them up from
-                        // `get_evaluation_vertices` as usual.
-                        self.spec_chain_telemetry.last_reason = Some("cycle_unit_in_chain_walk");
-                        self.spec_chain_telemetry.last_path = Some("full");
-                        self.spec_chain_telemetry.fallbacks += 1;
-                        return Ok(None);
+                        if pending_members != settleable {
+                            // The divergent case: members deliberately held
+                            // clean (retained/iterative, or reachable only
+                            // through the virtual edges that made the
+                            // component cyclic) mean the banked SCC is a
+                            // strict superset of this request's. Bail BEFORE
+                            // touching the unit — nothing in it has been
+                            // evaluated or cleared, so the exact path settles
+                            // the request's own SCC from scratch.
+                            self.spec_chain_telemetry.last_reason =
+                                Some("partially_pending_cycle_unit");
+                            self.spec_chain_telemetry.last_path = Some("full");
+                            self.spec_chain_telemetry.fallbacks += 1;
+                            return Ok(None);
+                        }
+                        // Every settleable member is pending, so the banked
+                        // component IS this request's SCC. Cycle semantics stay
+                        // on the existing runtime path: the whole SCC goes to
+                        // `handle_cycle_unit`, which owns detection and the
+                        // #CIRC!/settle passes.
+                        if self.handle_cycle_unit(cycle_members, None, None, None)? > 0 {
+                            cycle_errors += 1;
+                        }
+                        cycle_units_settled_this_walk += 1;
+                        evaluated.extend(cycle_members.iter().copied());
                     }
                     ScheduleUnit::Layer(index) => {
                         let layer = schedule.unit_layer(index);
@@ -25974,7 +26071,14 @@ where
                     .get_mut()
                     .unwrap()
                     .extend(spill_invalidations);
-                self.spec_chain_telemetry.last_reason = Some("spill_footprint_moved_mid_walk");
+                // Clause (f) observability: this fallback is exact, but if the
+                // walk already settled an SCC this request, the exact path is
+                // about to settle it a second time.
+                self.spec_chain_telemetry.last_reason = if cycle_units_settled_this_walk > 0 {
+                    Some("spill_fallback_after_cycle_settle")
+                } else {
+                    Some("spill_footprint_moved_mid_walk")
+                };
                 self.spec_chain_telemetry.last_path = Some("full");
                 self.spec_chain_telemetry.fallbacks += 1;
                 return Ok(None);
@@ -26000,8 +26104,13 @@ where
                     .any(|vertex| !chain.members.contains(vertex))
             {
                 // Exact fallback: leave the residual dirty and let the
-                // per-request schedule path finish the job.
-                self.spec_chain_telemetry.last_reason = Some("demotion_cap_or_outside_chain");
+                // per-request schedule path finish the job. Same clause (f)
+                // observability as the spill fallback above.
+                self.spec_chain_telemetry.last_reason = if cycle_units_settled_this_walk > 0 {
+                    Some("demotion_fallback_after_cycle_settle")
+                } else {
+                    Some("demotion_cap_or_outside_chain")
+                };
                 self.spec_chain_telemetry.last_path = Some("full");
                 self.spec_chain_telemetry.fallbacks += 1;
                 return Ok(None);

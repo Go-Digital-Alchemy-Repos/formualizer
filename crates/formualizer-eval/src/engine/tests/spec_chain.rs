@@ -116,6 +116,15 @@ fn build_growing_spill_workbook(config: EvalConfig) -> Result<Engine<TestWorkboo
 /// looking clean while one of its passes ran the exact path. That is the r9b2
 /// flake in `spec_chain_matches_the_full_path_on_value_edits`.
 ///
+/// WARNING for closures passed here: `chain_drops` counts every out-of-walk
+/// retirement, and `clear_cached_static_schedule` is one of them — any
+/// topology edit (`set_cell_formula`, a new sheet, a structural edit) made
+/// *after* the pass that banked the chain counts a drop and sends this helper
+/// round the retry loop until it panics. A closure must therefore finish its
+/// topology edits before its banking pass; only value edits belong after it.
+/// A test that wants to assert the drop itself must not run under
+/// `chain_sequence`.
+///
 /// There is no shared lock to join: `scc_reuse.rs` has an `EPOCH_LOCK`, but it
 /// is module-private and none of the registering modules take it, so holding
 /// it would not exclude them. The engine-side alternative — not dropping the
@@ -413,57 +422,86 @@ fn spec_chain_retired_by_a_function_registration() -> Result<(), ExcelError> {
     Ok(())
 }
 
-/// A schedule containing an SCC is never banked (clause (f) of the safety
-/// argument).
+/// A schedule containing an SCC IS banked, and a request that dirties the
+/// whole SCC walks it (clause (f) of the safety argument).
 ///
-/// The banked SCC would be the whole strongly connected component, while a
-/// later request's SCC comes from Tarjan over that request's dirty-filtered
-/// candidates: with retained/iterative members held clean the two sets differ,
-/// and settling the banked superset would stamp `#CIRC!` over — and tear down
-/// spills anchored by — members the exact path would not have touched. The
-/// walk can also fall back mid-request, which would let one request settle the
-/// same SCC twice and double-advance its iteration budget. Refusing the bank
-/// puts both out of reach; the price is that cyclic books never get a chain.
+/// The earlier revision refused any schedule carrying a cycle unit. Measured
+/// on both r9 gate workbooks that removed the chain entirely: they report
+/// `cycles = 0` — no `#CIRC!` stamps at all — and yet their schedules contain
+/// cycle units, because a `ScheduleUnit::Cycle` is any statically-cyclic SCC
+/// (`Scheduler::separate_cycles_with_virtual`: size >= 2, or a self-loop, over
+/// an edge set that includes the pass's virtual relay edges), and under
+/// `CycleDetection::Runtime` such a unit settles through `evaluate_scc_unit`
+/// without stamping anything.
+///
+/// The rule that replaced the refusal is per unit, not per schedule: settle
+/// the banked members only when every settleable member is pending, so the
+/// banked component is exactly the SCC this request's exact path would have
+/// built. This fixture is the all-pending case — B1 and C1 are mutually
+/// dependent, so any edit reaching one reaches both (`mark_dirty_many` BFS
+/// over dependents; dirtiness is mutually reachable inside an SCC).
 #[test]
-fn spec_chain_refuses_to_bank_a_schedule_containing_a_cycle() -> Result<(), ExcelError> {
+fn spec_chain_banks_and_walks_a_schedule_containing_a_cycle() -> Result<(), ExcelError> {
     let _guard = spec_chain_test_guard();
-    let mut engine = build_cycle_workbook(iterative_config(true))?;
-    let mut reference = build_cycle_workbook(iterative_config(false))?;
+    let (banked, installed, values, telemetry) = chain_sequence(|| {
+        let mut engine = build_cycle_workbook(iterative_config(true))?;
+        let mut reference = build_cycle_workbook(iterative_config(false))?;
 
-    engine.evaluate_all()?;
-    reference.evaluate_all()?;
+        engine.evaluate_all()?;
+        reference.evaluate_all()?;
+        let banked = engine.spec_chain_telemetry().chain_builds;
+        let installed = engine.spec_chain_is_installed();
 
-    let telemetry = engine.spec_chain_telemetry().clone();
+        // A value edit on A1 dirties B1, and the SCC closes dirtiness over C1:
+        // every settleable member of the cycle unit is pending.
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(30))?;
+        reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(30))?;
+        engine.evaluate_all()?;
+        reference.evaluate_all()?;
+
+        let values: Vec<(Option<LiteralValue>, Option<LiteralValue>)> = (2..=3u32)
+            .map(|col| {
+                (
+                    engine.get_cell_value("Sheet1", 1, col),
+                    reference.get_cell_value("Sheet1", 1, col),
+                )
+            })
+            .collect();
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok((
+            (banked, installed, values, telemetry.clone()),
+            telemetry,
+        ))
+    })?;
+
+    assert_eq!(banked, 1, "a schedule with a cycle unit is banked");
+    assert!(installed, "and the chain stays installed");
     assert_eq!(
-        telemetry.chain_builds, 0,
-        "a schedule with a cycle unit must not be banked"
+        telemetry.chain_walks, 1,
+        "the value edit was served by the chain walk"
     );
-    assert_eq!(telemetry.last_reason, Some("cycle_unit_in_schedule"));
-    assert!(!engine.spec_chain_is_installed());
-    assert_eq!(telemetry.chain_walks, 0);
-
-    // And it stays refused across later requests, so the walk's defensive
-    // cycle branch is never reached.
-    engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(30))?;
-    reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(30))?;
-    engine.evaluate_all()?;
-    reference.evaluate_all()?;
-
-    let telemetry = engine.spec_chain_telemetry().clone();
-    assert_eq!(telemetry.chain_builds, 0);
-    assert_eq!(telemetry.chain_walks, 0);
-    assert_eq!(telemetry.last_reason, Some("cycle_unit_in_schedule"));
-
-    // The values the flag-on engine produces are the flag-off engine's.
-    for col in 2..=3u32 {
-        assert_eq!(
-            engine.get_cell_value("Sheet1", 1, col),
-            reference.get_cell_value("Sheet1", 1, col),
-            "column {col} diverged"
-        );
+    assert_eq!(telemetry.last_path, Some("chain"));
+    assert_eq!(telemetry.last_reason, None, "the walk completed");
+    for (col, (chained, plain)) in (2..=3u32).zip(values) {
+        assert_eq!(chained, plain, "column {col} diverged");
     }
     Ok(())
 }
+
+// The partially-pending case (`partially_pending_cycle_unit`) has no test.
+// It is the divergent one clause (f) exists for, but it is not constructible
+// from the public API by source reading alone. Inside an SCC every member is
+// a dependent of every other, so `mark_dirty_many`'s BFS over dependents
+// makes dirtiness all-or-nothing: an edit reaching one member reaches them
+// all, retained/iterative membership included (`retained_scc_members` holds
+// members clean *between* requests, but "any edit that reaches a member
+// dirties it like any other formula"). A partially pending unit therefore
+// needs a component that is cyclic only through the per-pass virtual/relay
+// edges `build_regionized` synthesises — a range reader whose region node
+// closes a loop — which the dirty BFS does not traverse in the same shape.
+// That is the r9 gate workbooks' situation, not something this crate's
+// `TestWorkbook` fixtures reach. The branch is reachable and cheap; it is
+// left to a fixture built from a captured book.
 
 /// The mid-walk spill check: a dynamic array that grows during a chain walk
 /// hands the rest of the request to the exact path, and the request's values
@@ -522,6 +560,11 @@ fn spec_chain_falls_back_when_a_spill_grows_during_the_walk() -> Result<(), Exce
     assert_eq!(
         telemetry.demotion_rounds, 0,
         "the fallback was not the demotion cap"
+    );
+    assert_eq!(
+        telemetry.chain_drops, 0,
+        "and not an out-of-walk drop either: this test does not run under \
+         `chain_sequence`, so the elimination has to rule that out itself"
     );
     // The fallback's own reason, "spill_footprint_moved_mid_walk", is not
     // readable at the end of the request: the exact path runs next and its
