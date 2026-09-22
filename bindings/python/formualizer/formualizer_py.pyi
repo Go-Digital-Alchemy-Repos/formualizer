@@ -38,6 +38,7 @@ __all__ = [
     "SemanticReference",
     "Sheet",
     "SheetPortSession",
+    "SpecChainTelemetry",
     "SpillRole",
     "SpillRoleKind",
     "Staleness",
@@ -423,6 +424,24 @@ class EvaluationConfig:
         When enabled, copied formula spans may be evaluated
         by the experimental FormulaPlane runtime instead of materialized as
         per-cell graph formulas.
+        """
+    @property
+    def speculative_chain(self) -> builtins.bool: ...
+    @speculative_chain.setter
+    def speculative_chain(self, value: builtins.bool) -> None:
+        r"""
+        Bank and reuse the Excel-style calculation chain.
+        
+        The default is the engine's own — `FZ_SPEC_CHAIN`'s reader, so the
+        binding never diverges from a Rust host on the same environment.
+        """
+    @property
+    def spec_chain_read_guard(self) -> builtins.bool: ...
+    @spec_chain_read_guard.setter
+    def spec_chain_read_guard(self, value: builtins.bool) -> None:
+        r"""
+        Read-site out-of-order backstop for the chain. Only meaningful when
+        `speculative_chain` is set; default from `FZ_SPEC_CHAIN_READ_GUARD`.
         """
     @property
     def max_work_units(self) -> typing.Optional[builtins.int]: ...
@@ -822,6 +841,11 @@ class LiteralValue:
         Create an Empty value
         """
     @staticmethod
+    def pending() -> LiteralValue:
+        r"""
+        Create an unresolved value, distinct from a blank cell.
+        """
+    @staticmethod
     def date(year: builtins.int, month: builtins.int, day: builtins.int) -> LiteralValue:
         r"""
         Create a Date value
@@ -850,6 +874,19 @@ class LiteralValue:
     def error(kind: builtins.str, message: typing.Optional[builtins.str]) -> LiteralValue:
         r"""
         Create an Error value
+        """
+    @staticmethod
+    def from_object(value: typing.Any) -> LiteralValue:
+        r"""
+        Wrap any Python value the engine understands as a `LiteralValue`.
+        
+        Accepts the same shapes the engine's setters accept: numbers, strings,
+        booleans, dates/times/timedeltas, nested sequences, and the error dicts
+        the engine hands back (`{"type": "Error", "kind": "Div"}`).
+        
+        This is the bridge from a *read* value to the `LiteralValue` API:
+        `Workbook.get_value` returns plain Python objects, so a caller who
+        wants `excel_token` on an evaluated cell round-trips it through here.
         """
     def to_python(self) -> typing.Any:
         r"""
@@ -1203,8 +1240,8 @@ class SheetPortSession:
         r"""
         Describe each port with direction, shape, constraints, and resolved defaults.
         """
-    def read_inputs(self) -> typing.Any: ...
-    def read_outputs(self) -> typing.Any: ...
+    def read_inputs(self, typed: builtins.bool = False) -> typing.Any: ...
+    def read_outputs(self, typed: builtins.bool = False) -> typing.Any: ...
     def write_inputs(self, update: typing.Any) -> None:
         r"""
         Write input values into the bound workbook.
@@ -1247,6 +1284,82 @@ class SheetPortSession:
             print(out)
         ```
         """
+
+@typing.final
+class SpecChainTelemetry:
+    r"""
+    Which path the engine's evaluations took and what the chain's read-site
+    guard saw, for the r11 chain instrument.
+    
+    Counters are cumulative over the engine's life; `last_path` and
+    `last_reason` describe the most recent evaluation only.
+    """
+    @property
+    def chain_builds(self) -> builtins.int:
+        r"""
+        Chains banked.
+        """
+    @property
+    def partial_banks(self) -> builtins.int:
+        r"""
+        Of those, banked from a pass in which some formula vertex was clean.
+        """
+    @property
+    def members_at_bank(self) -> builtins.int:
+        r"""
+        Members of the last banked chain.
+        """
+    @property
+    def chain_walks(self) -> builtins.int:
+        r"""
+        Requests served by walking the chain.
+        """
+    @property
+    def demotion_rounds(self) -> builtins.int:
+        r"""
+        Walk rounds that demoted vertices back to the exact path.
+        """
+    @property
+    def demoted_vertices(self) -> builtins.int:
+        r"""
+        Vertices demoted, totalled.
+        """
+    @property
+    def fallbacks(self) -> builtins.int:
+        r"""
+        Requests the chain could not serve.
+        """
+    @property
+    def chain_drops(self) -> builtins.int:
+        r"""
+        Installed chains taken away out of band.
+        """
+    @property
+    def read_guard_checks(self) -> builtins.int:
+        r"""
+        Range reads the read-site guard probed.
+        """
+    @property
+    def read_guard_coarse_hits(self) -> builtins.int:
+        r"""
+        Probes the guard's coarse per-column filter flagged.
+        """
+    @property
+    def read_guard_violations(self) -> builtins.int:
+        r"""
+        Probes the guard's exact test confirmed as out of order.
+        """
+    @property
+    def last_reason(self) -> typing.Optional[builtins.str]:
+        r"""
+        Why the last evaluation did not use the chain, if it did not.
+        """
+    @property
+    def last_path(self) -> typing.Optional[builtins.str]:
+        r"""
+        Path the last evaluation ran: `"chain"` or `"full"`.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class SpillRole:
@@ -1555,6 +1668,11 @@ class Workbook:
     """
     @property
     def sheet_names(self) -> builtins.list[builtins.str]: ...
+    @property
+    def speculative_chain(self) -> builtins.bool:
+        r"""
+        Whether the calculation chain is enabled on the live engine.
+        """
     def inspect_cell(self, address: builtins.str, *, include_values: builtins.bool = True) -> CellSnapshotReport:
         r"""
         Inspect one cell without evaluating it. Raises `InspectionError`; inspect its `code` attribute for a stable category.
@@ -1825,6 +1943,11 @@ class Workbook:
         This accessor is read-only and deliberately bypasses `literal_to_py`,
         whose coercions erase Int/Number and IEEE-754 payload distinctions.
         """
+    def read_typed_range(self, sheet: builtins.str, start_row: builtins.int, start_col: builtins.int, end_row: builtins.int, end_col: builtins.int) -> builtins.list[builtins.list[LiteralValue]]:
+        r"""
+        Read a rectangular native-value snapshot without evaluating or applying temporal egress.
+        Coordinates are inclusive and 1-based. Unpopulated cells are Empty.
+        """
     def set_deterministic_clock(self, deterministic_timestamp_utc: datetime.datetime, deterministic_timezone: typing.Optional[typing.Any] = None) -> None:
         r"""
         Pin the evaluation clock to a caller-supplied instant, so the
@@ -1836,6 +1959,11 @@ class Workbook:
         offset in seconds — the same spelling as
         `SheetPortSession.evaluate_once(deterministic_timezone=...)`.
         Omitted means UTC.
+        """
+    def prepare_graph(self) -> None:
+        r"""
+        Materialize the workbook dependency graph without evaluating formulas.
+        Reusable services can perform this input-independent preparation once.
         """
     def evaluate_all(self) -> None: ...
     def last_cycle_telemetry(self) -> CycleTelemetry:
@@ -1862,6 +1990,28 @@ class Workbook:
             t = wb.last_cycle_telemetry()
             print(t.iterated_sccs, t.converged_sccs, t.capped_sccs)
         ```
+        """
+    def spec_chain_telemetry(self) -> SpecChainTelemetry:
+        r"""
+        The chain build/walk/fallback and read-guard counters for this
+        engine's life, and which path the last evaluation took.
+        
+        Example:
+        ```python
+            t = wb.spec_chain_telemetry()
+            print(t.chain_walks, t.read_guard_coarse_hits, t.read_guard_violations)
+        ```
+        """
+    def set_speculative_chain(self, enabled: builtins.bool) -> None:
+        r"""
+        Turn the calculation chain on or off on the live engine.
+        
+        Turning it off drops any banked chain with it. Turning it on banks
+        nothing by itself: the next converged exact pass banks, which is what
+        makes a *partial* bank constructible from Python — construct with the
+        chain off, warm the workbook with `evaluate_all()`, call
+        `set_speculative_chain(True)`, then edit, and that edit's exact pass
+        banks over its own dirty members.
         """
     def set_cycle_instrumentation_targets(self, targets: typing.Sequence[tuple[builtins.str, builtins.int, builtins.int]]) -> None:
         r"""
@@ -1930,6 +2080,12 @@ class Workbook:
     def redo(self) -> None:
         r"""
         Redo the most recently undone edit.
+        """
+    def with_deferred_updates(self, callback: typing.Any) -> typing.Any:
+        r"""
+        Apply ordered literal updates, propagating dirtiness once on exit.
+        The callback may read stored cells and write values, but must not evaluate.
+        The scope is flushed even when the callback raises an exception.
         """
     def set_values_batch(self, sheet: builtins.str, start_row: builtins.int, start_col: builtins.int, data: list) -> None: ...
     def set_formulas_batch(self, sheet: builtins.str, start_row: builtins.int, start_col: builtins.int, formulas: list) -> None: ...
@@ -2112,6 +2268,23 @@ class WorkbookMode(enum.Enum):
     def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
 
+@typing.final
+class XlsxPathSource(enum.Enum):
+    r"""
+    XLSX filesystem backing source used by Calamine path loads.
+    """
+    SHARED_FILE = ...
+    r"""
+    Safe default: one retained file handle with shared serialized I/O.
+    """
+    DIRECT_MMAP = ...
+    r"""
+    Explicit read-only mmap; see the filesystem mutation contract.
+    """
+
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
+
 def excel_token_for_kind(kind: builtins.str) -> typing.Optional[builtins.str]:
     r"""
     Resolve a Python-surface error-kind name to its Excel cell token.
@@ -2136,23 +2309,6 @@ def excel_token_for_kind(kind: builtins.str) -> typing.Optional[builtins.str]:
         fz.excel_token_for_kind("circ")  # None
     ```
     """
-
-@typing.final
-class XlsxPathSource(enum.Enum):
-    r"""
-    XLSX filesystem backing source used by Calamine path loads.
-    """
-    SHARED_FILE = ...
-    r"""
-    Safe default: one retained file handle with shared serialized I/O.
-    """
-    DIRECT_MMAP = ...
-    r"""
-    Explicit read-only mmap; see the filesystem mutation contract.
-    """
-
-    def __str__(self) -> builtins.str: ...
-    def __repr__(self) -> builtins.str: ...
 
 def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
     r"""

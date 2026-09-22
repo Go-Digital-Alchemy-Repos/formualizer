@@ -44,6 +44,7 @@ __all__ = [
     "SemanticReference",
     "Sheet",
     "SheetPortSession",
+    "SpecChainTelemetry",
     "SpillRole",
     "SpillRoleKind",
     "Staleness",
