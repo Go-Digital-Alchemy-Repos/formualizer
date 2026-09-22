@@ -1,7 +1,9 @@
 //! Tests for the Excel-style speculative calculation chain
 //! (`EvalConfig::speculative_chain`).
 
-use crate::engine::{CycleConfig, Engine, EvalConfig, SpecChainTelemetry, TemporalEgress};
+use crate::engine::{
+    CancelToken, CycleConfig, Engine, EvalConfig, SpecChainTelemetry, TemporalEgress,
+};
 use crate::function::{FnCaps, Function};
 use crate::function_registry;
 use crate::test_workbook::TestWorkbook;
@@ -1060,5 +1062,42 @@ fn read_guard_coarse_hit_outside_rect_is_not_a_violation() -> Result<(), ExcelEr
     );
     assert_eq!(telemetry.read_guard_first_violation, None);
     assert_eq!(values, reference_values, "the walk's values are the exact path's");
+    Ok(())
+}
+
+/// The cancellable full-recalc entry point is the one the workbook layer and
+/// the Python binding's `Workbook.evaluate_all()` take
+/// (`formualizer_workbook::Workbook::evaluate_all_cancellable` ->
+/// `Engine::evaluate_all_cancellable`). It must bank and walk the chain like
+/// the plain `evaluate_all`, otherwise a chain-on workbook driven from Python
+/// silently never uses the chain.
+#[test]
+fn cancellable_evaluate_all_banks_and_walks_the_chain() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let telemetry = chain_sequence(|| {
+        let mut engine = build_range_workbook(chain_config())?;
+
+        engine.evaluate_all_cancellable(CancelToken::new())?;
+        assert_eq!(
+            engine.spec_chain_telemetry().chain_builds,
+            1,
+            "the first cancellable recalc must bank a chain"
+        );
+        assert_eq!(engine.spec_chain_telemetry().chain_walks, 0);
+        assert_eq!(engine.spec_chain_telemetry().last_path, Some("full"));
+
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        engine.evaluate_all_cancellable(CancelToken::new())?;
+
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok((telemetry.clone(), telemetry))
+    })?;
+
+    assert_eq!(
+        telemetry.chain_walks, 1,
+        "the second cancellable recalc must walk the banked chain"
+    );
+    assert_eq!(telemetry.chain_builds, 1, "no rebuild on the second call");
+    assert_eq!(telemetry.last_path, Some("chain"));
     Ok(())
 }

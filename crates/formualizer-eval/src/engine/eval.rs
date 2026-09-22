@@ -27945,6 +27945,18 @@ where
             }
             return self.evaluate_authoritative_formula_plane_all();
         }
+        // Excel-style speculative calculation chain, exactly as in
+        // `evaluate_all_legacy_impl`: the cancellable entry point is the route
+        // the Python binding's `Workbook.evaluate_all()` takes, so without this
+        // it would neither walk nor bank a chain. A chain walk is a bounded
+        // fast path that replaces the whole schedule-and-walk below; the
+        // cancellation checks it skips are the per-unit ones of a pass that no
+        // longer happens.
+        if self.config.speculative_chain
+            && let Some(result) = self.try_spec_chain_evaluate()?
+        {
+            return Ok(result);
+        }
         self.reset_virtual_dep_telemetry_if_disabled();
         let start = crate::instant::FzInstant::now();
         let mut computed_vertices = 0;
@@ -28048,6 +28060,12 @@ where
             if changed_vertices.is_empty() {
                 if let Some(t) = telemetry.as_mut() {
                     t.bailout_reason = Some("converged");
+                }
+                // Bank this pass's order, under the same first-pass-converged
+                // rule as `evaluate_all_legacy_impl`. A cancelled pass returns
+                // early and never reaches here, so only a completed pass banks.
+                if self.config.speculative_chain && replan_iterations == 0 {
+                    self.install_spec_chain(&schedule, &to_evaluate);
                 }
                 break;
             }
