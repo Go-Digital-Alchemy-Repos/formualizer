@@ -25686,36 +25686,38 @@ where
     ///     would not have touched, re-key `retained_scc_members` and move the
     ///     cycle telemetry.
     ///
-    ///     The walk therefore classifies each cycle unit by its *settleable*
-    ///     members — the `FormulaScalar`/`FormulaArray`/`NamedScalar`/
-    ///     `NamedArray` members, i.e. exactly the kinds
-    ///     `DependencyGraph::get_evaluation_vertices` can emit; a banked unit
-    ///     may also carry pass-through `Range`/`InfiniteRange` members, which
-    ///     can never be pending and must not be counted, or every such unit
-    ///     would fall back forever. None pending: skip the unit, its values
-    ///     stand (the same rule `handle_cycle_unit` applies under
-    ///     `CycleDetection::Runtime`). All pending: settle the banked members,
-    ///     which are then exactly the request's SCC. Some but not all pending:
-    ///     the divergent case — hand the whole request to the exact path
-    ///     (`partially_pending_cycle_unit`) *before* touching the unit.
+    ///   The walk therefore classifies each cycle unit by its *settleable*
+    ///   members — the `FormulaScalar`/`FormulaArray`/`NamedScalar`/
+    ///   `NamedArray` members, i.e. exactly the kinds
+    ///   `DependencyGraph::get_evaluation_vertices` can emit; a banked unit
+    ///   may also carry pass-through `Range`/`InfiniteRange` members, which
+    ///   can never be pending and must not be counted, or every such unit
+    ///   would fall back forever. None pending: skip the unit, its values
+    ///   stand (the same rule `handle_cycle_unit` applies under
+    ///   `CycleDetection::Runtime`). All pending: settle the banked members,
+    ///   which are then exactly the request's SCC. Some but not all pending:
+    ///   the divergent case — hand the whole request to the exact path
+    ///   (`partially_pending_cycle_unit`) *before* touching the unit.
     ///
-    ///     Known remaining divergence (r9, open follow-up). A mid-walk
-    ///     fallback taken *after* this walk already settled a cycle unit lets
-    ///     the exact path settle that same SCC a second time inside one
-    ///     request, double-advancing an iteration budget for an iterative SCC
-    ///     (`pending_iterative_redirty` duplication is idempotent, per
-    ///     [`Self::redirty_for_next_recalc`]; the double settle is not). The
-    ///     fallback path itself is exact, so the request's answer is the exact
-    ///     path's answer — what moves is iteration state. Reaching it needs a
-    ///     spill to grow (or the demotion cap to trip) during a chain walk in
-    ///     a workbook that also has iterative cycles; neither gate workbook
-    ///     does. It is made observable rather than fixed:
-    ///     `cycle_units_settled_this_walk` re-labels those two fallbacks as
-    ///     `spill_fallback_after_cycle_settle` /
-    ///     `demotion_fallback_after_cycle_settle` so the case can be counted
-    ///     in the field before anyone pays for a fix. The
-    ///     `partially_pending_cycle_unit` fallback can land after an earlier
-    ///     settle in the same walk too, and carries the same hazard.
+    ///   Known remaining divergence (r9, open follow-up). A mid-walk
+    ///   fallback taken *after* this walk already settled a cycle unit lets
+    ///   the exact path settle that same SCC a second time inside one
+    ///   request, double-advancing an iteration budget for an iterative SCC
+    ///   (`pending_iterative_redirty` duplication is idempotent, per
+    ///   [`Self::redirty_for_next_recalc`]; the double settle is not). The
+    ///   fallback path itself is exact, so the request's answer is the exact
+    ///   path's answer — what moves is iteration state. Reaching it needs a
+    ///   spill to grow (or the demotion cap to trip) during a chain walk in
+    ///   a workbook that also has iterative cycles; neither gate workbook
+    ///   does. It is made observable rather than fixed:
+    ///   `cycle_units_settled_this_walk` re-labels those two fallbacks as
+    ///   `spill_fallback_after_cycle_settle` /
+    ///   `demotion_fallback_after_cycle_settle` so the case can be counted
+    ///   in the field before anyone pays for a fix. The
+    ///   `partially_pending_cycle_unit` fallback can land after an earlier
+    ///   settle in the same walk too, and carries the same hazard, so it is
+    ///   re-labelled `partially_pending_cycle_unit_after_cycle_settle` on the
+    ///   same condition.
     ///
     /// Why the per-request path does no virtual-dependency work at all: the
     /// only candidate check would be `changed_virtual_dep_vertices` against a
@@ -25848,7 +25850,11 @@ where
     ///   from a correct schedule. Strictly more conservative than the
     ///   end-of-round shape, and the only shape available to a fallback that
     ///   must happen before a particular unit is touched. The cycle unit
-    ///   itself is untouched, which is the point.
+    ///   itself is untouched, which is the point. It is also the only shape
+    ///   that re-evaluates already-walked vertices, so a volatile walked
+    ///   before the cycle unit is evaluated twice inside this request —
+    ///   internally consistent, since the exact path's values are the ones
+    ///   that stand, but observable in a volatile's call count.
     ///
     /// See clause (f) of [`Self::install_spec_chain`] for the cycle-unit rule
     /// and the one divergence it knowingly leaves open.
@@ -25961,6 +25967,12 @@ where
                         let mut settleable = 0usize;
                         let mut pending_members = 0usize;
                         for &vertex in cycle_members {
+                            // A tombstoned member can never enter `pending`,
+                            // so counting it as settleable would leave the
+                            // unit looking partially pending forever.
+                            if !self.graph.vertex_exists_active(vertex) {
+                                continue;
+                            }
                             if !matches!(
                                 self.graph.get_vertex_kind(vertex),
                                 VertexKind::FormulaScalar
@@ -25976,9 +25988,13 @@ where
                             }
                         }
                         if pending_members == 0 {
-                            // Values stand, exactly as `handle_cycle_unit`
-                            // would decide for itself under
-                            // `CycleDetection::Runtime`.
+                            // The chain's own decision, not a delegation to
+                            // `handle_cycle_unit`: that function's self-skip
+                            // is guarded on `if let Some(filter) =
+                            // dirty_filter` and the walk passes `None`. A
+                            // component with nothing pending needs no work,
+                            // and this request's exact-path schedule would
+                            // not contain it at all, so its values stand.
                             continue;
                         }
                         if pending_members != settleable {
@@ -25990,8 +26006,17 @@ where
                             // touching the unit — nothing in it has been
                             // evaluated or cleared, so the exact path settles
                             // the request's own SCC from scratch.
+                            // Clause (f) observability, as for the spill and
+                            // demotion fallbacks below: this fallback can also
+                            // land after the walk settled an SCC in this
+                            // request, and then carries the same double-settle
+                            // hazard.
                             self.spec_chain_telemetry.last_reason =
-                                Some("partially_pending_cycle_unit");
+                                if cycle_units_settled_this_walk > 0 {
+                                    Some("partially_pending_cycle_unit_after_cycle_settle")
+                                } else {
+                                    Some("partially_pending_cycle_unit")
+                                };
                             self.spec_chain_telemetry.last_path = Some("full");
                             self.spec_chain_telemetry.fallbacks += 1;
                             return Ok(None);

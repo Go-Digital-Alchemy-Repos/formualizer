@@ -4320,6 +4320,11 @@ impl DependencyGraph {
         index < self.store.len()
     }
 
+    /// Check if a vertex exists and has not been tombstoned
+    pub(crate) fn vertex_exists_active(&self, vertex_id: VertexId) -> bool {
+        self.store.vertex_exists_active(vertex_id)
+    }
+
     /// Get the kind of a vertex
     pub(crate) fn get_vertex_kind(&self, vertex_id: VertexId) -> VertexKind {
         self.store.kind(vertex_id)
