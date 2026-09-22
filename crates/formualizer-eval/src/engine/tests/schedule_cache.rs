@@ -6,6 +6,11 @@ use formualizer_common::{ExcelError, LiteralValue};
 fn telemetry_config() -> EvalConfig {
     EvalConfig {
         enable_virtual_dep_telemetry: true,
+        // These tests pin the pre-chain schedule-cache contract, so they must
+        // not take `speculative_chain` from the ambient `FZ_SPEC_CHAIN`: the
+        // chain path returns before the schedule builder is reached and the
+        // reuse-probe counters would all read zero.
+        speculative_chain: false,
         ..EvalConfig::default()
     }
 }

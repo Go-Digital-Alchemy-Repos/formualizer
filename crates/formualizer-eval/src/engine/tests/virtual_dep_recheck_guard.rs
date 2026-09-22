@@ -9,7 +9,16 @@ use formualizer_common::LiteralValue;
 use formualizer_parse::parser::parse;
 
 fn engine() -> Engine<TestWorkbook> {
-    Engine::new(TestWorkbook::new(), EvalConfig::default())
+    Engine::new(
+        TestWorkbook::new(),
+        EvalConfig {
+            // These tests pin how the post-pass recheck itself routes, which
+            // the speculative chain bypasses; do not take the flag from the
+            // ambient `FZ_SPEC_CHAIN`.
+            speculative_chain: false,
+            ..EvalConfig::default()
+        },
+    )
 }
 
 /// An ordinary workbook — values, scalar formulas and a range read — has

@@ -35,6 +35,9 @@ fn config() -> EvalConfig {
         formula_plane_mode: FormulaPlaneMode::Off,
         enable_parallel: false,
         enable_virtual_dep_telemetry: true,
+        // Pin the pre-chain schedule-reuse contract these tests assert; see
+        // `schedule_cache::telemetry_config`.
+        speculative_chain: false,
         ..EvalConfig::default()
     }
 }
