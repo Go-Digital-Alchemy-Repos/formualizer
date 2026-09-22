@@ -42,6 +42,7 @@ mod range_dependencies;
 mod range_property_tests;
 mod recalc_plan;
 mod schedule_cache;
+mod spec_chain;
 mod schedule_integration;
 mod schedule_units;
 mod sheet_index_integration;

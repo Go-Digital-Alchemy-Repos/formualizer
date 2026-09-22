@@ -62,7 +62,8 @@ pub use cancel::CancelToken;
 pub use eval::{
     CycleInstrumentationEdge, CycleInstrumentationTarget, CycleTelemetry, Engine, EngineAction,
     EngineBaselineStats, EvalResult, RecalcPlan, SourceFormulaIngress, StampedSccDiagnostic,
-    StampedSccDiagnosticEdge, TableMetadata, UpstreamDiagnosticsSnapshot, VirtualDepTelemetry,
+    SpecChainTelemetry, StampedSccDiagnosticEdge, TableMetadata, UpstreamDiagnosticsSnapshot,
+    VirtualDepTelemetry,
 };
 pub use eval_delta::{
     DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy, EvalDeltaRecord, TARGET_EVAL_DELTA_VERSION,
@@ -1005,6 +1006,28 @@ pub struct EvalConfig {
 
     /// Maximum bytes for the engine-side lookup-index cache.
     pub lookup_index_cache_max_bytes: usize,
+
+    /// PROTOTYPE (r8b): Excel-style speculative calculation chain.
+    ///
+    /// When set, `evaluate_all` keeps the flattened last-known-good schedule
+    /// (the "calculation chain") on the engine and, on later calls, walks it
+    /// in order evaluating only the dirty vertices instead of rebuilding a
+    /// schedule per request. The chain is discarded when the topology epoch or
+    /// the output footprint epoch moves, and any miss falls back to the exact
+    /// per-request schedule path.
+    ///
+    /// Default is `false`. For the prototype the default is read once from the
+    /// environment variable `FZ_SPEC_CHAIN` (set it to `1` to enable), so the
+    /// profile harness and the test suite can flip it without an API change.
+    pub speculative_chain: bool,
+}
+
+/// PROTOTYPE (r8b): read the `FZ_SPEC_CHAIN` default for `EvalConfig`.
+pub fn speculative_chain_env_default() -> bool {
+    matches!(
+        std::env::var("FZ_SPEC_CHAIN").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 impl Default for EvalConfig {
@@ -1074,6 +1097,7 @@ impl Default for EvalConfig {
             max_formula_plane_cache_edges: 100_000,
             max_formula_plane_cache_bytes: 64 * 1024 * 1024,
             lookup_index_cache_max_bytes: 64 * 1024 * 1024,
+            speculative_chain: speculative_chain_env_default(),
         }
     }
 }

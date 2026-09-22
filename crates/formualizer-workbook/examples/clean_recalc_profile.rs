@@ -97,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         r.cycle_errors
     );
     println!("  cycle {:?}", wb.engine().last_cycle_telemetry());
+    println!("  specchain {:?}", wb.engine().spec_chain_telemetry());
     if std::env::var("FZ_VDEP_TELEMETRY").is_ok() {
         let t = wb.engine().last_virtual_dep_telemetry();
         println!(
@@ -154,6 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.cycle_errors
         );
         println!("  cycle {:?}", wb.engine().last_cycle_telemetry());
+        println!("  specchain {:?}", wb.engine().spec_chain_telemetry());
         if eval_telemetry {
             let t = wb.engine().last_virtual_dep_telemetry();
             println!(

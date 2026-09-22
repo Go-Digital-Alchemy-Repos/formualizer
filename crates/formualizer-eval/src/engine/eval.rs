@@ -1532,6 +1532,9 @@ pub struct Engine<R> {
     /// must not use relocated span read summaries to prove disconnection.
     legacy_island_structural_summaries_trusted: bool,
     cached_static_schedule: Option<CachedScheduleEntry>,
+    /// PROTOTYPE (r8b): stored calculation chain (see `EvalConfig::speculative_chain`).
+    spec_chain: Option<SpecChain>,
+    spec_chain_telemetry: SpecChainTelemetry,
     #[cfg(any(test, feature = "benchmark_internal"))]
     recalc_reuse_probe: std::sync::Mutex<RecalcReuseProbe>,
     cached_mixed_topology: Option<CachedMixedTopology>,
@@ -2818,6 +2821,40 @@ fn schedule_probe_retained_bytes(schedule: &crate::engine::Schedule) -> usize {
 }
 
 #[derive(Debug, Clone)]
+/// PROTOTYPE (r8b): the Excel-style calculation chain.
+///
+/// `schedule` is the last-known-good flattened evaluation order for the WHOLE
+/// formula set (every unit the build produced, in condensation order).
+/// `position` maps each chain member to its ordinal so membership and staleness
+/// can be answered without rebuilding anything.
+struct SpecChain {
+    topology_epoch: u64,
+    /// `DependencyGraph::output_footprint_epoch` when the chain was installed.
+    /// A spill that changes an extent moves this and invalidates the chain.
+    footprint_epoch: u64,
+    schedule: Arc<crate::engine::scheduler::Schedule>,
+    position: FxHashMap<VertexId, u32>,
+}
+
+/// PROTOTYPE (r8b): which path an `evaluate_all` took and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpecChainTelemetry {
+    /// Chains installed after a full schedule build.
+    pub chain_builds: usize,
+    /// `evaluate_all` calls served by walking a stored chain.
+    pub chain_walks: usize,
+    /// Extra walk rounds triggered by demoted (still-dirty) vertices.
+    pub demotion_rounds: usize,
+    /// Vertices demoted to a later round, totalled.
+    pub demoted_vertices: usize,
+    /// Calls that reached the exact full-schedule path with the flag on.
+    pub fallbacks: usize,
+    /// Why the last call did not (or could not) use the chain.
+    pub last_reason: Option<&'static str>,
+    /// Path the last call actually ran: "chain" or "full".
+    pub last_path: Option<&'static str>,
+}
+
 struct CachedScheduleEntry {
     topology_epoch: u64,
     candidate_vertices: Vec<VertexId>,
@@ -3673,6 +3710,8 @@ where
             topology_epoch: 0,
             legacy_island_structural_summaries_trusted: true,
             cached_static_schedule: None,
+            spec_chain: None,
+            spec_chain_telemetry: SpecChainTelemetry::default(),
             #[cfg(any(test, feature = "benchmark_internal"))]
             recalc_reuse_probe: std::sync::Mutex::new(RecalcReuseProbe::default()),
             cached_mixed_topology: None,
@@ -3852,6 +3891,8 @@ where
             topology_epoch: 0,
             legacy_island_structural_summaries_trusted: true,
             cached_static_schedule: None,
+            spec_chain: None,
+            spec_chain_telemetry: SpecChainTelemetry::default(),
             #[cfg(any(test, feature = "benchmark_internal"))]
             recalc_reuse_probe: std::sync::Mutex::new(RecalcReuseProbe::default()),
             cached_mixed_topology: None,
@@ -6936,6 +6977,20 @@ where
 
     fn clear_cached_static_schedule(&mut self) {
         self.cached_static_schedule = None;
+        // PROTOTYPE (r8b): a topology edit retires the calculation chain too.
+        self.spec_chain = None;
+    }
+
+    /// PROTOTYPE (r8b): which evaluation path the most recent `evaluate_all`
+    /// used, and the chain build/walk/demotion/fallback counters for the
+    /// process so far.
+    pub fn spec_chain_telemetry(&self) -> &SpecChainTelemetry {
+        &self.spec_chain_telemetry
+    }
+
+    #[doc(hidden)]
+    pub fn spec_chain_is_installed(&self) -> bool {
+        self.spec_chain.is_some()
     }
 
     fn invalidation_baseline(&self) -> InvalidationBaseline {
@@ -15251,6 +15306,7 @@ where
         }
         if global_changed && !changed.is_empty() || provider_changed {
             self.cached_static_schedule = None;
+            self.spec_chain = None;
         }
         self.function_semantic_epoch_seen = changes.epoch;
         self.function_provider_revision_seen = provider_revision;
@@ -25355,6 +25411,15 @@ where
     /// one clock sample; request begin happens at the public entry points /
     /// coordinators instead.
     fn evaluate_all_legacy_impl(&mut self) -> Result<EvalResult, ExcelError> {
+        // PROTOTYPE (r8b): Excel-style speculative calculation chain. When a
+        // usable chain is installed this serves the whole request without
+        // touching the schedule builder; every miss returns `None` and drops
+        // through to the exact path below, which reinstalls a fresh chain.
+        if self.config.speculative_chain
+            && let Some(result) = self.try_spec_chain_evaluate()?
+        {
+            return Ok(result);
+        }
         self.reset_virtual_dep_telemetry_if_disabled();
         #[cfg(feature = "tracing")]
         let _span_eval = tracing::info_span!("evaluate_all").entered();
@@ -25404,6 +25469,12 @@ where
                 if let Some(t) = telemetry.as_mut() {
                     t.bailout_reason = Some("converged");
                 }
+                // PROTOTYPE (r8b): bank this pass's order as the calculation
+                // chain. Only a first-pass converged build is banked: a replan
+                // means the order we just walked was not the final one.
+                if self.config.speculative_chain && replan_iterations == 0 {
+                    self.install_spec_chain(&schedule);
+                }
                 break;
             }
             if replan_iterations >= MAX_REPLAN {
@@ -25436,6 +25507,236 @@ where
             cycle_errors,
             elapsed: start.elapsed(),
         })
+    }
+
+    /// PROTOTYPE (r8b): bank the just-walked schedule as the calculation chain.
+    ///
+    /// Eligibility is deliberately narrow: no vertex in the schedule may be a
+    /// runtime-reference (`OFFSET`/`INDIRECT`) formula, because such a vertex
+    /// can read somewhere else once its precedents have values and so can
+    /// invalidate the order without moving the topology epoch. Range and
+    /// whole-column dependencies — the thing the existing static schedule
+    /// cache refuses — are fine: their producer set is a function of the
+    /// topology, which the epoch check pins.
+    fn install_spec_chain(&mut self, schedule: &crate::engine::scheduler::Schedule) {
+        let member_count: usize = schedule
+            .layers
+            .iter()
+            .map(|layer| layer.vertices.len())
+            .sum::<usize>()
+            + schedule.cycles.iter().map(|c| c.len()).sum::<usize>();
+        if member_count == 0 {
+            return;
+        }
+        let mut position = FxHashMap::with_capacity_and_hasher(member_count, Default::default());
+        let mut ordinal: u32 = 0;
+        let mut has_dynamic = false;
+        'units: for &unit in &schedule.units {
+            let members: &[VertexId] = match unit {
+                ScheduleUnit::Layer(i) => &schedule.unit_layer(i).vertices,
+                ScheduleUnit::Cycle(i) => schedule.unit_cycle(i),
+            };
+            for &vertex in members {
+                if self.graph.is_dynamic(vertex) {
+                    has_dynamic = true;
+                    break 'units;
+                }
+                position.insert(vertex, ordinal);
+                ordinal = ordinal.saturating_add(1);
+            }
+        }
+        if has_dynamic {
+            self.spec_chain = None;
+            self.spec_chain_telemetry.last_reason = Some("dynamic_reference_vertex");
+            return;
+        }
+        self.spec_chain = Some(SpecChain {
+            topology_epoch: self.topology_epoch,
+            footprint_epoch: self.graph.output_footprint_epoch(),
+            schedule: Arc::new(schedule.clone()),
+            position,
+        });
+        self.spec_chain_telemetry.chain_builds += 1;
+    }
+
+    /// PROTOTYPE (r8b): serve `evaluate_all` by walking the stored chain.
+    ///
+    /// Returns `Ok(None)` when the chain cannot be trusted for this request, in
+    /// which case the caller runs the ordinary per-request schedule path and
+    /// reinstalls a chain from it. Every `None` return also drops the stored
+    /// chain, so a miss is never retried against the same stale order.
+    fn try_spec_chain_evaluate(&mut self) -> Result<Option<EvalResult>, ExcelError> {
+        let Some(chain) = self.spec_chain.take() else {
+            self.spec_chain_telemetry.last_reason = Some("no_chain");
+            self.spec_chain_telemetry.last_path = Some("full");
+            self.spec_chain_telemetry.fallbacks += 1;
+            return Ok(None);
+        };
+        if chain.topology_epoch != self.topology_epoch {
+            self.spec_chain_telemetry.last_reason = Some("topology_epoch_moved");
+            self.spec_chain_telemetry.last_path = Some("full");
+            self.spec_chain_telemetry.fallbacks += 1;
+            return Ok(None);
+        }
+        // A dynamic-array spill that changes an extent moves this epoch; the
+        // simplest safe rule is to rebuild rather than re-walk.
+        if chain.footprint_epoch != self.graph.output_footprint_epoch() {
+            self.spec_chain_telemetry.last_reason = Some("output_footprint_epoch_moved");
+            self.spec_chain_telemetry.last_path = Some("full");
+            self.spec_chain_telemetry.fallbacks += 1;
+            return Ok(None);
+        }
+
+        let start = crate::instant::FzInstant::now();
+        self.graph.flush_pending_edge_deltas();
+        let to_evaluate = self.graph.get_evaluation_vertices();
+        if to_evaluate.is_empty() {
+            self.spec_chain = Some(chain);
+            self.spec_chain_telemetry.chain_walks += 1;
+            self.spec_chain_telemetry.last_reason = Some("no_work");
+            self.spec_chain_telemetry.last_path = Some("chain");
+            self.redirty_for_next_recalc();
+            self.recalc_epoch = self.recalc_epoch.wrapping_add(1);
+            let mut telemetry = self.start_virtual_dep_telemetry();
+            telemetry.bailout_reason = Some("spec_chain_no_work");
+            self.last_virtual_dep_telemetry = telemetry;
+            return Ok(Some(EvalResult {
+                computed_vertices: 0,
+                cycle_errors: 0,
+                elapsed: start.elapsed(),
+            }));
+        }
+        if to_evaluate
+            .iter()
+            .any(|vertex| !chain.position.contains_key(vertex))
+        {
+            self.spec_chain_telemetry.last_reason = Some("dirty_vertex_outside_chain");
+            self.spec_chain_telemetry.last_path = Some("full");
+            self.spec_chain_telemetry.fallbacks += 1;
+            return Ok(None);
+        }
+
+        let schedule = Arc::clone(&chain.schedule);
+        // Demotion budget, Excel-style: a vertex that turns out to need a later
+        // slot is pushed into the next round instead of aborting the walk. The
+        // cap keeps a pathological workbook from walking forever.
+        let demotion_cap = to_evaluate.len().saturating_mul(3);
+        const MAX_DEMOTION_ROUNDS: usize = 3;
+
+        let mut pending: FxHashSet<VertexId> = to_evaluate.iter().copied().collect();
+        let mut evaluated: FxHashSet<VertexId> =
+            FxHashSet::with_capacity_and_hasher(to_evaluate.len(), Default::default());
+        let mut computed_vertices = 0usize;
+        let mut cycle_errors = 0usize;
+        let mut demoted_total = 0usize;
+        let mut rounds = 0usize;
+        let mut scratch = crate::engine::scheduler::Layer {
+            vertices: Vec::new(),
+        };
+
+        loop {
+            for &unit in &schedule.units {
+                self.cancellation_checkpoint("Evaluation cancelled during chain walk")?;
+                match unit {
+                    ScheduleUnit::Cycle(index) => {
+                        let members = schedule.unit_cycle(index);
+                        if !members.iter().any(|v| pending.contains(v)) {
+                            continue;
+                        }
+                        // Cycle semantics stay on the existing runtime path:
+                        // the whole SCC goes to `handle_cycle_unit`, which owns
+                        // detection and the #CIRC!/settle passes.
+                        if self.handle_cycle_unit(members, None, None, None)? > 0 {
+                            cycle_errors += 1;
+                        }
+                        evaluated.extend(members.iter().copied());
+                    }
+                    ScheduleUnit::Layer(index) => {
+                        let layer = schedule.unit_layer(index);
+                        scratch.vertices.clear();
+                        scratch.vertices.extend(
+                            layer
+                                .vertices
+                                .iter()
+                                .copied()
+                                .filter(|v| pending.contains(v)),
+                        );
+                        if scratch.vertices.is_empty() {
+                            continue;
+                        }
+                        evaluated.extend(scratch.vertices.iter().copied());
+                        computed_vertices +=
+                            if self.thread_pool.is_some() && scratch.vertices.len() > 1 {
+                                self.evaluate_layer_parallel(&scratch)?
+                            } else {
+                                self.evaluate_layer_sequential(&scratch)?
+                            };
+                    }
+                }
+            }
+
+            self.resource_checkpoint(0)?;
+            // Evaluation re-dirties dependents as it writes, exactly as on the
+            // full path; clear the flags for everything this cycle visited and
+            // see what is left over.
+            let mut visited: Vec<VertexId> = evaluated.iter().copied().collect();
+            visited.sort_unstable();
+            self.graph.clear_dirty_flags(&visited);
+
+            let residual: Vec<VertexId> = self
+                .graph
+                .get_evaluation_vertices()
+                .into_iter()
+                .filter(|v| !evaluated.contains(v))
+                .collect();
+            if residual.is_empty() {
+                break;
+            }
+            rounds += 1;
+            demoted_total += residual.len();
+            self.spec_chain_telemetry.demotion_rounds += 1;
+            self.spec_chain_telemetry.demoted_vertices += residual.len();
+            if rounds > MAX_DEMOTION_ROUNDS
+                || demoted_total > demotion_cap
+                || residual
+                    .iter()
+                    .any(|vertex| !chain.position.contains_key(vertex))
+            {
+                // Exact fallback: leave the residual dirty and let the
+                // per-request schedule path finish the job.
+                self.spec_chain_telemetry.last_reason = Some("demotion_cap_or_outside_chain");
+                self.spec_chain_telemetry.last_path = Some("full");
+                self.spec_chain_telemetry.fallbacks += 1;
+                return Ok(None);
+            }
+            pending = residual.into_iter().collect();
+        }
+
+        let mut completed: Vec<VertexId> = evaluated.iter().copied().collect();
+        completed.extend(to_evaluate.iter().copied());
+        completed.sort_unstable();
+        completed.dedup();
+        self.graph.clear_dirty_flags(&completed);
+
+        self.redirty_for_next_recalc();
+        self.recalc_epoch = self.recalc_epoch.wrapping_add(1);
+
+        self.spec_chain = Some(chain);
+        self.spec_chain_telemetry.chain_walks += 1;
+        self.spec_chain_telemetry.last_reason = None;
+        self.spec_chain_telemetry.last_path = Some("chain");
+
+        let mut telemetry = self.start_virtual_dep_telemetry();
+        telemetry.bailout_reason = Some("spec_chain");
+        telemetry.candidate_vertices_total = to_evaluate.len();
+        telemetry.reused_schedule_vertices_total = computed_vertices;
+        self.last_virtual_dep_telemetry = telemetry;
+
+        Ok(Some(EvalResult {
+            computed_vertices,
+            cycle_errors,
+            elapsed: start.elapsed(),
+        }))
     }
 
     pub fn evaluate_all_with_target_delta(
