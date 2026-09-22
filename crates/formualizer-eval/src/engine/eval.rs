@@ -25546,6 +25546,21 @@ where
             self.spec_chain_telemetry.last_reason = Some("dynamic_reference_vertex");
             return;
         }
+        // Only a schedule that covers EVERY formula vertex is a calculation
+        // chain. A partial schedule (a targeted prepare, a staged/deferred
+        // build, or the narrow pass that follows a formula edit) orders only
+        // the vertices it was handed, so a later dirty set would immediately
+        // escape it — and, worse, its order was never proven against the
+        // vertices it left out.
+        let all_formulas = self.graph.formula_vertices();
+        if all_formulas
+            .iter()
+            .any(|vertex| !position.contains_key(vertex))
+        {
+            self.spec_chain = None;
+            self.spec_chain_telemetry.last_reason = Some("partial_schedule_coverage");
+            return;
+        }
         self.spec_chain = Some(SpecChain {
             topology_epoch: self.topology_epoch,
             footprint_epoch: self.graph.output_footprint_epoch(),
