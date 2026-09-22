@@ -62,9 +62,8 @@ pub use cancel::CancelToken;
 pub use eval::{
     CycleInstrumentationEdge, CycleInstrumentationTarget, CycleTelemetry, Engine, EngineAction,
     EngineBaselineStats, EvalResult, ReadGuardViolation, RecalcPlan, SourceFormulaIngress,
-    StampedSccDiagnostic,
-    SpecChainTelemetry, StampedSccDiagnosticEdge, TableMetadata, UpstreamDiagnosticsSnapshot,
-    VirtualDepTelemetry,
+    SpecChainTelemetry, StampedSccDiagnostic, StampedSccDiagnosticEdge, TableMetadata,
+    UpstreamDiagnosticsSnapshot, VirtualDepTelemetry,
 };
 pub use eval_delta::{
     DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy, EvalDeltaRecord, TARGET_EVAL_DELTA_VERSION,
@@ -1017,11 +1016,14 @@ pub struct EvalConfig {
     /// the output footprint epoch moves, and any miss falls back to the exact
     /// per-request schedule path.
     ///
-    /// Default is `false`. The default is read once from the environment
-    /// variable `FZ_SPEC_CHAIN` set to `1`, `true`, `on` or `yes`
-    /// (case-insensitive, whitespace trimmed); any other value, and an unset
-    /// variable, keep the default. This lets the profile harness and the test
-    /// suite flip it without an API change.
+    /// Default is `true` since r11. The default is read once from the
+    /// environment variable `FZ_SPEC_CHAIN`: only an explicit `0`, `false`,
+    /// `off` or `no` (case-insensitive, whitespace trimmed) turns the chain
+    /// off, and any other value — including an unparseable one and an unset
+    /// variable — leaves it on. This lets the profile harness flip it without
+    /// an API change; a *test* that needs the chain off must set this field
+    /// explicitly rather than rely on the environment, since the ambient
+    /// variable is now the on position.
     pub speculative_chain: bool,
 
     /// Read-site out-of-order backstop for the calculation chain.
@@ -1048,15 +1050,21 @@ pub struct EvalConfig {
 }
 
 /// Read the `FZ_SPEC_CHAIN` default for `EvalConfig`.
+///
+/// On unless the variable explicitly says otherwise, since r11: the chain is
+/// the default evaluation path, so the environment's job is to turn it *off*
+/// for a comparison run. An unset or unparseable variable therefore leaves
+/// the chain on, which is the same shape as
+/// `spec_chain_read_guard_env_default`.
 pub fn speculative_chain_env_default() -> bool {
     std::env::var("FZ_SPEC_CHAIN")
         .map(|v| {
-            matches!(
+            !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
+                "0" | "false" | "off" | "no"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Whether the chain's read-site guard is on when nothing says otherwise.
