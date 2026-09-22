@@ -1022,6 +1022,26 @@ pub struct EvalConfig {
     /// variable, keep the default. This lets the profile harness and the test
     /// suite flip it without an API change.
     pub speculative_chain: bool,
+
+    /// Read-site out-of-order backstop for the calculation chain.
+    ///
+    /// Only meaningful when [`Self::speculative_chain`] is set. While a chain
+    /// walk is in progress, every range read the engine resolves asks whether
+    /// any vertex still pending in *this* walk lies inside the rect it is
+    /// about to materialise. A hit means the reader is running before a
+    /// producer of a range it reads, so the walk stops at the end of the
+    /// current layer and hands the request to the exact path.
+    ///
+    /// It is a backstop, not a replacement for the bank rule: under
+    /// `install_spec_chain`'s clauses (a)-(d) it should never fire. What it
+    /// covers is what that static argument cannot see — the
+    /// `EvaluationCompat` / `VirtualDependencyCompat` extent divergence, a
+    /// stale `used_axis_bounds_cache` bound, and any future admission path
+    /// that leaks a clean member.
+    ///
+    /// Default is [`SPEC_CHAIN_READ_GUARD_DEFAULT`], overridden only by an
+    /// explicit `FZ_SPEC_CHAIN_READ_GUARD` of `0`, `false`, `off` or `no`.
+    pub spec_chain_read_guard: bool,
 }
 
 /// Read the `FZ_SPEC_CHAIN` default for `EvalConfig`.
@@ -1034,6 +1054,30 @@ pub fn speculative_chain_env_default() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Whether the chain's read-site guard is on when nothing says otherwise.
+///
+/// One constant, because the decision it encodes is a measurement: the guard
+/// is on for r11's gate so its `read_guard_violations` and its cost are
+/// measured on a real workload, and if the false-positive rate turns out to
+/// cost the flip gain this is the single place that flips.
+pub const SPEC_CHAIN_READ_GUARD_DEFAULT: bool = true;
+
+/// Read the `FZ_SPEC_CHAIN_READ_GUARD` default for `EvalConfig`.
+///
+/// Inverted against `FZ_SPEC_CHAIN`'s reader on purpose: the guard is on by
+/// default, so only an explicit off value turns it off and any other value
+/// (including an unparseable one) leaves the default alone.
+pub fn spec_chain_read_guard_env_default() -> bool {
+    std::env::var("FZ_SPEC_CHAIN_READ_GUARD")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(SPEC_CHAIN_READ_GUARD_DEFAULT)
 }
 
 impl Default for EvalConfig {
@@ -1104,6 +1148,7 @@ impl Default for EvalConfig {
             max_formula_plane_cache_bytes: 64 * 1024 * 1024,
             lookup_index_cache_max_bytes: 64 * 1024 * 1024,
             speculative_chain: speculative_chain_env_default(),
+            spec_chain_read_guard: spec_chain_read_guard_env_default(),
         }
     }
 }

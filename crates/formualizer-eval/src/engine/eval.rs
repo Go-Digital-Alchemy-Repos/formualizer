@@ -1535,6 +1535,15 @@ pub struct Engine<R> {
     /// Stored calculation chain (see `EvalConfig::speculative_chain`).
     spec_chain: Option<SpecChain>,
     spec_chain_telemetry: SpecChainTelemetry,
+    /// The read-site out-of-order guard for the walk currently in progress,
+    /// `None` at every other moment (see `EvalConfig::spec_chain_read_guard`).
+    chain_read_guard: std::sync::RwLock<Option<ChainReadGuard>>,
+    /// Whether `chain_read_guard` holds a guard, readable without taking the
+    /// lock. The read site is on the hot path of every range materialisation,
+    /// so it checks the two config bools first (free, and the whole guard
+    /// compiles out of a chain-off engine's behaviour) and this flag second;
+    /// only a live walk pays for the lock.
+    chain_read_guard_active: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "benchmark_internal"))]
     recalc_reuse_probe: std::sync::Mutex<RecalcReuseProbe>,
     cached_mixed_topology: Option<CachedMixedTopology>,
@@ -2885,10 +2894,122 @@ pub struct SpecChainTelemetry {
     /// banked chain, and `last_reason` alone cannot see a drop that lands
     /// mid-sequence (a later pass re-banks and the reason is overwritten).
     pub chain_drops: u32,
+    /// Range reads probed by the read-site out-of-order guard, totalled over
+    /// the engine's life. Zero means the guard never ran — either it is off,
+    /// or no chain walk resolved a range read — so a zero
+    /// `read_guard_violations` is only evidence when this is non-zero.
+    pub read_guard_checks: u64,
+    /// Probes that found a vertex from a strictly later layer inside the rect
+    /// being read. Each one aborts the walk at the end of the current layer.
+    /// The test is conservative, so a violation is not necessarily a real
+    /// out-of-order read; see [`Engine::install_chain_read_guard`].
+    pub read_guard_violations: u64,
     /// Why the last call did not (or could not) use the chain.
     pub last_reason: Option<&'static str>,
     /// Path the last call actually ran: "chain" or "full".
     pub last_path: Option<&'static str>,
+}
+
+/// One sheet column's pending-vertex population, for the read-site guard.
+struct ReadGuardColumn {
+    /// Vertices of this column still pending in a strictly later layer of the
+    /// current walk. Decremented for a whole layer before any of its members
+    /// evaluates, so the reader itself and its layer-mates are never counted.
+    live: std::sync::atomic::AtomicU32,
+    /// 1-based row interval spanned by this column's pending vertices at build
+    /// time. It does not shrink as they evaluate: keeping it fixed costs false
+    /// positives, never false negatives, and keeps the decrement O(1).
+    first_row: u32,
+    last_row: u32,
+}
+
+/// Read-site out-of-order backstop for one chain-walk round.
+///
+/// Answers, for a rect about to be materialised, "is any vertex still pending
+/// in this walk located inside it?" — which is by definition a reader running
+/// before a producer of a range it reads. Built once per round in
+/// O(|pending|); one atomic load per column of the rect per read.
+///
+/// The reads it observes run in parallel (`evaluate_vertex_immutable` takes
+/// `&self`), so every mutable datum here is an atomic.
+struct ChainReadGuard {
+    /// `(sheet, 1-based column) -> population`. Only columns that hold at
+    /// least one pending vertex appear, so this is at most `|pending|` entries
+    /// and usually far fewer.
+    columns: FxHashMap<(SheetId, u32), ReadGuardColumn>,
+    /// The column key of each counted vertex, so releasing a layer is O(1) per
+    /// vertex. Symbol vertices (names) have no grid position and are absent.
+    vertex_columns: FxHashMap<VertexId, (SheetId, u32)>,
+    checks: std::sync::atomic::AtomicU64,
+    violations: std::sync::atomic::AtomicU64,
+    violated: std::sync::atomic::AtomicBool,
+}
+
+impl ChainReadGuard {
+    /// Drop a whole layer's vertices out of the live counts.
+    ///
+    /// Called *before* the layer evaluates, so a hit means "a vertex in a
+    /// strictly later layer lies inside this rect". Same-layer vertices and
+    /// the reader itself are therefore never counted, which is what keeps a
+    /// self-overlapping read (`B1 = SUM(B1:B40)`-shaped fixtures, and every
+    /// layer whose members read each other's column) from reporting a
+    /// violation the banked order does not actually have.
+    fn release(&self, vertices: &[VertexId]) {
+        use std::sync::atomic::Ordering;
+        for vertex in vertices {
+            let Some(key) = self.vertex_columns.get(vertex) else {
+                continue;
+            };
+            let Some(column) = self.columns.get(key) else {
+                continue;
+            };
+            // Saturating: a vertex banked into two units would otherwise
+            // underflow the count and turn the guard permanently blind.
+            let _ = column
+                .live
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+                    live.checked_sub(1)
+                });
+        }
+    }
+
+    /// Probe one resolved read rect. 1-based, inclusive, as the read site has
+    /// it.
+    fn check(&self, sheet_id: SheetId, sr: u32, sc: u32, er: u32, ec: u32) {
+        use std::sync::atomic::Ordering;
+        if er < sr || ec < sc {
+            // An empty extent reads nothing and is not a probe.
+            return;
+        }
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        if self.violated.load(Ordering::Relaxed) {
+            return;
+        }
+        let occupied = |column: &ReadGuardColumn| {
+            column.live.load(Ordering::Relaxed) > 0 && column.last_row >= sr && column.first_row <= er
+        };
+        // O(min(rect width, populated columns)). A whole-row reference spans
+        // 16,384 columns and a chain walk's pending set rarely spans ten, so
+        // the scan direction has to be chosen rather than fixed.
+        let width = (ec - sc) as usize + 1;
+        let hit = if width > self.columns.len() {
+            self.columns
+                .iter()
+                .any(|(&(sheet, column), population)| {
+                    sheet == sheet_id && column >= sc && column <= ec && occupied(population)
+                })
+        } else {
+            (sc..=ec).any(|column| {
+                self.columns
+                    .get(&(sheet_id, column))
+                    .is_some_and(occupied)
+            })
+        };
+        if hit {
+            self.violations.fetch_add(1, Ordering::Relaxed);
+            self.violated.store(true, Ordering::Release);
+        }
+    }
 }
 
 struct CachedScheduleEntry {
@@ -3747,6 +3868,8 @@ where
             legacy_island_structural_summaries_trusted: true,
             cached_static_schedule: None,
             spec_chain: None,
+            chain_read_guard: std::sync::RwLock::new(None),
+            chain_read_guard_active: std::sync::atomic::AtomicBool::new(false),
             spec_chain_telemetry: SpecChainTelemetry::default(),
             #[cfg(any(test, feature = "benchmark_internal"))]
             recalc_reuse_probe: std::sync::Mutex::new(RecalcReuseProbe::default()),
@@ -3928,6 +4051,8 @@ where
             legacy_island_structural_summaries_trusted: true,
             cached_static_schedule: None,
             spec_chain: None,
+            chain_read_guard: std::sync::RwLock::new(None),
+            chain_read_guard_active: std::sync::atomic::AtomicBool::new(false),
             spec_chain_telemetry: SpecChainTelemetry::default(),
             #[cfg(any(test, feature = "benchmark_internal"))]
             recalc_reuse_probe: std::sync::Mutex::new(RecalcReuseProbe::default()),
@@ -7039,6 +7164,28 @@ where
     #[doc(hidden)]
     pub fn spec_chain_is_installed(&self) -> bool {
         self.spec_chain.is_some()
+    }
+
+    /// Reverse the banked chain's unit order, so the next walk runs a
+    /// deliberately wrong one. Returns false when no chain is installed.
+    ///
+    /// Test-only, and the only way to reach the read-site guard's violation
+    /// branch: every order the scheduler produces is correct by construction,
+    /// and the divergences the guard exists to catch (the `EvaluationCompat` /
+    /// `VirtualDependencyCompat` extent split, a stale used-bounds cache) are
+    /// not reachable from this crate's fixtures. Corrupting the banked order
+    /// is the cheapest fixture that puts a reader ahead of a producer it
+    /// reads; the values the request returns still have to be the exact
+    /// path's.
+    #[cfg(test)]
+    pub(crate) fn spec_chain_reverse_banked_units_for_test(&mut self) -> bool {
+        let Some(chain) = self.spec_chain.as_mut() else {
+            return false;
+        };
+        let mut schedule = (*chain.schedule).clone();
+        schedule.units.reverse();
+        chain.schedule = Arc::new(schedule);
+        true
     }
 
     fn invalidation_baseline(&self) -> InvalidationBaseline {
@@ -25567,6 +25714,159 @@ where
         })
     }
 
+    /// Whether the read-site guard should run at all.
+    ///
+    /// Both are plain config bools, so a chain-off engine pays nothing — not
+    /// even an atomic load — for the guard's existence.
+    #[inline]
+    fn chain_read_guard_enabled(&self) -> bool {
+        self.config.speculative_chain && self.config.spec_chain_read_guard
+    }
+
+    /// Build the guard for one round of a chain walk over that round's
+    /// `pending` set, replacing whatever was there.
+    ///
+    /// O(|pending|): one grid-address lookup per pending vertex, and one map
+    /// entry per populated `(sheet, column)`. Symbol vertices (names) have no
+    /// grid position and are simply not counted — a name cannot be inside a
+    /// rect, so it cannot make a read out of order.
+    ///
+    /// # What the guard can and cannot say
+    ///
+    /// No false negatives: the counts start from the *whole* pending set and
+    /// fall only when a layer actually begins evaluating, and a demoted vertex
+    /// stays counted because the next round rebuilds from the new pending set.
+    /// False positives are possible and expected: a pending vertex in one of
+    /// the rect's columns, within the column's row interval, but outside the
+    /// rect itself, reads as a hit. Each one costs a whole request's chain
+    /// gain, which is why the guard has its own flag.
+    fn install_chain_read_guard(&mut self, pending: &FxHashSet<VertexId>) {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+        if !self.chain_read_guard_enabled() {
+            return;
+        }
+        let mut columns: FxHashMap<(SheetId, u32), ReadGuardColumn> = FxHashMap::default();
+        let mut vertex_columns: FxHashMap<VertexId, (SheetId, u32)> =
+            FxHashMap::with_capacity_and_hasher(pending.len(), Default::default());
+        for &vertex in pending {
+            let Some(addr) = self.graph.vertex_grid_addr(vertex) else {
+                continue;
+            };
+            let row = addr.row() + 1;
+            let key = (self.graph.get_sheet_id(vertex), addr.col() + 1);
+            vertex_columns.insert(vertex, key);
+            columns
+                .entry(key)
+                .and_modify(|population| {
+                    population.live.fetch_add(1, Ordering::Relaxed);
+                    population.first_row = population.first_row.min(row);
+                    population.last_row = population.last_row.max(row);
+                })
+                .or_insert_with(|| ReadGuardColumn {
+                    live: AtomicU32::new(1),
+                    first_row: row,
+                    last_row: row,
+                });
+        }
+        let guard = ChainReadGuard {
+            columns,
+            vertex_columns,
+            checks: AtomicU64::new(0),
+            violations: AtomicU64::new(0),
+            violated: AtomicBool::new(false),
+        };
+        *self
+            .chain_read_guard
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        self.chain_read_guard_active.store(true, Ordering::Release);
+    }
+
+    /// Drop a unit's vertices out of the live counts, before it evaluates.
+    fn release_chain_read_guard_unit(&self, vertices: &[VertexId]) {
+        if !self
+            .chain_read_guard_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        if let Some(guard) = self
+            .chain_read_guard
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            guard.release(vertices);
+        }
+    }
+
+    /// Whether a read during this walk has already been flagged out of order.
+    fn chain_read_guard_violated(&self) -> bool {
+        if !self
+            .chain_read_guard_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        self.chain_read_guard
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|guard| guard.violated.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Retire the guard and fold its counters into the chain telemetry.
+    ///
+    /// Idempotent, and called on every exit from the walk — including the
+    /// defensive call at the top of [`Self::try_spec_chain_evaluate`], which
+    /// is what keeps a guard left behind by an `Err` from an earlier request
+    /// out of the next one.
+    fn clear_chain_read_guard(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.chain_read_guard_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let taken = self
+            .chain_read_guard
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(guard) = taken {
+            self.spec_chain_telemetry.read_guard_checks = self
+                .spec_chain_telemetry
+                .read_guard_checks
+                .saturating_add(guard.checks.load(Ordering::Relaxed));
+            self.spec_chain_telemetry.read_guard_violations = self
+                .spec_chain_telemetry
+                .read_guard_violations
+                .saturating_add(guard.violations.load(Ordering::Relaxed));
+        }
+    }
+
+    /// The read-site probe itself, called once per resolved range extent.
+    ///
+    /// Takes `&self`: range reads run in parallel inside a layer.
+    #[inline]
+    fn probe_chain_read_guard(&self, sheet_id: SheetId, sr: u32, sc: u32, er: u32, ec: u32) {
+        if !self.chain_read_guard_enabled() {
+            return;
+        }
+        if !self
+            .chain_read_guard_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        if let Some(guard) = self
+            .chain_read_guard
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            guard.check(sheet_id, sr, sc, er, ec);
+        }
+    }
+
     /// Bank the just-walked schedule as the calculation chain.
     ///
     /// Eligibility is deliberately narrow: no vertex in the schedule may be a
@@ -25913,7 +26213,8 @@ where
     ///   doing — the spill branch's re-dirtied invalidations, or the residual.
     ///   The spill branch also puts `pending_output_invalidations` back,
     ///   because the exact path reads that same set as its recheck guard.
-    /// * **Mid-unit fallback** (`partially_pending_cycle_unit`). This fires
+    /// * **Mid-unit fallback** (`partially_pending_cycle_unit`,
+    ///   `read_guard_out_of_order`). This fires
     ///   *before* the round's `clear_dirty_flags`, so every vertex walked so
     ///   far is evaluated but still dirty, and the exact path simply redoes it
     ///   from a correct schedule. Strictly more conservative than the
@@ -25927,7 +26228,25 @@ where
     ///
     /// See clause (f) of [`Self::install_spec_chain`] for the cycle-unit rule
     /// and the one divergence it knowingly leaves open.
+    ///
+    /// # Read-site out-of-order guard
+    ///
+    /// When `EvalConfig::spec_chain_read_guard` is set, each round installs a
+    /// [`ChainReadGuard`] over its `pending` set and releases each unit's
+    /// vertices just before that unit evaluates. Any range read resolved
+    /// during the walk that lands on a vertex still pending in a strictly
+    /// later layer sets the violation flag, the walk stops at the end of the
+    /// current unit, and the request takes the mid-unit fallback above — which
+    /// is what discards the values the bad read produced. The reason is
+    /// `read_guard_out_of_order`, or
+    /// `read_guard_out_of_order_after_cycle_settle` when this walk had already
+    /// settled a cycle unit, since a read-guard fallback carries clause (f)'s
+    /// double-settle hazard exactly like the spill and demotion ones.
     fn try_spec_chain_evaluate(&mut self) -> Result<Option<EvalResult>, ExcelError> {
+        // A walk that ended on an `Err` (cancellation, a resource budget, an
+        // evaluation error) unwinds without reaching its own cleanup, so the
+        // guard is retired here rather than only at the walk's exits.
+        self.clear_chain_read_guard();
         let Some(chain) = self.spec_chain.take() else {
             self.spec_chain_telemetry.last_reason = Some("no_chain");
             self.spec_chain_telemetry.last_path = Some("full");
@@ -26022,6 +26341,9 @@ where
         };
 
         loop {
+            // One guard per round, over this round's pending set: a demoted
+            // vertex is counted again by the round that will evaluate it.
+            self.install_chain_read_guard(&pending);
             for &unit in &schedule.units {
                 self.cancellation_checkpoint("Evaluation cancelled during chain walk")?;
                 match unit {
@@ -26088,6 +26410,7 @@ where
                                 };
                             self.spec_chain_telemetry.last_path = Some("full");
                             self.spec_chain_telemetry.fallbacks += 1;
+                            self.clear_chain_read_guard();
                             return Ok(None);
                         }
                         // Every settleable member is pending, so the banked
@@ -26095,6 +26418,12 @@ where
                         // on the existing runtime path: the whole SCC goes to
                         // `handle_cycle_unit`, which owns detection and the
                         // #CIRC!/settle passes.
+                        //
+                        // The whole component leaves the live counts before any
+                        // of it evaluates: an SCC's members read each other by
+                        // construction, so counting them against each other
+                        // would flag every cycle unit.
+                        self.release_chain_read_guard_unit(cycle_members);
                         if self.handle_cycle_unit(cycle_members, None, None, None)? > 0 {
                             cycle_errors += 1;
                         }
@@ -26115,6 +26444,11 @@ where
                             continue;
                         }
                         evaluated.extend(scratch.vertices.iter().copied());
+                        // Before the layer runs, not after: the guard's
+                        // question is "is a vertex from a STRICTLY LATER layer
+                        // inside this rect", which is what the banked order is
+                        // supposed to make impossible.
+                        self.release_chain_read_guard_unit(&scratch.vertices);
                         computed_vertices +=
                             if self.thread_pool.is_some() && scratch.vertices.len() > 1 {
                                 self.evaluate_layer_parallel(&scratch)?
@@ -26122,6 +26456,25 @@ where
                                 self.evaluate_layer_sequential(&scratch)?
                             };
                     }
+                }
+                // Checked after the unit, so the layer that contained the bad
+                // read finishes first. The fallback then takes the mid-unit
+                // shape — it returns BEFORE this round's `clear_dirty_flags`,
+                // so everything walked stays dirty and the exact path redoes
+                // it, which is what discards the values the bad read produced.
+                if self.chain_read_guard_violated() {
+                    // Clause (f) observability, as for the spill and demotion
+                    // fallbacks: a mid-walk fallback landing after this walk
+                    // settled an SCC lets the exact path settle it again.
+                    self.spec_chain_telemetry.last_reason = if cycle_units_settled_this_walk > 0 {
+                        Some("read_guard_out_of_order_after_cycle_settle")
+                    } else {
+                        Some("read_guard_out_of_order")
+                    };
+                    self.spec_chain_telemetry.last_path = Some("full");
+                    self.spec_chain_telemetry.fallbacks += 1;
+                    self.clear_chain_read_guard();
+                    return Ok(None);
                 }
             }
 
@@ -26175,6 +26528,7 @@ where
                 };
                 self.spec_chain_telemetry.last_path = Some("full");
                 self.spec_chain_telemetry.fallbacks += 1;
+                self.clear_chain_read_guard();
                 return Ok(None);
             }
 
@@ -26207,10 +26561,12 @@ where
                 };
                 self.spec_chain_telemetry.last_path = Some("full");
                 self.spec_chain_telemetry.fallbacks += 1;
+                self.clear_chain_read_guard();
                 return Ok(None);
             }
             pending = residual.into_iter().collect();
         }
+        self.clear_chain_read_guard();
 
         let mut completed: Vec<VertexId> = evaluated.iter().copied().collect();
         completed.extend(to_evaluate.iter().copied());
@@ -29423,6 +29779,18 @@ where
                         )
                     })
                     .unwrap_or((1, 1, 0, 0));
+
+                // The chain's read-site backstop. The rect is final here, and
+                // this is the point every range materialisation below passes
+                // through — including `resolve_range_view_sheet_ref`, which
+                // delegates to this function. The reader's own identity is not
+                // available at this site and is not needed: "a vertex from a
+                // later layer of the walk in progress is inside this rect" is
+                // already the definition of an out-of-order read.
+                //
+                // No-op unless a chain walk is in progress; see
+                // `Engine::probe_chain_read_guard`.
+                self.probe_chain_read_guard(sheet_id, sr, sc, er, ec);
 
                 if self.force_materialize_range_views {
                     if er < sr || ec < sc {
