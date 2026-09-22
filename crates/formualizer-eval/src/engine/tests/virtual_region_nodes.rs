@@ -98,11 +98,18 @@ fn region_nodes_preserve_reader_after_producer_ordering() {
         !plan.is_empty(),
         "the fixture must allocate at least one region node"
     );
-    // Three readers over two distinct regions (A1:A4 twice, A3:A6 once) plus
-    // the B1:B3 read: region nodes are per region, not per reader.
-    assert!(
-        plan.node_ids().len() < region_edges.values().map(|r| r.len()).sum::<usize>() + 1,
-        "region nodes should be shared between readers of the same region"
+    // Four distinct regions are read (A1:A4 by B1 and B3, A3:A6 by B2, B1:B3
+    // by B5). Only A1:A4 has more than one reader, so exactly one relay node
+    // survives; single-reader regions are inlined back to per-cell edges.
+    assert_eq!(
+        plan.node_ids().len(),
+        1,
+        "region nodes are per region and only kept when a region has >1 reader"
+    );
+    assert_eq!(
+        region_edges.values().map(|r| r.len()).sum::<usize>(),
+        2,
+        "the surviving relay node is shared by its two readers"
     );
 
     let mut sched_vdeps = vdeps.clone();
@@ -235,6 +242,64 @@ fn self_referencing_sum_is_still_circ_with_region_nodes() {
             engine.get_cell_value("Sheet1", 3, 4),
             Some(LiteralValue::Number(2.0)),
             "region_nodes={region_nodes}: D3 = D2+1"
+        );
+    }
+}
+
+/// The coarser relay node must not turn an indirect cycle into a wrong order.
+///
+/// `F1 = SUM(G1:G3)` reads a region whose dirty producer `G2` is transitively
+/// downstream of `F1` itself (`G2 = H1`, `H1 = F1`). The per-cell path sees
+/// `G2 -> F1` and `F1 -> ... -> G2` and reports a cycle; with region nodes the
+/// same loop runs through the relay (`G2 -> R -> F1 -> H1 -> G2`), so Tarjan —
+/// which walks the region nodes — must still find the SCC. Two readers keep the
+/// relay node alive (a single-reader region is inlined back to per-cell edges).
+#[test]
+fn indirect_cycle_through_a_region_node_is_still_detected() {
+    for region_nodes in [false, true] {
+        let mut engine = Engine::new(TestWorkbook::new(), config(region_nodes));
+        // G1 is a plain producer, G2 closes the loop back through H1.
+        engine
+            .set_cell_value("Sheet1", 1, 9, LiteralValue::Number(1.0))
+            .unwrap(); // I1
+        engine
+            .set_cell_formula("Sheet1", 1, 7, parse("=I1").unwrap())
+            .unwrap(); // G1
+        engine
+            .set_cell_formula("Sheet1", 2, 7, parse("=H1").unwrap())
+            .unwrap(); // G2
+        engine
+            .set_cell_formula("Sheet1", 3, 7, parse("=I1").unwrap())
+            .unwrap(); // G3
+        engine
+            .set_cell_formula("Sheet1", 1, 6, parse("=SUM(G1:G3)").unwrap())
+            .unwrap(); // F1
+        engine
+            .set_cell_formula("Sheet1", 1, 8, parse("=F1").unwrap())
+            .unwrap(); // H1 -> closes F1 -> H1 -> G2 -> (region) -> F1
+        // A second reader of the same region so the relay node is not inlined.
+        engine
+            .set_cell_formula("Sheet1", 2, 6, parse("=COUNT(G1:G3)").unwrap())
+            .unwrap(); // F2
+
+        engine.evaluate_all().expect("evaluate_all");
+        for (row, col, name) in [(1u32, 6u32, "F1"), (2, 7, "G2"), (1, 8, "H1")] {
+            match engine.get_cell_value("Sheet1", row, col) {
+                Some(LiteralValue::Error(err)) => assert_eq!(
+                    err.kind,
+                    formualizer_common::ExcelErrorKind::Circ,
+                    "region_nodes={region_nodes}: expected #CIRC! at {name}"
+                ),
+                other => panic!(
+                    "region_nodes={region_nodes}: expected #CIRC! at {name}, got {other:?}"
+                ),
+            }
+        }
+        // G1 and G3 are outside the loop and must still compute.
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 3, 7),
+            Some(LiteralValue::Number(1.0)),
+            "region_nodes={region_nodes}: G3 = I1"
         );
     }
 }

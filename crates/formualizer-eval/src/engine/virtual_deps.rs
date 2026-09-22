@@ -1001,6 +1001,38 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             }
         }
 
+        // A region with a single reader gains nothing from the relay hop: the
+        // edge count is the same either way and the extra node only lengthens
+        // the layer chain. Inline those back into the reader's own deps and
+        // drop the node. (On the Rev child 60 of 96 regions are single-reader.)
+        // A node with no readers at all — every reader of it fell back to the
+        // self-overlap path — is dropped outright.
+        let mut readers_of: rustc_hash::FxHashMap<VertexId, Vec<VertexId>> =
+            rustc_hash::FxHashMap::default();
+        for (reader, regions) in region_edges.iter() {
+            for &node in regions {
+                readers_of.entry(node).or_default().push(*reader);
+            }
+        }
+        plan.producers.retain(|node, producers| {
+            match readers_of.get(node).map(|r| r.len()).unwrap_or(0) {
+                0 => false,
+                1 => {
+                    let reader = readers_of[node][0];
+                    let deps = vdeps.entry(reader).or_default();
+                    deps.extend(producers.iter().copied().filter(|&u| u != reader));
+                    deps.sort_unstable();
+                    deps.dedup();
+                    if let Some(regions) = region_edges.get_mut(&reader) {
+                        regions.retain(|r| r != node);
+                    }
+                    false
+                }
+                _ => true,
+            }
+        });
+        region_edges.retain(|_, regions| !regions.is_empty());
+
         augmented_vertices.sort_unstable();
         augmented_vertices.dedup();
         (vdeps, region_edges, augmented_vertices, plan)
