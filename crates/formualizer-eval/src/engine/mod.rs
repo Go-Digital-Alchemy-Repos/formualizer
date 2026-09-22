@@ -61,7 +61,8 @@ pub use arena::AstNodeId;
 pub use cancel::CancelToken;
 pub use eval::{
     CycleInstrumentationEdge, CycleInstrumentationTarget, CycleTelemetry, Engine, EngineAction,
-    EngineBaselineStats, EvalResult, RecalcPlan, SourceFormulaIngress, StampedSccDiagnostic,
+    EngineBaselineStats, EvalResult, ReadGuardViolation, RecalcPlan, SourceFormulaIngress,
+    StampedSccDiagnostic,
     SpecChainTelemetry, StampedSccDiagnosticEdge, TableMetadata, UpstreamDiagnosticsSnapshot,
     VirtualDepTelemetry,
 };
@@ -1028,9 +1029,11 @@ pub struct EvalConfig {
     /// Only meaningful when [`Self::speculative_chain`] is set. While a chain
     /// walk is in progress, every range read the engine resolves asks whether
     /// any vertex still pending in *this* walk lies inside the rect it is
-    /// about to materialise. A hit means the reader is running before a
-    /// producer of a range it reads, so the walk stops at the end of the
-    /// current layer and hands the request to the exact path.
+    /// about to materialise. The question is answered in two levels: a coarse
+    /// per-column filter on every read, and, only on its hits, an exact test
+    /// against that column's pending rows. An exact hit means the reader is
+    /// running before a producer of a range it reads, so the walk stops at the
+    /// end of the current layer and hands the request to the exact path.
     ///
     /// It is a backstop, not a replacement for the bank rule: under
     /// `install_spec_chain`'s clauses (a)-(d) it should never fire. What it

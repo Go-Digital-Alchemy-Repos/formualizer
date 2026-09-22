@@ -921,9 +921,30 @@ fn read_guard_detects_reader_before_later_layer_producer() -> Result<(), ExcelEr
     assert_eq!(telemetry.chain_walks, 0, "no walk completed");
     assert!(
         telemetry.read_guard_violations >= 1,
-        "the violation is counted: {telemetry:#?}"
+        "the exact test confirmed the violation: {telemetry:#?}"
+    );
+    assert!(
+        telemetry.read_guard_coarse_hits >= telemetry.read_guard_violations,
+        "every exact hit passed the coarse filter first: {telemetry:#?}"
     );
     assert!(telemetry.read_guard_checks >= 1);
+    let first = telemetry
+        .read_guard_first_violation
+        .expect("the first exact violation is recorded for diagnosis");
+    let (sr, sc, er, ec) = first.rect;
+    let (producer_row, producer_col) = first.producer;
+    assert!(
+        producer_row >= sr && producer_row <= er && producer_col >= sc && producer_col <= ec,
+        "the producer recorded is inside the rect recorded: {first:?}"
+    );
+    assert!(
+        first.producer_layer > first.current_layer,
+        "the producer recorded is in a strictly later layer: {first:?}"
+    );
+    assert_eq!(
+        producer_col, 2,
+        "the producer is one of the B-column cells C1 read ahead of: {first:?}"
+    );
     assert_eq!(
         values, reference_values,
         "the fallback's values are the exact path's"
@@ -960,5 +981,84 @@ fn read_guard_is_silent_on_gate_workbook_shaped_walk() -> Result<(), ExcelError>
         telemetry.read_guard_violations, 0,
         "a correctly ordered walk must not be flagged: {telemetry:#?}"
     );
+    assert_eq!(
+        telemetry.read_guard_first_violation, None,
+        "no violation, so no diagnostic: {telemetry:#?}"
+    );
+    Ok(())
+}
+
+/// A workbook whose read rect shares a column with a later-layer producer that
+/// lies *outside* it — the coarse filter's false positive, in isolation.
+///
+/// * A1:A20 are values; B1..B10 each `SUM($A$1:$A$20)` (the range shape the
+///   static schedule cache refuses), so they form the walk's first layer.
+/// * C1 is `SUM($B$1:$B$10)`: it reads rows 1..10 of column B, and runs after
+///   that layer.
+/// * B20 is `=$C$1+1`: column B again, row 20, and a layer *after* C1.
+///
+/// So when C1 resolves its rect, column B still holds one pending vertex from
+/// a strictly later layer. The per-column live count is non-zero and the
+/// column's build-time row interval is 1..20, which meets the read's 1..10 —
+/// a coarse hit. Nothing pending is inside rows 1..10, so the exact test says
+/// no, and the walk finishes on the chain.
+fn build_coarse_hit_workbook(config: EvalConfig) -> Result<Engine<TestWorkbook>, ExcelError> {
+    let mut engine = Engine::new(TestWorkbook::new(), config);
+    for row in 1..=20u32 {
+        engine.set_cell_value("Sheet1", row, 1, LiteralValue::Int(row as i64))?;
+    }
+    for row in 1..=10u32 {
+        engine.set_cell_formula("Sheet1", row, 2, parse("=SUM($A$1:$A$20)").unwrap())?;
+    }
+    engine.set_cell_formula("Sheet1", 1, 3, parse("=SUM($B$1:$B$10)").unwrap())?;
+    engine.set_cell_formula("Sheet1", 20, 2, parse("=$C$1+1").unwrap())?;
+    Ok(engine)
+}
+
+/// A coarse hit that the exact test clears is not a violation, and costs the
+/// walk nothing.
+///
+/// This is the whole point of the second level: at r11b1 the coarse filter
+/// alone flagged every flip walk of both gate workbooks and threw the flip
+/// gain away. The assertions are the three that separate the levels — the
+/// filter fired, the exact test did not, and the request was still served by
+/// the chain.
+#[test]
+fn read_guard_coarse_hit_outside_rect_is_not_a_violation() -> Result<(), ExcelError> {
+    let _guard = spec_chain_test_guard();
+    let (values, reference_values, telemetry) = chain_sequence(|| {
+        let mut engine = build_coarse_hit_workbook(read_guard_config())?;
+        let mut reference = build_coarse_hit_workbook(plain_config())?;
+        engine.evaluate_all()?;
+        reference.evaluate_all()?;
+
+        engine.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        reference.set_cell_value("Sheet1", 1, 1, LiteralValue::Int(100))?;
+        engine.evaluate_all()?;
+        reference.evaluate_all()?;
+
+        let read = |engine: &Engine<TestWorkbook>| -> Vec<Option<LiteralValue>> {
+            (1..=10u32)
+                .map(|row| engine.get_cell_value("Sheet1", row, 2))
+                .chain(std::iter::once(engine.get_cell_value("Sheet1", 1, 3)))
+                .chain(std::iter::once(engine.get_cell_value("Sheet1", 20, 2)))
+                .collect()
+        };
+        let telemetry = engine.spec_chain_telemetry().clone();
+        Ok(((read(&engine), read(&reference), telemetry.clone()), telemetry))
+    })?;
+
+    assert_eq!(telemetry.chain_walks, 1, "the walk completed on the chain");
+    assert_eq!(telemetry.last_path, Some("chain"));
+    assert!(
+        telemetry.read_guard_coarse_hits >= 1,
+        "the coarse filter fired on C1's read of column B: {telemetry:#?}"
+    );
+    assert_eq!(
+        telemetry.read_guard_violations, 0,
+        "nothing pending was inside the rect: {telemetry:#?}"
+    );
+    assert_eq!(telemetry.read_guard_first_violation, None);
+    assert_eq!(values, reference_values, "the walk's values are the exact path's");
     Ok(())
 }

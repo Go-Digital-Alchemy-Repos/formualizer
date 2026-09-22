@@ -2899,15 +2899,62 @@ pub struct SpecChainTelemetry {
     /// or no chain walk resolved a range read — so a zero
     /// `read_guard_violations` is only evidence when this is non-zero.
     pub read_guard_checks: u64,
-    /// Probes that found a vertex from a strictly later layer inside the rect
-    /// being read. Each one aborts the walk at the end of the current layer.
-    /// The test is conservative, so a violation is not necessarily a real
-    /// out-of-order read; see [`Engine::install_chain_read_guard`].
+    /// Probes the *coarse* filter flagged: a populated column of the rect
+    /// whose live count is non-zero and whose build-time row interval meets
+    /// the read rows. It is only a filter — the column's rows interval is
+    /// fixed at build time and says nothing about where inside it the pending
+    /// vertices are — so a coarse hit is not a finding. The gap between this
+    /// and `read_guard_violations` is the filter's false-positive rate, which
+    /// is the number the flip decision needs.
+    pub read_guard_coarse_hits: u64,
+    /// Probes the *exact* test confirmed: a vertex still pending in a strictly
+    /// later layer of this walk lies inside the rect being read, which is by
+    /// definition a reader running before a producer of a range it reads. Only
+    /// these abort the walk; see [`Engine::install_chain_read_guard`].
     pub read_guard_violations: u64,
+    /// The first exact violation of the engine's life, for diagnosis: which
+    /// rect was read, which pending vertex was inside it, and how far apart
+    /// the two are in the banked order. Numbers only — no cell values, no
+    /// sheet names, no defined-name strings.
+    pub read_guard_first_violation: Option<ReadGuardViolation>,
     /// Why the last call did not (or could not) use the chain.
     pub last_reason: Option<&'static str>,
     /// Path the last call actually ran: "chain" or "full".
     pub last_path: Option<&'static str>,
+}
+
+/// The first exact read-guard violation of an engine's life.
+///
+/// Numbers only, and deliberately so: this rides the telemetry into profile
+/// logs and test output, where a sheet name, a defined name or a cell value
+/// would be client data. A grid position and two layer indices are enough to
+/// find the pair in the sheet by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadGuardViolation {
+    /// The read's sheet, as the engine's internal `SheetId`.
+    pub sheet_index: u32,
+    /// The resolved read rect, 1-based inclusive: `(sr, sc, er, ec)`.
+    pub rect: (u32, u32, u32, u32),
+    /// The 1-based `(row, col)` of the pending vertex found inside it.
+    pub producer: (u32, u32),
+    /// The walk layer that will evaluate that producer (1-based unit index,
+    /// `u32::MAX` when it is pending but absent from the banked order).
+    pub producer_layer: u32,
+    /// The walk layer that was running when the read happened. The producer
+    /// is pending exactly because `producer_layer > current_layer`.
+    pub current_layer: u32,
+}
+
+/// One pending vertex of a column, for the exact test.
+#[derive(Debug, Clone, Copy)]
+struct ReadGuardEntry {
+    /// 1-based row.
+    row: u32,
+    /// 1-based index of the banked unit that evaluates it, so that "still
+    /// pending" is `layer > current_layer` — the same discipline as the
+    /// coarse counts, which fall for a whole unit before it evaluates.
+    /// `u32::MAX` for a pending vertex no banked unit covers.
+    layer: u32,
 }
 
 /// One sheet column's pending-vertex population, for the read-site guard.
@@ -2921,14 +2968,53 @@ struct ReadGuardColumn {
     /// positives, never false negatives, and keeps the decrement O(1).
     first_row: u32,
     last_row: u32,
+    /// This column's pending vertices, sorted by row. Consulted only on a
+    /// coarse hit, with a binary search for `sr` and a walk to `er`, so the
+    /// exact test costs O(log n + hits in the rect's rows) on the column that
+    /// tripped the filter and nothing at all on every other read.
+    rows: Vec<ReadGuardEntry>,
+}
+
+impl ReadGuardColumn {
+    /// The coarse filter: could this column hold a pending vertex in rows
+    /// `sr..=er`? Two plain loads and a fixed interval test.
+    #[inline]
+    fn coarse_hit(&self, sr: u32, er: u32) -> bool {
+        self.live.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && self.last_row >= sr
+            && self.first_row <= er
+    }
+
+    /// The exact test: the first vertex of this column that is inside
+    /// `sr..=er` *and* still pending at `current_layer`.
+    fn first_pending_in(&self, sr: u32, er: u32, current_layer: u32) -> Option<ReadGuardEntry> {
+        let start = self.rows.partition_point(|entry| entry.row < sr);
+        self.rows[start..]
+            .iter()
+            .take_while(|entry| entry.row <= er)
+            .find(|entry| entry.layer > current_layer)
+            .copied()
+    }
 }
 
 /// Read-site out-of-order backstop for one chain-walk round.
 ///
 /// Answers, for a rect about to be materialised, "is any vertex still pending
 /// in this walk located inside it?" — which is by definition a reader running
-/// before a producer of a range it reads. Built once per round in
-/// O(|pending|); one atomic load per column of the rect per read.
+/// before a producer of a range it reads.
+///
+/// Two levels. The **coarse filter** is the per-column live count plus a
+/// build-time row interval: one atomic load per column of the rect, and it is
+/// what every ordinary read pays. It over-reports by construction — a pending
+/// vertex in one of the rect's columns, inside the column's row interval but
+/// outside the rect itself, passes it. The **exact test** runs only on a
+/// coarse hit and answers the real question, by binary-searching that column's
+/// sorted pending rows for one inside `sr..=er` whose layer is strictly later
+/// than the one running. Only an exact hit is a violation.
+///
+/// Built once per round in O(|pending| log |pending|) — the per-column sort —
+/// plus one pass over the banked units to label each pending vertex with the
+/// layer that will evaluate it.
 ///
 /// The reads it observes run in parallel (`evaluate_vertex_immutable` takes
 /// `&self`), so every mutable datum here is an atomic.
@@ -2940,9 +3026,18 @@ struct ChainReadGuard {
     /// The column key of each counted vertex, so releasing a layer is O(1) per
     /// vertex. Symbol vertices (names) have no grid position and are absent.
     vertex_columns: FxHashMap<VertexId, (SheetId, u32)>,
+    /// 1-based index of the banked unit currently evaluating; 0 before the
+    /// round's first unit. A vertex is still pending exactly when its
+    /// `ReadGuardEntry::layer` is greater than this, which is the whole of the
+    /// exact test's "still pending" predicate — no per-vertex flag needed.
+    current_layer: std::sync::atomic::AtomicU32,
     checks: std::sync::atomic::AtomicU64,
+    coarse_hits: std::sync::atomic::AtomicU64,
     violations: std::sync::atomic::AtomicU64,
     violated: std::sync::atomic::AtomicBool,
+    /// The first exact violation of this round, for the telemetry diagnostic.
+    /// Written once, under the `violated` flag's compare-exchange.
+    first_violation: std::sync::Mutex<Option<ReadGuardViolation>>,
 }
 
 impl ChainReadGuard {
@@ -2954,8 +3049,15 @@ impl ChainReadGuard {
     /// self-overlapping read (`B1 = SUM(B1:B40)`-shaped fixtures, and every
     /// layer whose members read each other's column) from reporting a
     /// violation the banked order does not actually have.
-    fn release(&self, vertices: &[VertexId]) {
+    fn release(&self, vertices: &[VertexId], unit_index: usize) {
         use std::sync::atomic::Ordering;
+        // The exact test's half of the same discipline: from here on, every
+        // vertex whose layer is greater than this unit's is pending and every
+        // vertex of this unit is not. `fetch_max` rather than `store` because
+        // a unit the pending filter emptied is skipped without releasing, and
+        // the counter must never go backwards.
+        let layer = u32::try_from(unit_index).unwrap_or(u32::MAX - 1).saturating_add(1);
+        self.current_layer.fetch_max(layer, Ordering::AcqRel);
         for vertex in vertices {
             let Some(key) = self.vertex_columns.get(vertex) else {
                 continue;
@@ -2985,29 +3087,65 @@ impl ChainReadGuard {
         if self.violated.load(Ordering::Relaxed) {
             return;
         }
-        let occupied = |column: &ReadGuardColumn| {
-            column.live.load(Ordering::Relaxed) > 0 && column.last_row >= sr && column.first_row <= er
+        let current_layer = self.current_layer.load(Ordering::Acquire);
+        let mut coarse_hit = false;
+        let mut exact: Option<(ReadGuardEntry, u32)> = None;
+        {
+            // The coarse filter first, the exact test only on its hits, and
+            // the exact test only until the first finding: one violation ends
+            // the walk, so a second is worth nothing.
+            let mut consider = |column_no: u32, population: &ReadGuardColumn| {
+                if !population.coarse_hit(sr, er) {
+                    return;
+                }
+                coarse_hit = true;
+                if exact.is_none() {
+                    if let Some(entry) = population.first_pending_in(sr, er, current_layer) {
+                        exact = Some((entry, column_no));
+                    }
+                }
+            };
+            // O(min(rect width, populated columns)). A whole-row reference spans
+            // 16,384 columns and a chain walk's pending set rarely spans ten, so
+            // the scan direction has to be chosen rather than fixed.
+            let width = (ec - sc) as usize + 1;
+            if width > self.columns.len() {
+                for (&(sheet, column_no), population) in &self.columns {
+                    if sheet == sheet_id && column_no >= sc && column_no <= ec {
+                        consider(column_no, population);
+                    }
+                }
+            } else {
+                for column_no in sc..=ec {
+                    if let Some(population) = self.columns.get(&(sheet_id, column_no)) {
+                        consider(column_no, population);
+                    }
+                }
+            }
+        }
+        if coarse_hit {
+            self.coarse_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some((entry, column_no)) = exact else {
+            return;
         };
-        // O(min(rect width, populated columns)). A whole-row reference spans
-        // 16,384 columns and a chain walk's pending set rarely spans ten, so
-        // the scan direction has to be chosen rather than fixed.
-        let width = (ec - sc) as usize + 1;
-        let hit = if width > self.columns.len() {
-            self.columns
-                .iter()
-                .any(|(&(sheet, column), population)| {
-                    sheet == sheet_id && column >= sc && column <= ec && occupied(population)
-                })
-        } else {
-            (sc..=ec).any(|column| {
-                self.columns
-                    .get(&(sheet_id, column))
-                    .is_some_and(occupied)
-            })
-        };
-        if hit {
-            self.violations.fetch_add(1, Ordering::Relaxed);
-            self.violated.store(true, Ordering::Release);
+        self.violations.fetch_add(1, Ordering::Relaxed);
+        if self
+            .violated
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let mut slot = self
+                .first_violation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = Some(ReadGuardViolation {
+                sheet_index: sheet_id as u32,
+                rect: (sr, sc, er, ec),
+                producer: (entry.row, column_no),
+                producer_layer: entry.layer,
+                current_layer,
+            });
         }
     }
 }
@@ -25726,24 +25864,55 @@ where
     /// Build the guard for one round of a chain walk over that round's
     /// `pending` set, replacing whatever was there.
     ///
-    /// O(|pending|): one grid-address lookup per pending vertex, and one map
-    /// entry per populated `(sheet, column)`. Symbol vertices (names) have no
-    /// grid position and are simply not counted — a name cannot be inside a
+    /// One grid-address lookup per pending vertex, one pass over the banked
+    /// units to label each pending vertex with the unit that will evaluate it
+    /// (the same pass the walk's own pending filter makes), one map entry per
+    /// populated `(sheet, column)` and one sort of each column's rows:
+    /// O(|schedule| + |pending| log |pending|). Symbol vertices (names) have
+    /// no grid position and are simply not counted — a name cannot be inside a
     /// rect, so it cannot make a read out of order.
     ///
     /// # What the guard can and cannot say
     ///
-    /// No false negatives: the counts start from the *whole* pending set and
-    /// fall only when a layer actually begins evaluating, and a demoted vertex
-    /// stays counted because the next round rebuilds from the new pending set.
-    /// False positives are possible and expected: a pending vertex in one of
-    /// the rect's columns, within the column's row interval, but outside the
-    /// rect itself, reads as a hit. Each one costs a whole request's chain
-    /// gain, which is why the guard has its own flag.
-    fn install_chain_read_guard(&mut self, pending: &FxHashSet<VertexId>) {
+    /// No false negatives at either level: both start from the *whole* pending
+    /// set, the coarse counts fall only when a layer actually begins
+    /// evaluating, the exact test's layer labels come from the banked order
+    /// itself, and a demoted vertex stays pending because the next round
+    /// rebuilds from the new pending set. A pending vertex the banked order
+    /// does not cover gets layer `u32::MAX` and so stays pending for the whole
+    /// round, which is the conservative reading.
+    ///
+    /// The coarse filter over-reports — a pending vertex in one of the rect's
+    /// columns, inside the column's build-time row interval, but outside the
+    /// rect, passes it — and that is why it is only a filter. The exact test
+    /// asks the real question of the columns it flags, so a violation is a
+    /// genuine reader-before-producer in the banked order, and the difference
+    /// between `read_guard_coarse_hits` and `read_guard_violations` is what
+    /// the filter costs.
+    fn install_chain_read_guard(
+        &mut self,
+        pending: &FxHashSet<VertexId>,
+        schedule: &crate::engine::scheduler::Schedule,
+    ) {
         use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
         if !self.chain_read_guard_enabled() {
             return;
+        }
+        // Which banked unit evaluates each pending vertex. 1-based, so that
+        // `current_layer` can start at 0 meaning "before the first unit".
+        let mut layers: FxHashMap<VertexId, u32> =
+            FxHashMap::with_capacity_and_hasher(pending.len(), Default::default());
+        for (unit_index, unit) in schedule.units.iter().enumerate() {
+            let layer = u32::try_from(unit_index).unwrap_or(u32::MAX - 1).saturating_add(1);
+            let members: &[VertexId] = match *unit {
+                ScheduleUnit::Cycle(index) => schedule.unit_cycle(index),
+                ScheduleUnit::Layer(index) => &schedule.unit_layer(index).vertices,
+            };
+            for member in members {
+                if pending.contains(member) {
+                    layers.entry(*member).or_insert(layer);
+                }
+            }
         }
         let mut columns: FxHashMap<(SheetId, u32), ReadGuardColumn> = FxHashMap::default();
         let mut vertex_columns: FxHashMap<VertexId, (SheetId, u32)> =
@@ -25754,6 +25923,10 @@ where
             };
             let row = addr.row() + 1;
             let key = (self.graph.get_sheet_id(vertex), addr.col() + 1);
+            let entry = ReadGuardEntry {
+                row,
+                layer: layers.get(&vertex).copied().unwrap_or(u32::MAX),
+            };
             vertex_columns.insert(vertex, key);
             columns
                 .entry(key)
@@ -25761,19 +25934,27 @@ where
                     population.live.fetch_add(1, Ordering::Relaxed);
                     population.first_row = population.first_row.min(row);
                     population.last_row = population.last_row.max(row);
+                    population.rows.push(entry);
                 })
                 .or_insert_with(|| ReadGuardColumn {
                     live: AtomicU32::new(1),
                     first_row: row,
                     last_row: row,
+                    rows: vec![entry],
                 });
+        }
+        for population in columns.values_mut() {
+            population.rows.sort_unstable_by_key(|entry| entry.row);
         }
         let guard = ChainReadGuard {
             columns,
             vertex_columns,
+            current_layer: AtomicU32::new(0),
             checks: AtomicU64::new(0),
+            coarse_hits: AtomicU64::new(0),
             violations: AtomicU64::new(0),
             violated: AtomicBool::new(false),
+            first_violation: std::sync::Mutex::new(None),
         };
         *self
             .chain_read_guard
@@ -25783,7 +25964,7 @@ where
     }
 
     /// Drop a unit's vertices out of the live counts, before it evaluates.
-    fn release_chain_read_guard_unit(&self, vertices: &[VertexId]) {
+    fn release_chain_read_guard_unit(&self, vertices: &[VertexId], unit_index: usize) {
         if !self
             .chain_read_guard_active
             .load(std::sync::atomic::Ordering::Acquire)
@@ -25796,7 +25977,7 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
         {
-            guard.release(vertices);
+            guard.release(vertices, unit_index);
         }
     }
 
@@ -25836,10 +26017,21 @@ where
                 .spec_chain_telemetry
                 .read_guard_checks
                 .saturating_add(guard.checks.load(Ordering::Relaxed));
+            self.spec_chain_telemetry.read_guard_coarse_hits = self
+                .spec_chain_telemetry
+                .read_guard_coarse_hits
+                .saturating_add(guard.coarse_hits.load(Ordering::Relaxed));
             self.spec_chain_telemetry.read_guard_violations = self
                 .spec_chain_telemetry
                 .read_guard_violations
                 .saturating_add(guard.violations.load(Ordering::Relaxed));
+            if self.spec_chain_telemetry.read_guard_first_violation.is_none() {
+                self.spec_chain_telemetry.read_guard_first_violation = guard
+                    .first_violation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
         }
     }
 
@@ -26234,8 +26426,10 @@ where
     /// When `EvalConfig::spec_chain_read_guard` is set, each round installs a
     /// [`ChainReadGuard`] over its `pending` set and releases each unit's
     /// vertices just before that unit evaluates. Any range read resolved
-    /// during the walk that lands on a vertex still pending in a strictly
-    /// later layer sets the violation flag, the walk stops at the end of the
+    /// during the walk is filtered against the per-column live counts and, on
+    /// a hit, tested exactly against that column's pending rows; a vertex
+    /// still pending in a strictly later layer *inside the rect* sets the
+    /// violation flag, the walk stops at the end of the
     /// current unit, and the request takes the mid-unit fallback above — which
     /// is what discards the values the bad read produced. The reason is
     /// `read_guard_out_of_order`, or
@@ -26343,8 +26537,8 @@ where
         loop {
             // One guard per round, over this round's pending set: a demoted
             // vertex is counted again by the round that will evaluate it.
-            self.install_chain_read_guard(&pending);
-            for &unit in &schedule.units {
+            self.install_chain_read_guard(&pending, &schedule);
+            for (unit_index, &unit) in schedule.units.iter().enumerate() {
                 self.cancellation_checkpoint("Evaluation cancelled during chain walk")?;
                 match unit {
                     ScheduleUnit::Cycle(index) => {
@@ -26423,7 +26617,7 @@ where
                         // of it evaluates: an SCC's members read each other by
                         // construction, so counting them against each other
                         // would flag every cycle unit.
-                        self.release_chain_read_guard_unit(cycle_members);
+                        self.release_chain_read_guard_unit(cycle_members, unit_index);
                         if self.handle_cycle_unit(cycle_members, None, None, None)? > 0 {
                             cycle_errors += 1;
                         }
@@ -26448,7 +26642,7 @@ where
                         // question is "is a vertex from a STRICTLY LATER layer
                         // inside this rect", which is what the banked order is
                         // supposed to make impossible.
-                        self.release_chain_read_guard_unit(&scratch.vertices);
+                        self.release_chain_read_guard_unit(&scratch.vertices, unit_index);
                         computed_vertices +=
                             if self.thread_pool.is_some() && scratch.vertices.len() > 1 {
                                 self.evaluate_layer_parallel(&scratch)?
