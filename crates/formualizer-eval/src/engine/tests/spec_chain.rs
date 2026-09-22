@@ -259,51 +259,72 @@ fn spec_chain_invalidated_by_a_topology_edit() -> Result<(), ExcelError> {
     let telemetry = engine.spec_chain_telemetry().clone();
     assert_eq!(telemetry.chain_walks, 1, "the post-edit call did not walk");
     assert_eq!(telemetry.last_path, Some("full"));
-    // The post-edit pass dirties only the sub-graph the edit touched, so it is
-    // not a chain: the chain is banked only from a pass in which every formula
-    // vertex was dirty.
-    assert_eq!(telemetry.chain_builds, 1);
-    assert_eq!(
-        telemetry.last_reason,
-        Some("producers_not_all_dirty_at_bank_time")
+    // The post-edit pass dirties only the sub-graph the edit touched, and since
+    // r11 that is enough to bank: the chain it installs covers exactly those
+    // dirty vertices.
+    assert_eq!(telemetry.chain_builds, 2);
+    assert!(
+        telemetry.partial_banks >= 1,
+        "the narrow post-edit pass banked over a subset of its schedule"
     );
+    // `last_reason` is the retirement the edit caused, not a bank refusal:
+    // nothing refuses the bank any more, and `install_spec_chain` writes a
+    // reason only when it does.
+    assert_eq!(telemetry.last_reason, Some("no_chain"));
     Ok(())
 }
 
+/// A pass that is not a full recalc banks a chain, and the chain it banks
+/// covers exactly that pass's dirty vertices.
+///
+/// Until r11 this pass was refused (`producers_not_all_dirty_at_bank_time`),
+/// so a chain was reachable only from a full recalc. The rule is now
+/// `members = scheduled ∩ dirty_at_bank`: a scheduled vertex that was clean in
+/// the banking pass is not a member, and the per-request gate refuses any
+/// request that would dirty it. `partial_banks` is what distinguishes this
+/// bank from the full-recalc one.
 #[test]
-fn spec_chain_refuses_to_bank_from_a_partial_pass() -> Result<(), ExcelError> {
+fn partial_pass_banks_chain_over_its_dirty_members() -> Result<(), ExcelError> {
     let _guard = spec_chain_test_guard();
     let mut engine = build_range_workbook(chain_config())?;
     engine.evaluate_all()?;
     assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
+    assert_eq!(
+        engine.spec_chain_telemetry().partial_banks,
+        0,
+        "the full recalc's bank covers its whole schedule"
+    );
+    let members_after_full_recalc = engine.spec_chain_telemetry().members_at_bank;
 
-    // Retire the chain, then run a pass that is NOT a full recalc: only the
-    // newly added formula and its dependents are dirty. Its order was only
-    // ever proven for the producers that were dirty in it, so it must not be
-    // banked even though every formula vertex may well appear in the schedule.
+    // Retire the chain with a topology edit, then run a pass that is NOT a
+    // full recalc: only the newly added formula and its dependents are dirty.
     engine.set_cell_formula("Sheet1", 2, 4, parse("=$A$1+1").unwrap())?;
     assert!(!engine.spec_chain_is_installed());
 
     engine.evaluate_all()?;
     let telemetry = engine.spec_chain_telemetry().clone();
     assert_eq!(
-        telemetry.chain_builds, 1,
-        "the partial pass must not bank a chain"
+        telemetry.chain_builds, 2,
+        "the partial pass banks a chain of its own"
     );
-    assert!(!engine.spec_chain_is_installed());
     assert_eq!(
-        telemetry.last_reason,
-        Some("producers_not_all_dirty_at_bank_time")
+        telemetry.partial_banks, 1,
+        "and it is recorded as a partial bank"
     );
-
-    // A pass in which every formula vertex is dirty — here a fresh engine over
-    // the same book, which is the shape the warmed-session runtime starts
-    // from — does bank. (The accepted limitation: an editing session that
-    // never does a full recalc never gets a chain.)
-    let mut fresh = build_range_workbook(chain_config())?;
-    fresh.evaluate_all()?;
-    assert!(fresh.spec_chain_is_installed());
-    assert_eq!(fresh.spec_chain_telemetry().chain_builds, 1);
+    assert!(
+        engine.spec_chain_is_installed(),
+        "an editing session gets a chain from its first edit"
+    );
+    assert!(
+        telemetry.members_at_bank < members_after_full_recalc,
+        "the partial chain covers fewer vertices ({} against {})",
+        telemetry.members_at_bank,
+        members_after_full_recalc
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 4),
+        Some(LiteralValue::Number(2.0))
+    );
     Ok(())
 }
 
@@ -333,12 +354,13 @@ fn spec_chain_handles_a_new_formula_vertex_by_falling_back() -> Result<(), Excel
         telemetry.fallbacks, 2,
         "both requests reached the exact path"
     );
-    // `last_reason` is the LAST thing written in the request, and the fallback's
-    // own "no_chain" is overwritten later in the same `evaluate_all` by the bank
-    // refusal: the post-edit pass dirties only E3, not every formula vertex.
+    // The fallback's own "no_chain" is the last reason written: the post-edit
+    // pass dirties only E3, which since r11 banks a chain over {E3} rather than
+    // refusing, and a successful bank writes no reason.
+    assert_eq!(telemetry.last_reason, Some("no_chain"));
     assert_eq!(
-        telemetry.last_reason,
-        Some("producers_not_all_dirty_at_bank_time")
+        telemetry.chain_builds, 2,
+        "the narrow post-edit pass banked its own chain"
     );
     Ok(())
 }
@@ -566,18 +588,15 @@ fn spec_chain_falls_back_when_a_spill_grows_during_the_walk() -> Result<(), Exce
         "and not an out-of-walk drop either: this test does not run under \
          `chain_sequence`, so the elimination has to rule that out itself"
     );
-    // The fallback's own reason, "spill_footprint_moved_mid_walk", is not
-    // readable at the end of the request: the exact path runs next and its
-    // converged branch overwrites `last_reason` with the bank refusal. The
-    // walk had already evaluated and cleared D1 before re-dirtying F5, so that
-    // pass is partial and refuses to bank. The fallback itself is pinned by
-    // `fallbacks` above: the chain was installed, the topology and footprint
-    // epochs were unmoved at admission, the dirty set `{D1}` is inside the
-    // chain, and no demotion round ran — the mid-walk spill check is the only
-    // remaining source of a fallback on this request.
-    assert_eq!(
-        telemetry.last_reason,
-        Some("producers_not_all_dirty_at_bank_time")
-    );
+    // Since r11 the fallback's own reason survives to the end of the request.
+    // The exact path runs next over the partial dirty set the walk left behind
+    // and banks a fresh chain from it, and a successful bank writes no reason,
+    // so "spill_footprint_moved_mid_walk" is still the last one written. (Under
+    // the r9 all-dirty precondition that same pass refused to bank and
+    // overwrote it.) `fallbacks` above pins the same fact independently: the
+    // chain was installed, the topology and footprint epochs were unmoved at
+    // admission, the dirty set `{D1}` is inside the chain, and no demotion
+    // round ran.
+    assert_eq!(telemetry.last_reason, Some("spill_footprint_moved_mid_walk"));
     Ok(())
 }

@@ -4339,6 +4339,16 @@ impl DependencyGraph {
         self.vertex_formulas.get(&vertex_id).copied()
     }
 
+    /// How many vertices carry a cell formula — the size of the set
+    /// [`Self::formula_vertices`] enumerates, without materialising it.
+    ///
+    /// The speculative calculation chain banks this count on every converged
+    /// pass (r11 banks per edit, not only per full recalc), so the count must
+    /// not cost an allocation and a sort.
+    pub(crate) fn formula_vertex_ids_len(&self) -> usize {
+        self.vertex_formulas.len()
+    }
+
     pub(crate) fn formula_vertices(&self) -> Vec<VertexId> {
         let mut vertices = self.vertex_formulas.keys().copied().collect::<Vec<_>>();
         vertices.sort_unstable();
