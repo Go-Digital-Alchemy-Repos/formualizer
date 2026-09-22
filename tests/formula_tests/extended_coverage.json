@@ -1896,7 +1896,7 @@
     },
     {
       "formula": "=IMSIN(\"3+4i\")",
-      "result": "3.853738037919377-27.016813258003932i",
+      "result": "3.853738037919377-27.016813258003936i",
       "result_type": "str",
       "description": "IMSIN sine of complex number"
     },
@@ -1914,7 +1914,7 @@
     },
     {
       "formula": "=IMCOS(\"3+4i\")",
-      "result": "-27.034945603074224-3.851153334811777i",
+      "result": "-27.034945603074224-3.8511533348117775i",
       "result_type": "str",
       "description": "IMCOS cosine of complex number"
     },

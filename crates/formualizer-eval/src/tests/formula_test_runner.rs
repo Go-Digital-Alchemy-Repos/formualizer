@@ -255,6 +255,78 @@ fn parse_error_kind_prefix(value: &str) -> Option<ExcelErrorKind> {
     ExcelErrorKind::try_parse(&trimmed[..end])
 }
 
+/// Complex functions whose `"3+4i"`-style results are products of libm
+/// transcendental calls (`exp`, `sin`, `cos`, `sinh`, `cosh`).
+///
+/// These are the only formulas that get a last-ULP allowance (GOD-338 r10,
+/// decision 2026-09-22). Their expectations are the values a correctly
+/// rounded libm produces through the engine's own formulas (checked against a
+/// 60-digit mpmath derivation), but platform libms are not correctly rounded:
+/// on the same `f64` inputs, Apple's aarch64 libm returns `sin(4)` one ULP off
+/// (bits `bfe837b9dddc1eaf`, correctly rounded `...eae`) and glibc 2.36 on
+/// x86_64 returns `sinh(4)` one ULP off (`403b4a3803703630`, correctly rounded
+/// `...631`). Each shows up as a one-ULP difference in one component of the
+/// rendered complex string. The allowance is one ULP per component, requires
+/// the same suffix and the same shape, and every use is reported.
+#[cfg(test)]
+const LIBM_LAST_ULP_COMPLEX_FUNCTIONS: [&str; 3] = ["IMEXP", "IMSIN", "IMCOS"];
+
+/// Split a rendered complex string `a+bi` / `a-bj` into its components.
+/// Returns `None` for purely real or purely imaginary renderings, which the
+/// allowance does not cover.
+#[cfg(test)]
+fn parse_rendered_complex(s: &str) -> Option<(f64, f64, char)> {
+    let suffix = s.chars().last().filter(|c| *c == 'i' || *c == 'j')?;
+    let body = &s[..s.len() - 1];
+    let bytes = body.as_bytes();
+    let split = (1..bytes.len()).rev().find(|&k| {
+        (bytes[k] == b'+' || bytes[k] == b'-') && !matches!(bytes[k - 1], b'e' | b'E')
+    })?;
+    let re = body[..split].parse::<f64>().ok()?;
+    let im = body[split..].parse::<f64>().ok()?;
+    Some((re, im, suffix))
+}
+
+#[cfg(test)]
+fn f64_ulp_distance(a: f64, b: f64) -> u64 {
+    fn ordered(v: f64) -> i64 {
+        let bits = v.to_bits() as i64;
+        if bits < 0 { i64::MIN - bits } else { bits }
+    }
+    ordered(a).abs_diff(ordered(b))
+}
+
+/// The GOD-338 last-ULP allowance for libm-dependent complex results; see
+/// [`LIBM_LAST_ULP_COMPLEX_FUNCTIONS`].
+#[cfg(test)]
+fn within_libm_last_ulp_allowance(
+    formula: &str,
+    actual: &LiteralValue,
+    expected: &serde_json::Value,
+) -> bool {
+    let upper = formula.trim_start_matches('=').to_ascii_uppercase();
+    if !LIBM_LAST_ULP_COMPLEX_FUNCTIONS
+        .iter()
+        .any(|name| upper.starts_with(&format!("{name}(")))
+    {
+        return false;
+    }
+    let (LiteralValue::Text(actual_str), serde_json::Value::String(expected_str)) =
+        (actual, expected)
+    else {
+        return false;
+    };
+    match (
+        parse_rendered_complex(actual_str),
+        parse_rendered_complex(expected_str),
+    ) {
+        (Some((ar, ai, asuf)), Some((er, ei, esuf))) => {
+            asuf == esuf && f64_ulp_distance(ar, er) <= 1 && f64_ulp_distance(ai, ei) <= 1
+        }
+        _ => false,
+    }
+}
+
 /// Format a LiteralValue for display.
 #[cfg(test)]
 fn format_literal(lit: &LiteralValue) -> String {
@@ -288,6 +360,7 @@ fn format_literal(lit: &LiteralValue) -> String {
 #[cfg(test)]
 fn run_formula_tests(test_dir: &Path) -> (usize, usize, Vec<TestFailure>) {
     let mut passed = 0;
+    let mut libm_allowances: Vec<String> = Vec::new();
     let mut skipped = 0;
     let mut failures = Vec::new();
 
@@ -363,6 +436,19 @@ fn run_formula_tests(test_dir: &Path) -> (usize, usize, Vec<TestFailure>) {
                     let result_type = test_case.result_type.as_deref();
                     if compare_result(&actual, &test_case.result, result_type) {
                         passed += 1;
+                    } else if within_libm_last_ulp_allowance(
+                        &test_case.formula,
+                        &actual,
+                        &test_case.result,
+                    ) {
+                        passed += 1;
+                        libm_allowances.push(format!(
+                            "[{}] {}: expected {:?}, actual {}",
+                            file_name,
+                            test_case.formula,
+                            test_case.result,
+                            format_literal(&actual)
+                        ));
                     } else {
                         failures.push(TestFailure {
                             file: file_name.clone(),
@@ -410,6 +496,10 @@ fn run_formula_tests(test_dir: &Path) -> (usize, usize, Vec<TestFailure>) {
                 }
             }
         }
+    }
+
+    for allowance in &libm_allowances {
+        eprintln!("libm last-ULP allowance (GOD-338) used: {allowance}");
     }
 
     (passed, skipped, failures)
@@ -483,5 +573,45 @@ mod tests {
         } else {
             println!("\nFormula test suite: {} tests passed", passed);
         }
+    }
+
+    #[test]
+    fn libm_last_ulp_allowance_admits_one_ulp_per_component_only_for_named_functions() {
+        let text = |s: &str| LiteralValue::Text(s.to_string());
+        let expected = serde_json::json!("-13.128783081462158-15.200784463067954i");
+        // Apple aarch64 sin(4) is one ULP off: imaginary part one ULP away.
+        let one_ulp = text("-13.128783081462158-15.200784463067956i");
+        assert!(within_libm_last_ulp_allowance(
+            "=IMEXP(\"3+4i\")",
+            &one_ulp,
+            &expected
+        ));
+        // Two ULPs in a component is not libm last-digit noise.
+        let two_ulps = text("-13.128783081462158-15.200784463067958i");
+        assert!(!within_libm_last_ulp_allowance(
+            "=IMEXP(\"3+4i\")",
+            &two_ulps,
+            &expected
+        ));
+        // Other functions keep exact string comparison.
+        assert!(!within_libm_last_ulp_allowance(
+            "=IMSUM(\"3+4i\")",
+            &one_ulp,
+            &expected
+        ));
+        // Suffix must match.
+        let j_suffix = text("-13.128783081462158-15.200784463067954j");
+        assert!(!within_libm_last_ulp_allowance(
+            "=IMEXP(\"3+4i\")",
+            &j_suffix,
+            &expected
+        ));
+        assert_eq!(
+            f64_ulp_distance(-27.016813258003932, -27.016813258003936),
+            1
+        );
+        assert_eq!(f64_ulp_distance(3.853738037919377, 3.8537380379193773), 1);
+        assert_eq!(parse_rendered_complex("1e-5+2E+3i"), Some((1e-5, 2e3, 'i')));
+        assert_eq!(parse_rendered_complex("1.5430806348152437"), None);
     }
 }
