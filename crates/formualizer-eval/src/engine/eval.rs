@@ -2825,8 +2825,11 @@ fn schedule_probe_retained_bytes(schedule: &crate::engine::Schedule) -> usize {
 ///
 /// `schedule` is the last-known-good flattened evaluation order for the WHOLE
 /// formula set (every unit the build produced, in condensation order).
-/// `position` maps each chain member to its ordinal so membership and staleness
-/// can be answered without rebuilding anything.
+/// `members` is the set of vertices that order covers, so membership can be
+/// answered without rebuilding anything. Membership is all the walk needs: an
+/// ordinal would say where a vertex sits in the banked order, but the walk
+/// visits the order itself, and staleness is answered by the two epochs, not
+/// by any per-vertex datum.
 struct SpecChain {
     topology_epoch: u64,
     /// `DependencyGraph::output_footprint_epoch` when the chain was installed.
@@ -2835,11 +2838,13 @@ struct SpecChain {
     /// `graph.formula_vertices().len()` at bank time. The bank precondition is
     /// stated over exactly this set (every one of them was dirty in the banking
     /// pass), so the walk asserts the set has not changed size. The topology
-    /// epoch should already imply it; the assert is there to catch a path that
-    /// adds or removes a formula vertex without bumping the epoch.
+    /// epoch should already imply it; the check is there to catch a path that
+    /// adds or removes a formula vertex without bumping the epoch. It is a
+    /// count, not an identity: a path that added and removed one formula
+    /// vertex in the same request would pass it.
     formula_count_at_bank: usize,
     schedule: Arc<crate::engine::scheduler::Schedule>,
-    position: FxHashMap<VertexId, u32>,
+    members: FxHashSet<VertexId>,
 }
 
 /// Which path an `evaluate_all` took and why.
@@ -2855,6 +2860,17 @@ pub struct SpecChainTelemetry {
     pub demoted_vertices: usize,
     /// Calls that reached the exact full-schedule path with the flag on.
     pub fallbacks: usize,
+    /// Banked chains dropped from OUTSIDE the walk: by the function-registry
+    /// semantic epoch, by a topology edit through `clear_cached_static_schedule`
+    /// or by a committed output footprint. Only a chain that was actually
+    /// installed counts, so this is "a chain the engine had was taken away",
+    /// not "something that would have retired a chain happened".
+    ///
+    /// The tests use it as the retry signature: the in-process function
+    /// registry is global and any test module's `register_function` retires a
+    /// banked chain, and `last_reason` alone cannot see a drop that lands
+    /// mid-sequence (a later pass re-banks and the reason is overwritten).
+    pub chain_drops: u32,
     /// Why the last call did not (or could not) use the chain.
     pub last_reason: Option<&'static str>,
     /// Path the last call actually ran: "chain" or "full".
@@ -6984,7 +7000,20 @@ where
     fn clear_cached_static_schedule(&mut self) {
         self.cached_static_schedule = None;
         // A topology edit retires the calculation chain too.
-        self.spec_chain = None;
+        self.drop_spec_chain();
+    }
+
+    /// Retire a banked chain from outside the walk, counting the drop.
+    ///
+    /// Only an installed chain is counted: the call sites also fire on engines
+    /// that never banked one (every `set_cell_formula` reaches
+    /// `clear_cached_static_schedule`), and a counter that moved for those
+    /// would say nothing about a chain being taken away.
+    fn drop_spec_chain(&mut self) {
+        if self.spec_chain.take().is_some() {
+            self.spec_chain_telemetry.chain_drops =
+                self.spec_chain_telemetry.chain_drops.saturating_add(1);
+        }
     }
 
     /// Which evaluation path the most recent `evaluate_all` used, and the
@@ -15311,7 +15340,7 @@ where
         }
         if global_changed && !changed.is_empty() || provider_changed {
             self.cached_static_schedule = None;
-            self.spec_chain = None;
+            self.drop_spec_chain();
         }
         self.function_semantic_epoch_seen = changes.epoch;
         self.function_provider_revision_seen = provider_revision;
@@ -25482,10 +25511,12 @@ where
                     // plus volatiles needing refresh,
                     // `DependencyGraph::get_evaluation_vertices`), NOT the
                     // scheduler's `final_evaluate` — that one is augmented with
-                    // soft producers and demand-admitted vertices, and the
-                    // soft-producer half carries no dirty filter. The bank
-                    // precondition is stated over the dirty set; see
-                    // `install_spec_chain`.
+                    // soft producers and demand-admitted vertices. Both of
+                    // those admission paths do filter *formula* vertices by
+                    // dirty-or-volatile; what they admit unconditionally is
+                    // pass-through `Named*`/`Range` nodes. The bank
+                    // precondition is stated over the dirty set anyway, so it
+                    // does not rest on that property; see `install_spec_chain`.
                     self.install_spec_chain(&schedule, &to_evaluate);
                 }
                 break;
@@ -25595,8 +25626,10 @@ where
     /// (a) **Which formula vertices exist and where.** Region producer
     ///     membership is a function of the formula set and its placement;
     ///     both move only on a topology edit, and `topology_epoch` equality is
-    ///     rechecked on every request. `formula_count_at_bank` is the
-    ///     debug-time restatement of the same identity.
+    ///     rechecked on every request. `formula_count_at_bank` is a cheap
+    ///     debug-time *count* check on the same set — weaker than the
+    ///     identity, but enough to catch a path that adds or removes formula
+    ///     vertices without bumping the epoch.
     ///
     /// (b) **Each region's resolved extent.** Closed ranges are fixed by the
     ///     topology. Open-ended / whole-column ranges resolve against
@@ -25634,12 +25667,31 @@ where
     ///     on it anyway. A wrong order here produces a silently stale value,
     ///     not a caught error.
     ///
+    /// (f) **No cycles.** A schedule containing any cycle unit is refused at
+    ///     bank time (`cycle_unit_in_schedule`), so a chain never carries an
+    ///     SCC. That is deliberately conservative and it removes two hazards
+    ///     at once: the banked SCC is the whole component, whereas a later
+    ///     request's SCC comes from Tarjan over that request's dirty-filtered
+    ///     candidates — with retained/iterative members held clean the two
+    ///     sets differ, and settling the banked superset would stamp
+    ///     `#CIRC!` over (and tear down spills anchored by) members the exact
+    ///     path would not have touched; and, because the walk can fall back
+    ///     mid-request, an SCC it had already settled could be settled a
+    ///     second time within the same request, double-advancing an iteration
+    ///     budget.
+    ///
     /// Why the per-request path does no virtual-dependency work at all: the
     /// only candidate check would be `changed_virtual_dep_vertices` against a
     /// banked snapshot, which rebuilds the regionized dependencies of the
-    /// whole comparison domain — 17-22 s per evaluation on the Rev FIA child
-    /// by this file's own measurement, several times the flip the chain is
-    /// trying to win. It would also be comparing the wrong thing: that
+    /// whole comparison domain — an unguarded full rebuild costs 17-22 s per
+    /// evaluation on the Rev FIA child by this file's own measurement. That
+    /// figure is the *unguarded* cost, which is why a measured exact-path flip
+    /// on the same child is only ~5 s: within a request the r8 skip guard
+    /// (`changed_virtual_dep_vertices`, see the `has_pending_invalidation` /
+    /// no-runtime-reference conditions) usually skips the rebuild entirely.
+    /// The chain's comparison is across requests, where those skip conditions
+    /// do not apply, so the 17-22 s is the number it would actually pay.
+    /// It would also be comparing the wrong thing: that
     /// function is an *intra-pass* guard (same dirty flags on both sides), so
     /// on the chain path it degenerates into "did the dirty set change since
     /// the bank", which is true by definition of an incremental request, and
@@ -25661,6 +25713,18 @@ where
         schedule: &crate::engine::scheduler::Schedule,
         dirty: &[VertexId],
     ) {
+        // Clause (f): never bank a chain that carries an SCC. Refusing here is
+        // what keeps the banked-versus-per-request SCC divergence and the
+        // within-request double settle out of reach entirely.
+        if schedule
+            .units
+            .iter()
+            .any(|unit| matches!(unit, ScheduleUnit::Cycle(_)))
+        {
+            self.spec_chain = None;
+            self.spec_chain_telemetry.last_reason = Some("cycle_unit_in_schedule");
+            return;
+        }
         let member_count: usize = schedule
             .layers
             .iter()
@@ -25670,21 +25734,19 @@ where
         if member_count == 0 {
             return;
         }
-        let mut position = FxHashMap::with_capacity_and_hasher(member_count, Default::default());
-        let mut ordinal: u32 = 0;
+        let mut members = FxHashSet::with_capacity_and_hasher(member_count, Default::default());
         let mut has_dynamic = false;
         'units: for &unit in &schedule.units {
-            let members: &[VertexId] = match unit {
+            let unit_members: &[VertexId] = match unit {
                 ScheduleUnit::Layer(i) => &schedule.unit_layer(i).vertices,
                 ScheduleUnit::Cycle(i) => schedule.unit_cycle(i),
             };
-            for &vertex in members {
+            for &vertex in unit_members {
                 if self.graph.is_dynamic(vertex) {
                     has_dynamic = true;
                     break 'units;
                 }
-                position.insert(vertex, ordinal);
-                ordinal = ordinal.saturating_add(1);
+                members.insert(vertex);
             }
         }
         if has_dynamic {
@@ -25713,10 +25775,7 @@ where
         // Kept as a cheap anomaly check only: dirty implies scheduled, so
         // reaching this with a gap means the schedule dropped a vertex it was
         // handed, and the order cannot be trusted.
-        if all_formulas
-            .iter()
-            .any(|vertex| !position.contains_key(vertex))
-        {
+        if all_formulas.iter().any(|vertex| !members.contains(vertex)) {
             self.spec_chain = None;
             self.spec_chain_telemetry.last_reason = Some("partial_schedule_coverage");
             return;
@@ -25726,7 +25785,7 @@ where
             footprint_epoch: self.graph.output_footprint_epoch(),
             formula_count_at_bank: all_formulas.len(),
             schedule: Arc::new(schedule.clone()),
-            position,
+            members,
         });
         self.spec_chain_telemetry.chain_builds += 1;
     }
@@ -25750,15 +25809,6 @@ where
             self.spec_chain_telemetry.fallbacks += 1;
             return Ok(None);
         }
-        // Clause (a) of the bank-time safety argument, restated as an assert:
-        // an unchanged topology epoch is supposed to imply an unchanged
-        // formula set, and the precondition was stated over exactly that set.
-        // Free in release (the arguments are not evaluated).
-        debug_assert_eq!(
-            self.graph.formula_vertices().len(),
-            chain.formula_count_at_bank,
-            "spec chain: topology epoch unchanged but the formula set moved"
-        );
         // A dynamic-array spill that changes an extent moves this epoch; the
         // simplest safe rule is to rebuild rather than re-walk.
         if chain.footprint_epoch != self.graph.output_footprint_epoch() {
@@ -25767,6 +25817,21 @@ where
             self.spec_chain_telemetry.fallbacks += 1;
             return Ok(None);
         }
+        // Clause (a) of the bank-time safety argument, restated as a count
+        // check: an unchanged topology epoch is supposed to imply an unchanged
+        // formula set, and the precondition was stated over exactly that set.
+        // Free in release (the arguments are not evaluated).
+        //
+        // Ordered AFTER the footprint check on purpose. A spill-target path
+        // can insert into `vertex_formulas` while bumping only
+        // `output_footprint_epoch` (`update_formula_authorship`), and that is
+        // a case the footprint check handles correctly; running the assert
+        // first would trip a debug build on a legitimate path.
+        debug_assert_eq!(
+            self.graph.formula_vertices().len(),
+            chain.formula_count_at_bank,
+            "spec chain: topology epoch unchanged but the formula set moved"
+        );
 
         let start = crate::instant::FzInstant::now();
         self.graph.flush_pending_edge_deltas();
@@ -25778,9 +25843,15 @@ where
             self.spec_chain_telemetry.last_path = Some("chain");
             self.redirty_for_next_recalc();
             self.recalc_epoch = self.recalc_epoch.wrapping_add(1);
-            let mut telemetry = self.start_virtual_dep_telemetry();
-            telemetry.bailout_reason = Some("spec_chain_no_work");
-            self.last_virtual_dep_telemetry = telemetry;
+            // Same contract as the exact path: a populated record is published
+            // only when the consumer asked for one.
+            if self.config.enable_virtual_dep_telemetry {
+                let mut telemetry = self.start_virtual_dep_telemetry();
+                telemetry.bailout_reason = Some("spec_chain_no_work");
+                self.last_virtual_dep_telemetry = telemetry;
+            } else {
+                self.reset_virtual_dep_telemetry_if_disabled();
+            }
             return Ok(Some(EvalResult {
                 computed_vertices: 0,
                 cycle_errors: 0,
@@ -25789,7 +25860,7 @@ where
         }
         if to_evaluate
             .iter()
-            .any(|vertex| !chain.position.contains_key(vertex))
+            .any(|vertex| !chain.members.contains(vertex))
         {
             self.spec_chain_telemetry.last_reason = Some("dirty_vertex_outside_chain");
             self.spec_chain_telemetry.last_path = Some("full");
@@ -25808,7 +25879,9 @@ where
         let mut evaluated: FxHashSet<VertexId> =
             FxHashSet::with_capacity_and_hasher(to_evaluate.len(), Default::default());
         let mut computed_vertices = 0usize;
-        let mut cycle_errors = 0usize;
+        // Always zero: clause (f) refuses to bank a schedule that contains a
+        // cycle unit, so a walked chain never settles an SCC.
+        let cycle_errors = 0usize;
         let mut demoted_total = 0usize;
         let mut rounds = 0usize;
         let mut scratch = crate::engine::scheduler::Layer {
@@ -25820,17 +25893,22 @@ where
                 self.cancellation_checkpoint("Evaluation cancelled during chain walk")?;
                 match unit {
                     ScheduleUnit::Cycle(index) => {
-                        let members = schedule.unit_cycle(index);
-                        if !members.iter().any(|v| pending.contains(v)) {
+                        let cycle_members = schedule.unit_cycle(index);
+                        if !cycle_members.iter().any(|v| pending.contains(v)) {
                             continue;
                         }
-                        // Cycle semantics stay on the existing runtime path:
-                        // the whole SCC goes to `handle_cycle_unit`, which owns
-                        // detection and the #CIRC!/settle passes.
-                        if self.handle_cycle_unit(members, None, None, None)? > 0 {
-                            cycle_errors += 1;
-                        }
-                        evaluated.extend(members.iter().copied());
+                        // Defensive only. Clause (f) refuses to bank a schedule
+                        // carrying a cycle unit, so reaching one here means the
+                        // banked order is not what the bank check saw. Hand the
+                        // request to the exact path rather than settle an SCC
+                        // from a banked component. No member has been
+                        // evaluated or cleared, so they are still dirty and
+                        // the exact path picks them up from
+                        // `get_evaluation_vertices` as usual.
+                        self.spec_chain_telemetry.last_reason = Some("cycle_unit_in_chain_walk");
+                        self.spec_chain_telemetry.last_path = Some("full");
+                        self.spec_chain_telemetry.fallbacks += 1;
+                        return Ok(None);
                     }
                     ScheduleUnit::Layer(index) => {
                         let layer = schedule.unit_layer(index);
@@ -25874,7 +25952,7 @@ where
             );
             let footprint_moved = self.graph.output_footprint_epoch() != chain.footprint_epoch;
             if !spill_invalidations.is_empty() || footprint_moved {
-                for vertex in spill_invalidations {
+                for &vertex in &spill_invalidations {
                     if self.graph.vertex_exists(vertex)
                         && matches!(
                             self.graph.get_vertex_kind(vertex),
@@ -25888,6 +25966,14 @@ where
                         self.graph.set_dirty(vertex, true);
                     }
                 }
+                // Put the invalidations back: the exact path runs next and reads
+                // this same set as its recheck guard (`has_pending_invalidation`),
+                // so consuming it here would silently downgrade that recheck to
+                // a skip and lose the `changed_readers` half of its job.
+                self.pending_output_invalidations
+                    .get_mut()
+                    .unwrap()
+                    .extend(spill_invalidations);
                 self.spec_chain_telemetry.last_reason = Some("spill_footprint_moved_mid_walk");
                 self.spec_chain_telemetry.last_path = Some("full");
                 self.spec_chain_telemetry.fallbacks += 1;
@@ -25911,7 +25997,7 @@ where
                 || demoted_total > demotion_cap
                 || residual
                     .iter()
-                    .any(|vertex| !chain.position.contains_key(vertex))
+                    .any(|vertex| !chain.members.contains(vertex))
             {
                 // Exact fallback: leave the residual dirty and let the
                 // per-request schedule path finish the job.
@@ -25937,11 +26023,17 @@ where
         self.spec_chain_telemetry.last_reason = None;
         self.spec_chain_telemetry.last_path = Some("chain");
 
-        let mut telemetry = self.start_virtual_dep_telemetry();
-        telemetry.bailout_reason = Some("spec_chain");
-        telemetry.candidate_vertices_total = to_evaluate.len();
-        telemetry.reused_schedule_vertices_total = computed_vertices;
-        self.last_virtual_dep_telemetry = telemetry;
+        // Same contract as the exact path: a populated record is published only
+        // when the consumer asked for one.
+        if self.config.enable_virtual_dep_telemetry {
+            let mut telemetry = self.start_virtual_dep_telemetry();
+            telemetry.bailout_reason = Some("spec_chain");
+            telemetry.candidate_vertices_total = to_evaluate.len();
+            telemetry.reused_schedule_vertices_total = computed_vertices;
+            self.last_virtual_dep_telemetry = telemetry;
+        } else {
+            self.reset_virtual_dep_telemetry_if_disabled();
+        }
 
         Ok(Some(EvalResult {
             computed_vertices,
@@ -29679,6 +29771,12 @@ where
     fn record_changed_output_invalidations(&mut self, anchor: VertexId, cells: &[CellRef]) {
         // A new committed footprint can add hard virtual edges without changing graph CSR.
         self.cached_static_schedule = None;
+        // The chain is already covered here: the spill commit that reaches this
+        // function bumps `output_footprint_epoch`, which `try_spec_chain_evaluate`
+        // checks at admission and again mid-walk. Dropping it explicitly costs
+        // nothing and makes the retirement visible at the site instead of only
+        // through a two-step argument about the epoch.
+        self.drop_spec_chain();
         let affected = self.graph.invalidate_changed_output_cells(cells);
         if !affected.is_empty() {
             self.output_invalidation_epoch
