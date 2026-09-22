@@ -24,6 +24,10 @@ use rustc_hash::FxHashMap;
 fn config(region_nodes: bool) -> EvalConfig {
     EvalConfig {
         virtual_region_nodes: region_nodes,
+        // The fixtures use small ranges. With the default limit the graph
+        // expands those into direct cell edges and no range dependency (hence
+        // no region node) is ever created, so keep every range compressed.
+        range_expansion_limit: 0,
         ..Default::default()
     }
 }
