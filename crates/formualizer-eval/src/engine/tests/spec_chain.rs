@@ -107,10 +107,50 @@ fn spec_chain_invalidated_by_a_topology_edit() -> Result<(), ExcelError> {
     let telemetry = engine.spec_chain_telemetry().clone();
     assert_eq!(telemetry.chain_walks, 1, "the post-edit call did not walk");
     assert_eq!(telemetry.last_path, Some("full"));
-    // The post-edit pass only schedules the dirty sub-graph, so it is not a
-    // chain: the prototype waits for a pass that covers every formula vertex.
+    // The post-edit pass dirties only the sub-graph the edit touched, so it is
+    // not a chain: the chain is banked only from a pass in which every formula
+    // vertex was dirty.
     assert_eq!(telemetry.chain_builds, 1);
-    assert_eq!(telemetry.last_reason, Some("partial_schedule_coverage"));
+    assert_eq!(
+        telemetry.last_reason,
+        Some("producers_not_all_dirty_at_bank_time")
+    );
+    Ok(())
+}
+
+#[test]
+fn spec_chain_refuses_to_bank_from_a_partial_pass() -> Result<(), ExcelError> {
+    let mut engine = build_range_workbook(chain_config())?;
+    engine.evaluate_all()?;
+    assert_eq!(engine.spec_chain_telemetry().chain_builds, 1);
+
+    // Retire the chain, then run a pass that is NOT a full recalc: only the
+    // newly added formula and its dependents are dirty. Its order was only
+    // ever proven for the producers that were dirty in it, so it must not be
+    // banked even though every formula vertex may well appear in the schedule.
+    engine.set_cell_formula("Sheet1", 2, 4, parse("=$A$1+1").unwrap())?;
+    assert!(!engine.spec_chain_is_installed());
+
+    engine.evaluate_all()?;
+    let telemetry = engine.spec_chain_telemetry().clone();
+    assert_eq!(
+        telemetry.chain_builds, 1,
+        "the partial pass must not bank a chain"
+    );
+    assert!(!engine.spec_chain_is_installed());
+    assert_eq!(
+        telemetry.last_reason,
+        Some("producers_not_all_dirty_at_bank_time")
+    );
+
+    // A pass in which every formula vertex is dirty — here a fresh engine over
+    // the same book, which is the shape the warmed-session runtime starts
+    // from — does bank. (The accepted limitation: an editing session that
+    // never does a full recalc never gets a chain.)
+    let mut fresh = build_range_workbook(chain_config())?;
+    fresh.evaluate_all()?;
+    assert!(fresh.spec_chain_is_installed());
+    assert_eq!(fresh.spec_chain_telemetry().chain_builds, 1);
     Ok(())
 }
 

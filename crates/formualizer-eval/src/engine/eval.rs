@@ -2832,6 +2832,12 @@ struct SpecChain {
     /// `DependencyGraph::output_footprint_epoch` when the chain was installed.
     /// A spill that changes an extent moves this and invalidates the chain.
     footprint_epoch: u64,
+    /// `graph.formula_vertices().len()` at bank time. The bank precondition is
+    /// stated over exactly this set (every one of them was dirty in the banking
+    /// pass), so the walk asserts the set has not changed size. The topology
+    /// epoch should already imply it; the assert is there to catch a path that
+    /// adds or removes a formula vertex without bumping the epoch.
+    formula_count_at_bank: usize,
     schedule: Arc<crate::engine::scheduler::Schedule>,
     position: FxHashMap<VertexId, u32>,
 }
@@ -25473,7 +25479,15 @@ where
                 // chain. Only a first-pass converged build is banked: a replan
                 // means the order we just walked was not the final one.
                 if self.config.speculative_chain && replan_iterations == 0 {
-                    self.install_spec_chain(&schedule);
+                    // `to_evaluate` is this pass's DIRTY set (dirty formulas
+                    // plus volatiles needing refresh,
+                    // `DependencyGraph::get_evaluation_vertices`), NOT the
+                    // scheduler's `final_evaluate` — that one is augmented with
+                    // soft producers and demand-admitted vertices, and the
+                    // soft-producer half carries no dirty filter. The bank
+                    // precondition is stated over the dirty set; see
+                    // `install_spec_chain`.
+                    self.install_spec_chain(&schedule, &to_evaluate);
                 }
                 break;
             }
@@ -25518,7 +25532,115 @@ where
     /// whole-column dependencies — the thing the existing static schedule
     /// cache refuses — are fine: their producer set is a function of the
     /// topology, which the epoch check pins.
-    fn install_spec_chain(&mut self, schedule: &crate::engine::scheduler::Schedule) {
+    ///
+    /// `dirty` is the banking pass's dirty set
+    /// (`DependencyGraph::get_evaluation_vertices`), not the scheduler's
+    /// augmented `final_evaluate` set. The difference is the whole point of
+    /// the precondition below.
+    ///
+    /// # Safety argument
+    ///
+    /// The chain is an *order*, banked once and replayed for later requests
+    /// that only refilter it by the current dirty set. It is sound exactly
+    /// when, for every later request, the banked order is a topological order
+    /// of that request's edge set. The argument has one precondition and four
+    /// pinned quantities.
+    ///
+    /// **Precondition (checked here): every formula vertex was dirty in the
+    /// banking pass.** A range reader has no real graph edge to the cells it
+    /// reads; its precedents live in `get_range_dependencies` and reach the
+    /// scheduler only as relay edges `reader -> region node -> producers`
+    /// synthesised by `build_regionized`. `RegionNodePlan::intern` computes a
+    /// region's producers as `formula_vertices_in_region(...)` **filtered by
+    /// `is_dirty(u) || is_volatile(u)`** (virtual_deps.rs), so a region member
+    /// that was clean in that pass contributed no edge and its position
+    /// relative to its readers is arbitrary. If instead *every* formula vertex
+    /// was dirty, the filter dropped nothing: each region's producer set
+    /// equals its full formula membership, so the banked order carries a relay
+    /// edge for every producer any later request could possibly dirty, and it
+    /// therefore dominates every later request's edge set.
+    ///
+    /// Note that schedule *coverage* — every formula vertex appears somewhere
+    /// in the order — is strictly weaker and does NOT imply this: the
+    /// scheduler's `final_evaluate` is `to_evaluate ∪ augmented ∪
+    /// demand-admitted`, and `augmented` comes from
+    /// `get_soft_producers_memoized` -> `potential_output_anchors`, which
+    /// applies no dirty filter at all. A clean vertex can be scheduled that
+    /// way, satisfy coverage, and still carry no relay edge. That is why the
+    /// coverage test is no longer the gate.
+    ///
+    /// Given the precondition, the four things the order depends on are each
+    /// pinned for the chain's lifetime:
+    ///
+    /// (a) **Which formula vertices exist and where.** Region producer
+    ///     membership is a function of the formula set and its placement;
+    ///     both move only on a topology edit, and `topology_epoch` equality is
+    ///     rechecked on every request. `formula_count_at_bank` is the
+    ///     debug-time restatement of the same identity.
+    ///
+    /// (b) **Each region's resolved extent.** Closed ranges are fixed by the
+    ///     topology. Open-ended / whole-column ranges resolve against
+    ///     `used_rows_for_columns`, which unions the Arrow used region with
+    ///     the not-yet-materialised *formula* rows. A data-only edit does not
+    ///     bump the topology epoch (`set_cell_value` calls
+    ///     `mark_topology_edited` only for a new sheet or a formula
+    ///     replacement) and it can grow the used extent — but because formula
+    ///     rows are already in that union, growth can only pull in **value**
+    ///     cells, never a formula producer that was previously outside the
+    ///     region. Value cells are not producers, so the producer set cannot
+    ///     grow behind the chain's back.
+    ///
+    /// (c) **Which anchors a region read resolves to.** Spills move
+    ///     `output_footprint_epoch`; equality is checked at admission, and the
+    ///     mid-walk check in `try_spec_chain_evaluate` re-checks the epoch and
+    ///     `pending_output_invalidations` after each round and falls back to
+    ///     the exact path if either moved during the walk.
+    ///
+    /// (d) **Dirty propagation reaching the readers.** `mark_dirty_many`
+    ///     extends its BFS with `collect_range_dependents_for_vertex` both for
+    ///     the sources and inside the loop, so dirtiness is closed under range
+    ///     readers: a dirty producer always dirties its readers. The failure
+    ///     mode is therefore never "the reader was not dirty"; it is only ever
+    ///     "the reader was dirty but ordered before its producer", which is
+    ///     exactly what the precondition plus (a)-(c) exclude.
+    ///
+    /// (e) **There is no downstream backstop, which is why the precondition is
+    ///     mandatory rather than an optimisation.** Writing a value on the
+    ///     walk does not re-dirty dependents (`update_vertex_value` stores a
+    ///     value ref and nothing else), and the demotion round's `residual` is
+    ///     filtered by `!evaluated.contains(v)` — a vertex walked too early is
+    ///     already in `evaluated`, so it can never be demoted, and
+    ///     `clear_dirty_flags` over the walked set would erase a re-dirty flag
+    ///     on it anyway. A wrong order here produces a silently stale value,
+    ///     not a caught error.
+    ///
+    /// Why the per-request path does no virtual-dependency work at all: the
+    /// only candidate check would be `changed_virtual_dep_vertices` against a
+    /// banked snapshot, which rebuilds the regionized dependencies of the
+    /// whole comparison domain — 17-22 s per evaluation on the Rev FIA child
+    /// by this file's own measurement, several times the flip the chain is
+    /// trying to win. It would also be comparing the wrong thing: that
+    /// function is an *intra-pass* guard (same dirty flags on both sides), so
+    /// on the chain path it degenerates into "did the dirty set change since
+    /// the bank", which is true by definition of an incremental request, and
+    /// it would fall back every time. The bank-time precondition buys the same
+    /// guarantee for O(|formula vertices|) once, on a pass that was already
+    /// the expensive one, and leaves the request path at O(1) epoch checks
+    /// plus O(|dirty|) hash lookups.
+    ///
+    /// # Accepted limitation (defect 4 of the r8b notes)
+    ///
+    /// Because the precondition is "every formula vertex was dirty", a chain
+    /// is only ever banked from a full recalc. An editing session that opens a
+    /// warm book and never does a full recalc never gets a chain and always
+    /// runs the exact path. This is by design: the chain targets the warmed
+    /// -session runtime, where the first request *is* a full recalc and every
+    /// later request is an incremental value edit against it.
+    fn install_spec_chain(
+        &mut self,
+        schedule: &crate::engine::scheduler::Schedule,
+        dirty: &[VertexId],
+    ) {
         let member_count: usize = schedule
             .layers
             .iter()
@@ -25550,13 +25672,27 @@ where
             self.spec_chain_telemetry.last_reason = Some("dynamic_reference_vertex");
             return;
         }
-        // Only a schedule that covers EVERY formula vertex is a calculation
-        // chain. A partial schedule (a targeted prepare, a staged/deferred
-        // build, or the narrow pass that follows a formula edit) orders only
-        // the vertices it was handed, so a later dirty set would immediately
-        // escape it — and, worse, its order was never proven against the
-        // vertices it left out.
+        // The bank precondition: EVERY formula vertex must have been dirty in
+        // the pass that produced this order. See the safety argument above —
+        // this is what makes each region's producer set equal to its full
+        // formula membership, so the banked order dominates every later
+        // request's edge set. It also subsumes schedule coverage, because a
+        // dirty vertex is always scheduled; a partial pass (a targeted
+        // prepare, a staged/deferred build, or the narrow pass that follows a
+        // formula edit) is refused here rather than by the coverage test.
         let all_formulas = self.graph.formula_vertices();
+        let dirty_at_bank: FxHashSet<VertexId> = dirty.iter().copied().collect();
+        if all_formulas
+            .iter()
+            .any(|vertex| !dirty_at_bank.contains(vertex))
+        {
+            self.spec_chain = None;
+            self.spec_chain_telemetry.last_reason = Some("producers_not_all_dirty_at_bank_time");
+            return;
+        }
+        // Kept as a cheap anomaly check only: dirty implies scheduled, so
+        // reaching this with a gap means the schedule dropped a vertex it was
+        // handed, and the order cannot be trusted.
         if all_formulas
             .iter()
             .any(|vertex| !position.contains_key(vertex))
@@ -25568,6 +25704,7 @@ where
         self.spec_chain = Some(SpecChain {
             topology_epoch: self.topology_epoch,
             footprint_epoch: self.graph.output_footprint_epoch(),
+            formula_count_at_bank: all_formulas.len(),
             schedule: Arc::new(schedule.clone()),
             position,
         });
@@ -25593,6 +25730,15 @@ where
             self.spec_chain_telemetry.fallbacks += 1;
             return Ok(None);
         }
+        // Clause (a) of the bank-time safety argument, restated as an assert:
+        // an unchanged topology epoch is supposed to imply an unchanged
+        // formula set, and the precondition was stated over exactly that set.
+        // Free in release (the arguments are not evaluated).
+        debug_assert_eq!(
+            self.graph.formula_vertices().len(),
+            chain.formula_count_at_bank,
+            "spec chain: topology epoch unchanged but the formula set moved"
+        );
         // A dynamic-array spill that changes an extent moves this epoch; the
         // simplest safe rule is to rebuild rather than re-walk.
         if chain.footprint_epoch != self.graph.output_footprint_epoch() {
