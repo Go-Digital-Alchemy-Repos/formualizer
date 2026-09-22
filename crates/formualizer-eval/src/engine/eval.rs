@@ -25560,13 +25560,34 @@ where
     /// therefore dominates every later request's edge set.
     ///
     /// Note that schedule *coverage* — every formula vertex appears somewhere
-    /// in the order — is strictly weaker and does NOT imply this: the
-    /// scheduler's `final_evaluate` is `to_evaluate ∪ augmented ∪
-    /// demand-admitted`, and `augmented` comes from
-    /// `get_soft_producers_memoized` -> `potential_output_anchors`, which
-    /// applies no dirty filter at all. A clean vertex can be scheduled that
-    /// way, satisfy coverage, and still carry no relay edge. That is why the
-    /// coverage test is no longer the gate.
+    /// in the order — is not the gate, even though at present it would happen
+    /// to pass exactly when the precondition does. The scheduler's
+    /// `final_evaluate` is `to_evaluate ∪ augmented ∪ demand-admitted`, and
+    /// both admission paths filter *formula* vertices by dirty-or-volatile:
+    /// `get_soft_producers_memoized` (which feeds `augmented`) ends with
+    /// `out.retain(|&u| u != v && (is_dirty(u) || is_volatile(u)))`
+    /// (virtual_deps.rs), and `build_demand_subgraph_with` admits a
+    /// `FormulaScalar`/`FormulaArray` vertex only when it is dirty or
+    /// volatile. The vertices that path admits unconditionally are
+    /// `NamedScalar`, `NamedArray`, `Range` and `InfiniteRange` —
+    /// pass-through nodes, not formula vertices, so they cannot let a clean
+    /// formula vertex satisfy coverage. Coverage of all formula vertices
+    /// therefore currently coincides with all-dirty (volatiles reach
+    /// `to_evaluate` through `get_evaluation_vertices` ->
+    /// `volatiles_needing_refresh`). The explicit all-dirty check is kept
+    /// anyway, for two reasons: this safety argument must not rest on a
+    /// property of the scheduler's admission paths that those paths are not
+    /// written to preserve and that nothing pins, and the check is what a
+    /// reviewer can verify locally at this call site without re-deriving the
+    /// admission rules of two other modules.
+    ///
+    /// One observable consequence of walking the chain: the walk visits only
+    /// dirty vertices, so a chain request's computed-cell count can be lower
+    /// than the same request's on the exact path by the clean pass-through
+    /// (name/range) vertices the demand subgraph admits unconditionally —
+    /// measured on the Avocet parent flip as 68,983 exact against 68,980
+    /// chain, with identical digests. Computed counts are therefore not a
+    /// chain-vs-exact gate; digests are.
     ///
     /// Given the precondition, the four things the order depends on are each
     /// pinned for the chain's lifetime:
