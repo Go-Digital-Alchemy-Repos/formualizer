@@ -390,3 +390,134 @@ fn index_precise_selection_predicate_bounds() {
         );
     }
 }
+
+/* ───── F7 (session-runtime-f7-diagnosis-2026-09-24): errored INDEX selection ───── */
+
+fn is_error_kind(engine: &Engine<TestWorkbook>, row: u32, col: u32, kind: ExcelErrorKind) -> bool {
+    matches!(
+        engine.get_cell_value("Sheet1", row, col),
+        Some(LiteralValue::Error(error)) if error.kind == kind
+    )
+}
+
+/// Static SCC {B1, B3, D1}: B1 statically reads D1 through an untaken IF arm,
+/// B3 reads D1, D1 = INDEX over B1:B3. Live edges: D1 -> selected cell only,
+/// B3 -> D1; acyclic.
+fn build_f7_block(index_formula: &str) -> Engine<TestWorkbook> {
+    let mut engine = runtime_engine();
+    for row in 1..=3 {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(i64::from(row)))
+            .expect("set A column");
+    }
+    set_formula(&mut engine, 1, 2, "=IF($F$1,D1,NA())");
+    engine
+        .set_cell_value("Sheet1", 2, 2, LiteralValue::Int(0))
+        .expect("set B2");
+    set_formula(&mut engine, 3, 2, "=D1+1");
+    engine
+        .set_cell_value("Sheet1", 1, 6, LiteralValue::Boolean(false))
+        .expect("set switch F1");
+    set_formula(&mut engine, 1, 4, index_formula);
+    engine
+}
+
+fn f7_snapshot(engine: &Engine<TestWorkbook>) -> Vec<Option<LiteralValue>> {
+    [(1, 2), (2, 2), (3, 2), (1, 4)]
+        .iter()
+        .map(|&(row, col)| engine.get_cell_value("Sheet1", row, col))
+        .collect()
+}
+
+fn f7_circ_count(engine: &Engine<TestWorkbook>) -> usize {
+    [(1, 2), (2, 2), (3, 2), (1, 4)]
+        .iter()
+        .filter(|&&(row, col)| is_circ(engine, row, col))
+        .count()
+}
+
+/// T1: the selected cell holds #N/A; INDEX must propagate it without Circ.
+#[test]
+fn f7_index_selected_error_no_false_cycle() {
+    let mut engine = build_f7_block("=INDEX($B$1:$B$3,1)");
+    engine.evaluate_all().expect("evaluate");
+    assert_eq!(
+        f7_circ_count(&engine),
+        0,
+        "values: {:?}",
+        f7_snapshot(&engine)
+    );
+    assert!(
+        is_error_kind(&engine, 1, 4, ExcelErrorKind::Na),
+        "D1 must be #N/A"
+    );
+    assert!(
+        is_error_kind(&engine, 3, 2, ExcelErrorKind::Na),
+        "B3 must be #N/A"
+    );
+}
+
+/// T1b: the row index is a MATCH miss; INDEX returns #N/A without Circ.
+#[test]
+fn f7_index_error_row_index_no_false_cycle() {
+    let mut engine = build_f7_block("=INDEX($B$1:$B$3,MATCH(99,$A$1:$A$3,0))");
+    engine.evaluate_all().expect("evaluate");
+    assert_eq!(
+        f7_circ_count(&engine),
+        0,
+        "values: {:?}",
+        f7_snapshot(&engine)
+    );
+    assert!(
+        is_error_kind(&engine, 1, 4, ExcelErrorKind::Na),
+        "D1 must be #N/A"
+    );
+    assert!(
+        is_error_kind(&engine, 3, 2, ExcelErrorKind::Na),
+        "B3 must be #N/A"
+    );
+}
+
+/// T2: persisted start state. A switch turns on a genuine live cycle
+/// (B1 -> D1 -> B1), members are stamped Circ; the switch is turned off and
+/// the block re-evaluated once. The persisted #CIRC! in the selected cell must
+/// not make INDEX record the whole block; the result must equal a fresh
+/// evaluation of the switched-off block.
+#[test]
+fn f7_index_persisted_circ_selection_clears_after_switch_off() {
+    for index_formula in [
+        "=INDEX($B$1:$B$3,1)",
+        "=INDEX($B$1:$B$3,MATCH(1,$A$1:$A$3,0))",
+    ] {
+        let mut engine = build_f7_block(index_formula);
+        engine
+            .set_cell_value("Sheet1", 1, 6, LiteralValue::Boolean(true))
+            .expect("switch on");
+        engine.evaluate_all().expect("evaluate with live cycle");
+        assert!(
+            is_circ(&engine, 1, 4) && is_circ(&engine, 1, 2),
+            "{index_formula}: switch-on must stamp the genuine cycle, got {:?}",
+            f7_snapshot(&engine)
+        );
+
+        engine
+            .set_cell_value("Sheet1", 1, 6, LiteralValue::Boolean(false))
+            .expect("switch off");
+        engine.evaluate_all().expect("evaluate after switch off");
+
+        let mut fresh = build_f7_block(index_formula);
+        fresh.evaluate_all().expect("fresh evaluate");
+
+        assert_eq!(
+            f7_circ_count(&engine),
+            0,
+            "{index_formula}: persisted state must not produce Circ, got {:?}",
+            f7_snapshot(&engine)
+        );
+        assert_eq!(
+            f7_snapshot(&engine),
+            f7_snapshot(&fresh),
+            "{index_formula}: persisted evaluation must equal a fresh evaluation"
+        );
+    }
+}

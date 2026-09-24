@@ -997,3 +997,93 @@ fn bounded_range3d_shortcut_and_engine_resolve_record_identical_edges() {
     // Not vacuous: the B1:B2 span records six member cells.
     assert_eq!(records(1, "=SUM(Acct1:Acct3!B1:B2)").1.len(), 6);
 }
+
+/* ───────────── F7: INDEX over a bounded reference records one cell ────── */
+
+/// F7 (session-runtime-f7-diagnosis-2026-09-24): INDEX over a bounded
+/// reference must record a live edge to the selected cell only, even when
+/// that cell holds an error. At 7b2ee53c the precise path declined on an
+/// errored selection and the fallback resolved (and recorded) the whole
+/// range, closing false live cycles through unselected members.
+#[test]
+fn index_selected_error_records_only_selected_member() {
+    let mut engine = new_engine();
+    engine
+        .set_cell_value(
+            "Sheet1",
+            1,
+            2,
+            LiteralValue::Error(formualizer_common::ExcelError::new(
+                formualizer_common::ExcelErrorKind::Na,
+            )),
+        )
+        .unwrap(); // B1 = #N/A
+    set_num(&mut engine, "Sheet1", 2, 2, 0.0); // B2
+    set_num(&mut engine, "Sheet1", 3, 2, 5.0); // B3
+    engine.evaluate_all().unwrap();
+
+    let d1 = cell(&engine, "Sheet1", 1, 4);
+    let b1 = cell(&engine, "Sheet1", 1, 2);
+    let b2 = cell(&engine, "Sheet1", 2, 2);
+    let b3 = cell(&engine, "Sheet1", 3, 2);
+    let collector = LiveEdgeCollector::new(&[d1, b1, b2, b3]);
+
+    let v = eval_as_member(&engine, &collector, 0, "Sheet1", d1, "=INDEX($B$1:$B$3,1)");
+    assert!(
+        matches!(&v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Na),
+        "INDEX must return the selected cell's #N/A, got {v:?}"
+    );
+    assert_eq!(edges(&collector), FxHashSet::from_iter([(0, 1)]));
+
+    // Control: a non-error selection already records one edge.
+    let v = eval_as_member(&engine, &collector, 0, "Sheet1", d1, "=INDEX($B$1:$B$3,3)");
+    assert_eq!(v, LiteralValue::Number(5.0));
+    assert_eq!(edges(&collector), FxHashSet::from_iter([(0, 3)]));
+}
+
+/// F7: when the row index is itself an error (MATCH miss), INDEX returns that
+/// error and must not resolve or record the base range at all.
+#[test]
+fn index_error_row_index_records_no_base_edges() {
+    let mut engine = new_engine();
+    for r in 1..=3 {
+        set_num(&mut engine, "Sheet1", r, 1, r as f64); // A1:A3
+        set_num(&mut engine, "Sheet1", r, 2, r as f64 * 10.0); // B1:B3
+    }
+    engine.evaluate_all().unwrap();
+
+    let d1 = cell(&engine, "Sheet1", 1, 4);
+    let b1 = cell(&engine, "Sheet1", 1, 2);
+    let b2 = cell(&engine, "Sheet1", 2, 2);
+    let b3 = cell(&engine, "Sheet1", 3, 2);
+    let collector = LiveEdgeCollector::new(&[d1, b1, b2, b3]);
+
+    let v = eval_as_member(
+        &engine,
+        &collector,
+        0,
+        "Sheet1",
+        d1,
+        "=INDEX($B$1:$B$3,MATCH(99,$A$1:$A$3,0))",
+    );
+    assert!(
+        matches!(&v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Na),
+        "INDEX must return the MATCH #N/A, got {v:?}"
+    );
+    assert!(edges(&collector).is_empty());
+
+    // Text index: #VALUE!, still no base edges.
+    let v = eval_as_member(
+        &engine,
+        &collector,
+        0,
+        "Sheet1",
+        d1,
+        "=INDEX($B$1:$B$3,\"x\")",
+    );
+    assert!(
+        matches!(&v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
+        "INDEX with a text index must return #VALUE!, got {v:?}"
+    );
+    assert!(edges(&collector).is_empty());
+}
