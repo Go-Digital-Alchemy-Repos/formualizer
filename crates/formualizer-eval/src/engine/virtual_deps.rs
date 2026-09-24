@@ -753,6 +753,22 @@ pub(crate) struct RegionCanon {
 }
 
 impl RegionCanon {
+    /// Everything `reader` waits for: its region-free deps plus the producers
+    /// of every region it reads, sorted and deduplicated.
+    pub(crate) fn effective_deps(&self, reader: VertexId) -> Vec<VertexId> {
+        let mut out: Vec<VertexId> = self.vdeps.get(&reader).cloned().unwrap_or_default();
+        if let Some(keys) = self.regions.get(&reader) {
+            for key in keys {
+                if let Some(producers) = self.producers.get(key) {
+                    out.extend(producers.iter().copied());
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Readers whose dependencies differ between `self` (the schedule-time
     /// build) and `new` (the post-pass rebuild): a different region-free dep
     /// list, a different region list, or a region whose producers changed.
@@ -818,12 +834,47 @@ pub(crate) struct VdepSnapshot {
     pub map: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
     /// `Some` when `map` came from a region-node build.
     pub canon: Option<RegionCanon>,
+    /// OT-291: soft-producer ordering hints the schedule actually honoured,
+    /// reader -> producers (sorted). The post-pass recheck does not count a
+    /// dependency change as a change when every edge that differs was already
+    /// enforced by one of these hints: the pass ran in an order that the new
+    /// dependencies also require.
+    pub applied_hints: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
 }
 
 impl VdepSnapshot {
     pub(crate) fn per_cell(map: rustc_hash::FxHashMap<VertexId, Vec<VertexId>>) -> Self {
-        Self { map, canon: None }
+        Self {
+            map,
+            canon: None,
+            applied_hints: rustc_hash::FxHashMap::default(),
+        }
     }
+
+    pub(crate) fn with_applied_hints(mut self, hints: &[(VertexId, VertexId)]) -> Self {
+        for &(reader, producer) in hints {
+            self.applied_hints.entry(reader).or_default().push(producer);
+        }
+        for producers in self.applied_hints.values_mut() {
+            producers.sort_unstable();
+            producers.dedup();
+        }
+        self
+    }
+}
+
+/// `old` and `new` dependency lists differ only in edges `hints` enforced.
+/// All three lists are sorted (the builders sort and deduplicate them).
+pub(crate) fn differs_only_by_hints(
+    old: &[VertexId],
+    new: &[VertexId],
+    hints: &[VertexId],
+) -> bool {
+    let covered = |list: &[VertexId], other: &[VertexId]| {
+        list.iter()
+            .all(|u| other.binary_search(u).is_ok() || hints.binary_search(u).is_ok())
+    };
+    covered(old, new) && covered(new, old)
 }
 
 impl std::ops::Deref for VdepSnapshot {
@@ -1020,6 +1071,15 @@ pub struct VirtualDepBuilder<'a, R: EvaluationContext> {
     /// Shared by every `build` this builder performs; see
     /// [`AnchorRegionMemo`] for how it is invalidated.
     memo: AnchorRegionMemo,
+    /// OT-291: per reader, the dirty/volatile producers whose *saved* dynamic
+    /// output extent intersects one of its reads. A saved dynamic extent (a dynamic-array
+    /// anchor's `ref` from the file) is not a hard virtual dependency, since it
+    /// can be stale, but before the anchor's first spill it is the only thing
+    /// that says a follower cell is produced by that anchor. The scheduler
+    /// applies these as ordering hints (dropped wherever they would close a
+    /// cycle), so a reader of a saved-extent cell runs after its anchor. They
+    /// never enter `vdeps`, so the post-pass recheck is unaffected.
+    order_hints: std::cell::RefCell<rustc_hash::FxHashMap<VertexId, Vec<VertexId>>>,
 }
 
 impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
@@ -1027,7 +1087,39 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
         Self {
             engine,
             memo: AnchorRegionMemo::default(),
+            order_hints: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
         }
+    }
+
+    /// Record `v`'s saved-extent soft producers as ordering hints and return
+    /// all its soft producers. Only producers carrying a multi-cell saved
+    /// dynamic extent (and no CSE fence) become hints: a CSE fence and a
+    /// committed spill already give hard virtual dependencies, and hinting
+    /// them again would bypass the region-node relay. Every build over the
+    /// same builder sees the same graph and dirty flags, so a later record
+    /// for `v` is identical to an earlier one.
+    fn record_soft_producers(&self, v: VertexId, memo: &AnchorRegionMemo) -> Vec<VertexId> {
+        let soft = RangeVirtualDepProvider::get_soft_producers_memoized(self.engine, v, memo);
+        let hints: Vec<VertexId> = soft
+            .iter()
+            .copied()
+            .filter(|&u| {
+                let authorship = self.engine.graph.formula_authorship(u);
+                authorship.cse_fence.is_none()
+                    && authorship
+                        .saved_dynamic_extent
+                        .is_some_and(|extent| !extent.is_single_cell())
+            })
+            .collect();
+        if !hints.is_empty() {
+            self.order_hints.borrow_mut().insert(v, hints);
+        }
+        soft
+    }
+
+    /// The ordering hints recorded by every build this builder performed.
+    pub(crate) fn take_order_hints(&self) -> rustc_hash::FxHashMap<VertexId, Vec<VertexId>> {
+        std::mem::take(&mut *self.order_hints.borrow_mut())
     }
     pub fn build(
         &self,
@@ -1049,11 +1141,7 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
         self.memo.refresh(self.engine);
         let memo = &self.memo;
         for &v in candidates {
-            augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers_memoized(
-                self.engine,
-                v,
-                memo,
-            ));
+            augmented_vertices.extend(self.record_soft_producers(v, memo));
             let mut deps =
                 RangeVirtualDepProvider::get_virtual_deps_memoized(self.engine, v, memo);
             let dynamic_deps = DynamicRefVirtualDepProvider::get_virtual_deps(self.engine, v);
@@ -1110,11 +1198,7 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
         self.memo.refresh(self.engine);
         let memo = &self.memo;
         for &v in candidates {
-            augmented_vertices.extend(RangeVirtualDepProvider::get_soft_producers_memoized(
-                self.engine,
-                v,
-                memo,
-            ));
+            augmented_vertices.extend(self.record_soft_producers(v, memo));
             let mut regions: Vec<VertexId> = Vec::new();
             let mut deps = RangeVirtualDepProvider::get_virtual_deps_regionized(
                 self.engine,

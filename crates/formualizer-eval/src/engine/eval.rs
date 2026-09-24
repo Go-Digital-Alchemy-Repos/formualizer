@@ -2794,6 +2794,10 @@ struct ScheduleBuildMeta {
     used_virtual_schedule: bool,
     schedule_cache_hit: bool,
     schedule_cache_eligible: bool,
+    /// OT-291: the schedule honours soft-producer ordering hints that are not
+    /// in `vdeps`; such a schedule is ordered by the dirty set that built it
+    /// and is not stored in the static schedule cache.
+    order_hints_applied: bool,
 }
 
 #[cfg(any(test, feature = "benchmark_internal"))]
@@ -22457,7 +22461,8 @@ where
         let mut replans = 0usize;
         const MAX_REPLAN: usize = 5;
         loop {
-            let (precedents_to_eval, old_vdeps) = self.build_demand_subgraph(&root_vertices);
+            let (precedents_to_eval, old_vdeps, order_hints) =
+                self.build_demand_subgraph_with_hints(&root_vertices);
             let old_vdeps = VdepSnapshot::per_cell(old_vdeps);
             if precedents_to_eval.is_empty() {
                 break;
@@ -22469,9 +22474,13 @@ where
                     .unwrap()
                     .target_schedule_builds += 1;
             }
-            let scheduler = Scheduler::new(&self.graph);
-            let schedule =
-                scheduler.create_schedule_with_virtual(&precedents_to_eval, &old_vdeps)?;
+            let (schedule, applied_hints) = self.schedule_with_order_hints(
+                &precedents_to_eval,
+                &old_vdeps,
+                None,
+                &order_hints,
+            )?;
+            let old_vdeps = old_vdeps.with_applied_hints(&applied_hints);
             for &unit in &schedule.units {
                 self.cancellation_checkpoint("Evaluation cancelled before target schedule unit")?;
                 match unit {
@@ -27213,7 +27222,8 @@ where
         }
 
         // Build demand subgraph with virtual edges (same as evaluate_until)
-        let (precedents_to_eval, vdeps) = self.build_demand_subgraph(&target_vertex_ids);
+        let (precedents_to_eval, vdeps, order_hints) =
+            self.build_demand_subgraph_with_hints(&target_vertex_ids);
 
         if precedents_to_eval.is_empty() {
             return Ok(EvalPlan {
@@ -27241,8 +27251,8 @@ where
         }
 
         // Create schedule for the minimal subgraph honoring virtual edges
-        let scheduler = Scheduler::new(&self.graph);
-        let schedule = scheduler.create_schedule_with_virtual(&precedents_to_eval, &vdeps)?;
+        let (schedule, _) =
+            self.schedule_with_order_hints(&precedents_to_eval, &vdeps, None, &order_hints)?;
 
         // Build layer information
         let mut layers = Vec::new();
@@ -27318,6 +27328,7 @@ where
                     used_virtual_schedule: false,
                     schedule_cache_hit: true,
                     schedule_cache_eligible: true,
+                    order_hints_applied: false,
                 };
                 #[cfg(any(test, feature = "benchmark_internal"))]
                 {
@@ -27356,6 +27367,7 @@ where
             // be reused under `(topology_epoch, candidates)` alone (r8 review
             // follow-up N1; the debug_assert above stays as the loud form).
             let cacheable = vdeps.is_empty()
+                && !meta.order_hints_applied
                 && vdeps
                     .canon
                     .as_ref()
@@ -27502,37 +27514,120 @@ where
 
         let use_virtual = !sched_vdeps.is_empty();
 
-        let scheduler = Scheduler::new(&self.graph);
-        let schedule = if let Some((sched_vertices, sched_vdeps)) = relay.as_ref() {
-            scheduler.create_schedule_with_virtual_synthetic(
+        let order_hints = builder.take_order_hints();
+        let (schedule, applied_hints) = if let Some((sched_vertices, sched_vdeps)) =
+            relay.as_ref()
+        {
+            self.schedule_with_order_hints(
                 sched_vertices,
                 sched_vdeps,
-                crate::engine::vertex::VertexId::new(
+                Some(crate::engine::vertex::VertexId::new(
                     crate::engine::virtual_deps::REGION_NODE_BASE,
-                ),
+                )),
+                &order_hints,
             )?
-        } else if use_virtual {
-            scheduler.create_schedule_with_virtual(&final_evaluate, &vdeps)?
         } else {
-            scheduler.create_schedule(&final_evaluate)?
+            self.schedule_with_order_hints(&final_evaluate, &vdeps, None, &order_hints)?
         };
         drop(relay);
+        let order_hints_applied = !applied_hints.is_empty();
 
         let meta = ScheduleBuildMeta {
             candidate_vertices: to_evaluate.len(),
             vdeps_vertices,
             vdeps_edges,
             builder_elapsed_ms,
-            used_virtual_schedule: use_virtual,
+            used_virtual_schedule: use_virtual || order_hints_applied,
             schedule_cache_hit: false,
             schedule_cache_eligible: false,
+            order_hints_applied,
         };
 
         let vdeps = VdepSnapshot {
             map: vdeps,
             canon: regionized.map(|built| built.canon),
-        };
+            applied_hints: FxHashMap::default(),
+        }
+        .with_applied_hints(&applied_hints);
         Ok((schedule, vdeps, meta))
+    }
+
+    /// Build the schedule for `vertices` over `base` virtual dependencies,
+    /// additionally honouring `hints` (OT-291 soft-producer ordering: a reader
+    /// of a cell inside a producer's saved dynamic extent runs after that
+    /// producer, so it does not read a blank follower before the first spill).
+    ///
+    /// A hint is ordering only. It is applied when both ends are scheduled
+    /// here and the edge is not already present; a hint that closes a cycle
+    /// is dropped (the saved extent may be stale, and a real overlap is found
+    /// by the committed-spill path exactly as before), and the schedule is
+    /// rebuilt without it. Returns the hint edges `(reader, producer)` that the
+    /// schedule honours.
+    fn schedule_with_order_hints(
+        &self,
+        vertices: &[VertexId],
+        base: &FxHashMap<VertexId, Vec<VertexId>>,
+        synthetic_base: Option<VertexId>,
+        hints: &FxHashMap<VertexId, Vec<VertexId>>,
+    ) -> Result<(crate::engine::scheduler::Schedule, Vec<(VertexId, VertexId)>), ExcelError> {
+        let scheduler = Scheduler::new(&self.graph);
+        let run = |map: &FxHashMap<VertexId, Vec<VertexId>>| match synthetic_base {
+            Some(synthetic) => {
+                scheduler.create_schedule_with_virtual_synthetic(vertices, map, synthetic)
+            }
+            None if map.is_empty() => scheduler.create_schedule(vertices),
+            None => scheduler.create_schedule_with_virtual(vertices, map),
+        };
+        let mut extra: Vec<(VertexId, VertexId)> = Vec::new();
+        if !hints.is_empty() {
+            let in_set: FxHashSet<VertexId> = vertices.iter().copied().collect();
+            for (&reader, producers) in hints {
+                if !in_set.contains(&reader) {
+                    continue;
+                }
+                let present = base.get(&reader);
+                for &producer in producers {
+                    if producer != reader
+                        && in_set.contains(&producer)
+                        && !present.is_some_and(|deps| deps.contains(&producer))
+                    {
+                        extra.push((reader, producer));
+                    }
+                }
+            }
+        }
+        if extra.is_empty() {
+            return Ok((run(base)?, extra));
+        }
+        extra.sort_unstable();
+        extra.dedup();
+        loop {
+            let mut merged = base.clone();
+            for &(reader, producer) in &extra {
+                merged.entry(reader).or_default().push(producer);
+            }
+            let schedule = run(&merged)?;
+            if schedule.cycles.is_empty() {
+                return Ok((schedule, extra));
+            }
+            let mut cycle_of: FxHashMap<VertexId, usize> = FxHashMap::default();
+            for (index, cycle) in schedule.cycles.iter().enumerate() {
+                for &vertex in cycle {
+                    cycle_of.insert(vertex, index);
+                }
+            }
+            let before = extra.len();
+            extra.retain(|(reader, producer)| {
+                cycle_of.get(reader).is_none() || cycle_of.get(reader) != cycle_of.get(producer)
+            });
+            if extra.len() == before {
+                // Every remaining cycle is made of real edges.
+                return Ok((schedule, extra));
+            }
+            if extra.is_empty() {
+                return Ok((run(base)?, extra));
+            }
+        }
     }
 
     fn can_use_static_schedule_cache(&self, to_evaluate: &[VertexId]) -> bool {
@@ -27718,11 +27813,27 @@ where
         // with a per-cell rebuild; a region-node old map is compared canon to
         // canon, which is independent of the candidate set and charges a
         // region's producer change to every reader of that region.
+        // OT-291: a reader whose schedule honoured soft-producer ordering
+        // hints is not counted as changed when every edge that differs was
+        // one of those hints: the pass already ran it after that producer.
+        let hints = &old_vdeps.applied_hints;
         let mut changed = match old_vdeps.canon.as_ref() {
             Some(old_canon) => {
                 let new_canon = builder.build_regionized(&comparison_domain).canon;
                 let domain: FxHashSet<VertexId> = comparison_domain.iter().copied().collect();
-                old_canon.changed_readers(&new_canon, &domain)
+                let mut changed = old_canon.changed_readers(&new_canon, &domain);
+                if !hints.is_empty() {
+                    changed.retain(|v| {
+                        hints.get(v).is_none_or(|h| {
+                            !crate::engine::virtual_deps::differs_only_by_hints(
+                                &old_canon.effective_deps(*v),
+                                &new_canon.effective_deps(*v),
+                                h,
+                            )
+                        })
+                    });
+                }
+                changed
             }
             None => {
                 let new_vdeps = builder.build(&comparison_domain).0;
@@ -27731,7 +27842,22 @@ where
                 candidates.extend(new_vdeps.keys().copied());
                 let mut changed = Vec::new();
                 for v in candidates {
-                    if old_vdeps.get(&v) != new_vdeps.get(&v) {
+                    let old = old_vdeps.get(&v);
+                    let new = new_vdeps.get(&v);
+                    if old != new
+                        && hints.get(&v).is_none_or(|h| {
+                            let sorted = |list: Option<&Vec<VertexId>>| {
+                                let mut list = list.cloned().unwrap_or_default();
+                                list.sort_unstable();
+                                list
+                            };
+                            !crate::engine::virtual_deps::differs_only_by_hints(
+                                &sorted(old),
+                                &sorted(new),
+                                h,
+                            )
+                        })
+                    {
                         changed.push(v);
                     }
                 }
@@ -27773,6 +27899,21 @@ where
         rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
     ) {
         self.build_demand_subgraph_with(target_vertices, &VirtualDepBuilder::new(self))
+    }
+
+    /// As [`Self::build_demand_subgraph`], also returning the soft-producer
+    /// ordering hints the walk recorded (see [`Self::schedule_with_order_hints`]).
+    fn build_demand_subgraph_with_hints(
+        &self,
+        target_vertices: &[VertexId],
+    ) -> (
+        Vec<VertexId>,
+        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
+    ) {
+        let builder = VirtualDepBuilder::new(self);
+        let (vertices, vdeps) = self.build_demand_subgraph_with(target_vertices, &builder);
+        (vertices, vdeps, builder.take_order_hints())
     }
 
     /// As [`Self::build_demand_subgraph`], but reusing a caller's builder so

@@ -233,3 +233,4 @@ mod xlookup_declared_length_guard;
 mod xlookup_excel_parity;
 
 mod output_footprint_dependencies;
+mod saved_extent_ordering;
