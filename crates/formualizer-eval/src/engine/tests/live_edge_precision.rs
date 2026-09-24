@@ -166,14 +166,32 @@ fn index_unselected_error_is_ignored() {
     );
 }
 
+/// Inverted by F7 (session-runtime-f7-diagnosis-2026-09-24). This test used
+/// to assert the GOD-187ad parity gate: an errored selected cell kept eager
+/// whole-rect edges and so stamped C9 Circ. That gate is the F7 defect: the
+/// selected cell does not depend on Q29:Q100, so an error there must
+/// propagate exactly as a non-error selection does in
+/// `index_rect_edge_precision_acyclic_chain`.
 #[test]
-fn index_rect_edge_error_selection_keeps_whole_rect_edges() {
+fn index_rect_edge_error_selection_records_selected_cell_only() {
     let mut engine = build_guarded_chain("=INDEX(Q1:Q100,24)");
     set_formula(&mut engine, 24, 17, "=1/0");
     engine.evaluate_all().expect("evaluate");
     assert!(
-        is_circ(&engine, 9, 3),
-        "errored selected cell must retain eager whole-rect edges"
+        matches!(
+            engine.get_cell_value("Sheet1", 9, 3),
+            Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Div
+        ),
+        "errored selected cell must propagate DIV/0, got {:?}",
+        engine.get_cell_value("Sheet1", 9, 3)
+    );
+    assert_eq!(
+        (1..=100)
+            .flat_map(|row| (1..=17).map(move |col| (row, col)))
+            .filter(|&(row, col)| is_circ(&engine, row, col))
+            .count(),
+        0,
+        "an errored selection must not close a false cycle"
     );
 }
 

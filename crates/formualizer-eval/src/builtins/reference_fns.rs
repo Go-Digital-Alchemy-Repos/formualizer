@@ -320,6 +320,18 @@ impl IndexFn {
             return None;
         };
         let (rows, cols) = Self::bounded_dimensions(&base)?;
+        // F7: an index argument that fails strict number coercion is the
+        // error `validated_dispatch` returns (without format propagation);
+        // return it here so the fallback never resolves, and so never records
+        // live edges to, the whole base range for a result that does not
+        // depend on it.
+        match Self::index_coercion_error(args) {
+            Err(()) => return None,
+            Ok(Some(error)) => {
+                return Some(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+            }
+            Ok(None) => {}
+        }
         if !Self::precise_single_cell_selection(args, rows, cols) {
             return None;
         }
@@ -328,15 +340,42 @@ impl IndexFn {
         else {
             return None;
         };
+        // F7: an errored selected cell is returned as is, exactly as the
+        // fallback's `eval` would materialize it. Declining here (the
+        // GOD-187ad gate) made the fallback record the whole range as live
+        // edges, which closed false runtime cycles whenever the selected cell
+        // held a persisted #CIRC! or any other error.
         let value = Self::materialize_reference(ctx, &reference).ok()?;
-        if matches!(
-            &value,
-            crate::traits::CalcValue::Scalar(LiteralValue::Error(_))
-                | crate::traits::CalcValue::AnnotatedScalar(LiteralValue::Error(_), _)
-        ) {
-            return None;
-        }
         Some(function.apply_format_propagation(value))
+    }
+
+    /// Mirror of `validate_and_prepare`'s handling of INDEX's scalar,
+    /// `NumberStrict` index slots (`args[1..]`, in order). `Ok(Some(error))`:
+    /// the first index argument whose scalar value fails strict number
+    /// coercion, which is exactly the error the validated path returns before
+    /// `eval`. `Ok(None)`: every index argument coerces. `Err(())`: an index
+    /// argument outside this mirror (range, array, callable, or an evaluation
+    /// error that validation carries into `eval`); the caller declines.
+    fn index_coercion_error<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+    ) -> Result<Option<ExcelError>, ()> {
+        if !(2..=3).contains(&args.len()) {
+            return Err(());
+        }
+        for arg in &args[1..] {
+            let scalar = match arg.value() {
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(_)))
+                | Ok(crate::traits::CalcValue::Range(_))
+                | Ok(crate::traits::CalcValue::Callable(_))
+                | Err(_) => return Err(()),
+                Ok(crate::traits::CalcValue::Scalar(value))
+                | Ok(crate::traits::CalcValue::AnnotatedScalar(value, _)) => value,
+            };
+            if let Err(error) = crate::coercion::to_number_strict(&scalar) {
+                return Ok(Some(error));
+            }
+        }
+        Ok(None)
     }
 
     fn validated_dispatch<'a, 'b>(
