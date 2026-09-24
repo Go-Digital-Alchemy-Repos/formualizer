@@ -1087,3 +1087,50 @@ fn index_error_row_index_records_no_base_edges() {
     );
     assert!(edges(&collector).is_empty());
 }
+
+/// Review finding 5 (OT-285 qualification): an index argument whose
+/// evaluation returns `Err` (not an error value) decides INDEX's result
+/// without the base, so INDEX must not resolve or record the base range.
+/// `LAMBDA(x,x)(1)` is `Err(#N/IMPL)` in the AST interpreter. Precedence
+/// matches the validated fallback: a later coercion error wins over an
+/// earlier evaluation `Err`.
+#[test]
+fn index_eval_err_index_records_no_base_edges() {
+    let mut engine = new_engine();
+    for r in 1..=3 {
+        set_num(&mut engine, "Sheet1", r, 2, r as f64 * 10.0); // B1:B3
+    }
+    engine.evaluate_all().unwrap();
+
+    let d1 = cell(&engine, "Sheet1", 1, 4);
+    let b1 = cell(&engine, "Sheet1", 1, 2);
+    let b2 = cell(&engine, "Sheet1", 2, 2);
+    let b3 = cell(&engine, "Sheet1", 3, 2);
+    let collector = LiveEdgeCollector::new(&[d1, b1, b2, b3]);
+
+    for (formula, kind) in [
+        (
+            "=INDEX($B$1:$B$3,LAMBDA(x,x)(1))",
+            formualizer_common::ExcelErrorKind::NImpl,
+        ),
+        (
+            "=INDEX($B$1:$B$3,LAMBDA(x,x)(1),NA())",
+            formualizer_common::ExcelErrorKind::Na,
+        ),
+    ] {
+        let v = eval_as_member(&engine, &collector, 0, "Sheet1", d1, formula);
+        assert!(
+            matches!(&v, LiteralValue::Error(e) if e.kind == kind),
+            "{formula}: expected {kind:?}, got {v:?}"
+        );
+        assert!(
+            edges(&collector).is_empty(),
+            "{formula}: no base edges may be recorded"
+        );
+    }
+
+    // Control: a selection that reads the base records its selected member.
+    let v = eval_as_member(&engine, &collector, 0, "Sheet1", d1, "=INDEX($B$1:$B$3,2)");
+    assert_eq!(v, LiteralValue::Number(20.0));
+    assert_eq!(edges(&collector), FxHashSet::from_iter([(0, 2)]));
+}

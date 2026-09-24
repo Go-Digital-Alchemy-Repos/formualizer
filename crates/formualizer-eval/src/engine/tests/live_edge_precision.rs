@@ -539,3 +539,306 @@ fn f7_index_persisted_circ_selection_clears_after_switch_off() {
         );
     }
 }
+
+/* ───── OT-285 qualification: precise path against the validated fallback ───── */
+
+/// Upstream's oracle-shaped acyclic test (`index_selected_error_phantom_cycle_stays_acyclic`),
+/// restored. Excel oracle: research/upstream/formualizer/excel-oracle-2026-08-22.md,
+/// probe 8 row N (N1=`=1/0`, N2=`=INDEX(N1:N3,1)`, N3=`=N2` gives #DIV/0! in
+/// N2 and N3 with no circular reference). An errored selected cell must not
+/// make INDEX depend on the unselected member that reads it back.
+#[test]
+fn index_selected_error_phantom_cycle_stays_acyclic() {
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, 1, 17, "=1/0"); // Q1
+    set_formula(&mut engine, 3, 17, "=C9"); // Q3
+    set_formula(&mut engine, 9, 3, "=INDEX(Q1:Q3,1)"); // C9
+    engine.evaluate_all().expect("evaluate");
+
+    for (row, col, label) in [(9, 3, "C9"), (3, 17, "Q3")] {
+        assert!(
+            matches!(
+                engine.get_cell_value("Sheet1", row, col),
+                Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Div
+            ),
+            "{label} must be #DIV/0! (Excel probe 8 row N), got {:?}",
+            engine.get_cell_value("Sheet1", row, col)
+        );
+    }
+    for (row, col) in [(1, 17), (2, 17), (3, 17), (9, 3)] {
+        assert!(
+            !is_circ(&engine, row, col),
+            "no member may be Circ; ({row},{col}) is"
+        );
+    }
+}
+
+/// Test-only INDEX with INDEX's real schema and `eval`, and a non-None
+/// format policy, so format propagation differences between the precise
+/// path and the validated fallback (its default `dispatch`) are observable.
+#[derive(Debug)]
+struct MarkedSchemaIndexFn;
+
+impl crate::function::Function for MarkedSchemaIndexFn {
+    fn name(&self) -> &'static str {
+        "INDEX.MARKED.SCHEMA"
+    }
+
+    fn min_args(&self) -> usize {
+        crate::function::Function::min_args(&crate::builtins::reference_fns::IndexFn)
+    }
+
+    fn arg_schema(&self) -> &'static [crate::args::ArgSchema] {
+        crate::function::Function::arg_schema(&crate::builtins::reference_fns::IndexFn)
+    }
+
+    fn propagate_format(
+        &self,
+        _result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        Some(MARKER_FORMAT)
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [crate::traits::ArgumentHandle<'a, 'b>],
+        ctx: &dyn crate::traits::FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, formualizer_common::ExcelError> {
+        crate::function::Function::eval(&crate::builtins::reference_fns::IndexFn, args, ctx)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DispatchPath {
+    /// `IndexFn::precise_dispatch` for INDEX itself.
+    PreciseIndex,
+    /// `IndexFn::validated_dispatch`: INDEX's fallback.
+    FallbackIndex,
+    /// `IndexFn::precise_dispatch` dispatched as `MarkedSchemaIndexFn`.
+    PreciseMarked,
+    /// `MarkedSchemaIndexFn`'s default `dispatch`: validation, `eval`,
+    /// format policy.
+    FallbackMarked,
+}
+
+fn dispatch_path_on(
+    engine: &Engine<TestWorkbook>,
+    path: DispatchPath,
+    formula: &str,
+) -> PreciseDispatchResult {
+    use crate::function::Function;
+    use formualizer_parse::parser::ASTNodeType;
+
+    let interpreter = crate::interpreter::Interpreter::new(engine, "Sheet1");
+    let ast = parse(formula).expect("valid INDEX formula");
+    let ASTNodeType::Function { args, .. } = &ast.node_type else {
+        panic!("expected a function call: {formula}");
+    };
+    let handles: Vec<crate::traits::ArgumentHandle<'_, '_>> = args
+        .iter()
+        .map(|arg| crate::traits::ArgumentHandle::new(arg, &interpreter))
+        .collect();
+    let ctx = interpreter.function_context(None);
+    let index = crate::builtins::reference_fns::IndexFn;
+    let value = match path {
+        DispatchPath::PreciseIndex => {
+            crate::builtins::reference_fns::IndexFn::precise_dispatch(&index, &handles, &ctx)
+        }
+        DispatchPath::PreciseMarked => crate::builtins::reference_fns::IndexFn::precise_dispatch(
+            &MarkedSchemaIndexFn,
+            &handles,
+            &ctx,
+        ),
+        DispatchPath::FallbackIndex => Some(
+            index
+                .validated_dispatch(&handles, &ctx)
+                .unwrap_or_else(|error| {
+                    crate::traits::CalcValue::Scalar(LiteralValue::Error(error))
+                }),
+        ),
+        DispatchPath::FallbackMarked => Some(
+            MarkedSchemaIndexFn
+                .dispatch(&handles, &ctx)
+                .unwrap_or_else(|error| {
+                    crate::traits::CalcValue::Scalar(LiteralValue::Error(error))
+                }),
+        ),
+    };
+    value.map(|value| (value.format_id(), value.into_literal()))
+}
+
+fn index_fixture_engine() -> Engine<TestWorkbook> {
+    let mut engine = runtime_engine();
+    for (row, col, value) in [(1, 1, 1), (3, 1, 3), (1, 2, 10), (3, 2, 30)] {
+        engine
+            .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+            .expect("set fixture cell");
+    }
+    set_formula(&mut engine, 2, 1, "=1/0"); // A2: errored member
+    engine
+        .set_cell_value(
+            "Sheet1",
+            2,
+            2,
+            LiteralValue::Date(NaiveDate::from_ymd_opt(2024, 12, 1).expect("valid date")),
+        )
+        .expect("set B2"); // B2: a member carrying a date number format
+    engine.evaluate_all().expect("evaluate fixture");
+    engine
+}
+
+/// Review finding 2 (and 5): the precise path must return exactly what the
+/// validated fallback returns, value and format id, for index-error
+/// precedence, errors in the column argument, 3-argument 2D selections, an
+/// errored selected cell, and index arguments whose evaluation returns `Err`
+/// (`LAMBDA(x,x)(1)`: immediate invocation is `Err(#N/IMPL)` in the AST
+/// interpreter). Each row is run as INDEX (no format policy) and as a
+/// format-policy INDEX with INDEX's schema, so validation-time errors
+/// (unformatted) and `eval`-time results (formatted) are distinguishable.
+#[test]
+fn index_precise_path_matches_validated_fallback_table() {
+    let engine = index_fixture_engine();
+    // (formula, precise path taken, expected error kind or value check)
+    let cases: &[(&str, bool, Option<ExcelErrorKind>)] = &[
+        ("=INDEX(A1:B3,2,NA())", true, Some(ExcelErrorKind::Na)), // column-argument error
+        ("=INDEX(A1:B3,NA(),1/0)", true, Some(ExcelErrorKind::Na)), // first index error wins
+        ("=INDEX(A1:B3,2,1)", true, Some(ExcelErrorKind::Div)),   // errored selected cell
+        (
+            "=INDEX(A1:B3,\"x\",NA())",
+            true,
+            Some(ExcelErrorKind::Value),
+        ),
+        ("=INDEX(A1:B3,3,2)", true, None), // 3-argument 2D selection
+        ("=INDEX(A1:B3,2,2)", true, None), // selected cell carries a date format
+        ("=INDEX(A1:B3,0,1)", false, None), // whole column: declines
+        ("=INDEX(A1:B3,2)", false, None),  // 2-arg over 2D: declines
+        // Index arguments whose evaluation returns Err.
+        (
+            "=INDEX(A1:B3,LAMBDA(x,x)(1),1)",
+            true,
+            Some(ExcelErrorKind::NImpl),
+        ),
+        (
+            "=INDEX(A1:B3,2,LAMBDA(x,x)(1))",
+            true,
+            Some(ExcelErrorKind::NImpl),
+        ),
+        // A later coercion error beats an earlier evaluation Err (validation
+        // stores the Err and continues).
+        (
+            "=INDEX(A1:B3,LAMBDA(x,x)(1),NA())",
+            true,
+            Some(ExcelErrorKind::Na),
+        ),
+        (
+            "=INDEX(A1:B3,LAMBDA(x,x)(1),\"x\")",
+            true,
+            Some(ExcelErrorKind::Value),
+        ),
+        (
+            "=INDEX(A1:B3,\"x\",LAMBDA(x,x)(1))",
+            true,
+            Some(ExcelErrorKind::Value),
+        ),
+        (
+            "=INDEX(A1:A3,LAMBDA(x,x)(1))",
+            true,
+            Some(ExcelErrorKind::NImpl),
+        ),
+    ];
+
+    for (formula, taken, expected_error) in cases {
+        for (precise_path, fallback_path, marked) in [
+            (
+                DispatchPath::PreciseIndex,
+                DispatchPath::FallbackIndex,
+                false,
+            ),
+            (
+                DispatchPath::PreciseMarked,
+                DispatchPath::FallbackMarked,
+                true,
+            ),
+        ] {
+            let precise = dispatch_path_on(&engine, precise_path, formula);
+            let fallback = dispatch_path_on(&engine, fallback_path, formula)
+                .expect("the fallback always returns");
+            assert_eq!(
+                precise.is_some(),
+                *taken,
+                "{formula} (marked={marked}): precise path taken"
+            );
+            if let Some(precise) = precise {
+                assert_eq!(
+                    precise, fallback,
+                    "{formula} (marked={marked}): precise (format, value) must equal the fallback's"
+                );
+            }
+            if let Some(kind) = expected_error {
+                assert!(
+                    matches!(&fallback.1, LiteralValue::Error(error) if error.kind == *kind),
+                    "{formula} (marked={marked}): expected {kind:?}, got {:?}",
+                    fallback.1
+                );
+            }
+        }
+    }
+
+    // Non-vacuity of the format comparison: with the format policy, a
+    // validation-time error is unformatted, while an errored selected cell
+    // and an eval-time Err are formatted, in both paths.
+    let marked = |formula| dispatch_path_on(&engine, DispatchPath::PreciseMarked, formula);
+    assert_eq!(
+        marked("=INDEX(A1:B3,2,NA())").map(|(format, _)| format),
+        Some(None)
+    );
+    let selected_error = marked("=INDEX(A1:B3,2,1)").expect("precise path taken");
+    assert_eq!(selected_error.0, Some(MARKER_FORMAT));
+    assert!(
+        matches!(&selected_error.1, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Div),
+        "got {:?}",
+        selected_error.1
+    );
+    assert_eq!(
+        marked("=INDEX(A1:B3,LAMBDA(x,x)(1),1)").map(|(format, _)| format),
+        Some(Some(MARKER_FORMAT))
+    );
+    // The Err case really is an evaluation Err, not an error value.
+    {
+        use formualizer_parse::parser::ASTNodeType;
+        let interpreter = crate::interpreter::Interpreter::new(&engine, "Sheet1");
+        let ast = parse("=INDEX(A1:B3,LAMBDA(x,x)(1),1)").expect("parse");
+        let ASTNodeType::Function { args, .. } = &ast.node_type else {
+            panic!("expected a function call");
+        };
+        let handle = crate::traits::ArgumentHandle::new(&args[1], &interpreter);
+        assert!(
+            handle.value().is_err(),
+            "LAMBDA(x,x)(1) must evaluate to Err for this table to cover finding 5"
+        );
+    }
+}
+
+/// Review finding 4: the precise path reads the index slots' coercion from
+/// the dispatching function's schema. A schema with no coercion (the empty
+/// schema of `MarkedIndexFn`) makes validation accept a text index, so the
+/// precise path must not return the strict-coercion #VALUE! early; `eval`
+/// still reads the index strictly, which the precise path reports as the
+/// `eval`-time error with the function's format policy.
+#[test]
+fn index_precise_path_reads_coercion_from_schema() {
+    let engine = index_fixture_engine();
+    let strict = dispatch_path_on(&engine, DispatchPath::PreciseIndex, "=INDEX(A1:B3,\"x\",1)")
+        .expect("precise path taken");
+    assert_eq!(strict.0, None, "INDEX validation error is unformatted");
+    assert!(matches!(&strict.1, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value));
+
+    let (format, value) = precise_dispatch_on(&engine, &MarkedIndexFn, "=INDEX(A1:B3,\"x\",1)")
+        .expect("precise path taken");
+    assert!(matches!(&value, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value));
+    assert_eq!(
+        format,
+        Some(MARKER_FORMAT),
+        "with no schema coercion the #VALUE! comes from eval and is formatted"
+    );
+}
