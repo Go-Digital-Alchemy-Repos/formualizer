@@ -2122,8 +2122,7 @@ impl Overlay {
             }
             OverlayFragment::DenseRange { .. } | OverlayFragment::RunRange { .. } => {
                 if let Some(range) = fragment.interval_coverage() {
-                    let keys: Vec<_> =
-                        self.points_in_range(range).map(|(off, _)| *off).collect();
+                    let keys: Vec<_> = self.points_in_range(range).map(|(off, _)| *off).collect();
                     for off in keys {
                         if let Some(old) = self.points.remove(&off) {
                             removed = removed.saturating_add(Self::point_estimate(&old));
@@ -6302,7 +6301,10 @@ mod tests {
             overlay.set_scalar(off, OverlayValue::Number(off as f64));
         }
         let offsets = |range: core::ops::Range<usize>| -> Vec<usize> {
-            overlay.points_in_range(range).map(|(off, _)| *off).collect()
+            overlay
+                .points_in_range(range)
+                .map(|(off, _)| *off)
+                .collect()
         };
 
         assert_eq!(offsets(5..10), vec![5, 9], "start inclusive, end exclusive");
@@ -6332,7 +6334,10 @@ mod tests {
             ]
         );
         assert!(overlay.slice(21, 79).is_empty());
-        assert_eq!(sliced.estimated_bytes(), sliced.debug_recomputed_estimated_bytes());
+        assert_eq!(
+            sliced.estimated_bytes(),
+            sliced.debug_recomputed_estimated_bytes()
+        );
     }
 
     #[test]
@@ -6422,21 +6427,33 @@ mod tests {
         let mut removed = computed.clone();
         removed.remove_range(10..13);
         assert_eq!(
-            removed.points_in_range(0..usize::MAX).map(|(o, _)| *o).collect::<Vec<_>>(),
+            removed
+                .points_in_range(0..usize::MAX)
+                .map(|(o, _)| *o)
+                .collect::<Vec<_>>(),
             vec![4, 13, 14]
         );
-        assert_eq!(removed.estimated_bytes(), removed.debug_recomputed_estimated_bytes());
+        assert_eq!(
+            removed.estimated_bytes(),
+            removed.debug_recomputed_estimated_bytes()
+        );
 
         let mut covered = computed.clone();
         covered.apply_fragment(
             OverlayFragment::dense_range(12, vec![OverlayValue::Number(0.0); 2]).unwrap(),
         );
         assert_eq!(
-            covered.points_in_range(0..usize::MAX).map(|(o, _)| *o).collect::<Vec<_>>(),
+            covered
+                .points_in_range(0..usize::MAX)
+                .map(|(o, _)| *o)
+                .collect::<Vec<_>>(),
             vec![4, 10, 11, 14]
         );
         assert_eq!(covered.get(13), Some(OverlayValue::Number(0.0)));
-        assert_eq!(covered.estimated_bytes(), covered.debug_recomputed_estimated_bytes());
+        assert_eq!(
+            covered.estimated_bytes(),
+            covered.debug_recomputed_estimated_bytes()
+        );
         assert!(covered.debug_is_normalized());
     }
 
