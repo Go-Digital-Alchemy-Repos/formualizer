@@ -178,6 +178,49 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
     }
 }
 
+/// The schema entry `validate_and_prepare` applies to argument `idx`, or
+/// `None` when it has none (validation then skips the argument under
+/// `warn_only` and otherwise fails with "Too many arguments").
+pub(crate) fn schema_slot(schema: &[ArgSchema], idx: usize) -> Option<&ArgSchema> {
+    if schema.len() == 1 {
+        Some(&schema[0])
+    } else if idx < schema.len() {
+        Some(&schema[idx])
+    } else {
+        // Attempt to find a repeating spec (e.g., variadic tail like CHOOSE, SUM, etc.)
+        schema.iter().find(|s| s.repeating.is_some())
+    }
+}
+
+/// The coercion `validate_and_prepare` applies to the collapsed value of a
+/// `ShapeKind::Scalar` slot. `Ok(Some(value))`: the coerced value;
+/// `Ok(None)`: the policy leaves the value unchanged; `Err(error)`: the
+/// coercion failure, which validation returns unless `warn_only`.
+///
+/// Shared with callers that must predict validation's result without running
+/// it (INDEX's precise path), so the two cannot diverge.
+pub(crate) fn coerce_scalar_slot(
+    value: &LiteralValue,
+    policy: CoercionPolicy,
+) -> Result<Option<LiteralValue>, ExcelError> {
+    match policy {
+        CoercionPolicy::None => Ok(None),
+        CoercionPolicy::NumberStrict => {
+            crate::coercion::to_number_strict(value).map(|n| Some(LiteralValue::Number(n)))
+        }
+        CoercionPolicy::NumberLenientText => {
+            crate::coercion::to_number_lenient(value).map(|n| Some(LiteralValue::Number(n)))
+        }
+        CoercionPolicy::Logical => {
+            crate::coercion::to_logical(value).map(|b| Some(LiteralValue::Boolean(b)))
+        }
+        CoercionPolicy::Criteria => Ok(None), // handled per-function currently
+        CoercionPolicy::DateTimeSerial => {
+            crate::coercion::to_datetime_serial(value).map(|n| Some(LiteralValue::Number(n)))
+        }
+    }
+}
+
 pub fn validate_and_prepare<'a, 'b>(
     args: &'a [ArgumentHandle<'a, 'b>],
     schema: &[ArgSchema],
@@ -203,21 +246,11 @@ pub fn validate_and_prepare<'a, 'b>(
 
     let mut items: Vec<PreparedArg<'a>> = Vec::with_capacity(args.len());
     for (idx, arg) in args.iter().enumerate() {
-        let spec = if schema.len() == 1 {
-            &schema[0]
-        } else if idx < schema.len() {
-            &schema[idx]
-        } else {
-            // Attempt to find a repeating spec (e.g., variadic tail like CHOOSE, SUM, etc.)
-            if let Some(rep_spec) = schema.iter().find(|s| s.repeating.is_some()) {
-                rep_spec
-            } else if options.warn_only {
+        let Some(spec) = schema_slot(schema, idx) else {
+            if options.warn_only {
                 continue;
-            } else {
-                return Err(
-                    ExcelError::new(ExcelErrorKind::Value).with_message("Too many arguments")
-                );
             }
+            return Err(ExcelError::new(ExcelErrorKind::Value).with_message("Too many arguments"));
         };
 
         // By-ref argument: require a reference (AST literal or function-returned)
@@ -281,55 +314,14 @@ pub fn validate_and_prepare<'a, 'b>(
                             }
                         };
                         // Apply coercion policy to Value shapes when applicable
-                        let coerced = match spec.coercion {
-                            CoercionPolicy::None => v,
-                            CoercionPolicy::NumberStrict => {
-                                match crate::coercion::to_number_strict(v.as_ref()) {
-                                    Ok(n) => Cow::Owned(LiteralValue::Number(n)),
-                                    Err(e) => {
-                                        if options.warn_only {
-                                            v
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                            CoercionPolicy::NumberLenientText => {
-                                match crate::coercion::to_number_lenient(v.as_ref()) {
-                                    Ok(n) => Cow::Owned(LiteralValue::Number(n)),
-                                    Err(e) => {
-                                        if options.warn_only {
-                                            v
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                            CoercionPolicy::Logical => {
-                                match crate::coercion::to_logical(v.as_ref()) {
-                                    Ok(b) => Cow::Owned(LiteralValue::Boolean(b)),
-                                    Err(e) => {
-                                        if options.warn_only {
-                                            v
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                            CoercionPolicy::Criteria => v, // handled per-function currently
-                            CoercionPolicy::DateTimeSerial => {
-                                match crate::coercion::to_datetime_serial(v.as_ref()) {
-                                    Ok(n) => Cow::Owned(LiteralValue::Number(n)),
-                                    Err(e) => {
-                                        if options.warn_only {
-                                            v
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
+                        let coerced = match coerce_scalar_slot(v.as_ref(), spec.coercion) {
+                            Ok(Some(value)) => Cow::Owned(value),
+                            Ok(None) => v,
+                            Err(e) => {
+                                if options.warn_only {
+                                    v
+                                } else {
+                                    return Err(e);
                                 }
                             }
                         };

@@ -145,6 +145,15 @@ fn resolve_reference_bounds<'b>(
 #[derive(Debug)]
 pub struct IndexFn;
 
+/// What INDEX's index arguments alone decide; see
+/// `IndexFn::index_argument_outcome`.
+enum IndexArgumentOutcome {
+    Decline,
+    ValidationError(ExcelError),
+    EvalError(ExcelError),
+    Proceed,
+}
+
 impl IndexFn {
     fn index_argument<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Result<Option<i64>, ExcelError> {
         if arg.is_omitted() {
@@ -320,17 +329,28 @@ impl IndexFn {
             return None;
         };
         let (rows, cols) = Self::bounded_dimensions(&base)?;
-        // F7: an index argument that fails strict number coercion is the
-        // error `validated_dispatch` returns (without format propagation);
-        // return it here so the fallback never resolves, and so never records
-        // live edges to, the whole base range for a result that does not
-        // depend on it.
-        match Self::index_coercion_error(args) {
-            Err(()) => return None,
-            Ok(Some(error)) => {
+        // F7: when the index arguments alone decide the result, return it
+        // here so the fallback never resolves, and so never records live
+        // edges to, the whole base range for a result that does not depend
+        // on it.
+        match Self::index_argument_outcome(function, args) {
+            IndexArgumentOutcome::Decline => return None,
+            IndexArgumentOutcome::ValidationError(error) => {
+                // `validated_dispatch` returns a validation error before
+                // `eval`, without format propagation.
                 return Some(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
             }
-            Ok(None) => {}
+            IndexArgumentOutcome::EvalError(error) => {
+                // `eval` returns this error from `reference_from_base` before
+                // resolving the base, and `validated_dispatch` applies the
+                // format policy to it.
+                return Some(
+                    function.apply_format_propagation(crate::traits::CalcValue::Scalar(
+                        LiteralValue::Error(error),
+                    )),
+                );
+            }
+            IndexArgumentOutcome::Proceed => {}
         }
         if !Self::precise_single_cell_selection(args, rows, cols) {
             return None;
@@ -349,36 +369,101 @@ impl IndexFn {
         Some(function.apply_format_propagation(value))
     }
 
-    /// Mirror of `validate_and_prepare`'s handling of INDEX's scalar,
-    /// `NumberStrict` index slots (`args[1..]`, in order). `Ok(Some(error))`:
-    /// the first index argument whose scalar value fails strict number
-    /// coercion, which is exactly the error the validated path returns before
-    /// `eval`. `Ok(None)`: every index argument coerces. `Err(())`: an index
-    /// argument outside this mirror (range, array, callable, or an evaluation
-    /// error that validation carries into `eval`); the caller declines.
-    fn index_coercion_error<'a, 'b>(
+    /// Predicts what `validated_dispatch` does with the index arguments
+    /// (`args[1..]`) before it resolves the base range, reading the slot
+    /// schema from `function.arg_schema()` through the helpers
+    /// `validate_and_prepare` itself uses, so the two cannot diverge.
+    ///
+    /// - `ValidationError`: the first index argument whose scalar fails its
+    ///   slot's coercion; validation returns it early. An evaluation error
+    ///   (`value()` returning `Err`) in an earlier slot does not stop
+    ///   validation (it is stored as data), so a later coercion error wins.
+    /// - `EvalError`: validation passes, and `eval`'s `reference_from_base`
+    ///   returns this error (the first index argument, in order, whose
+    ///   `value()` is `Err` or whose scalar fails strict number coercion)
+    ///   before it resolves the base.
+    /// - `Proceed`: every index argument is a scalar that `eval` accepts.
+    /// - `Decline`: anything outside this mirror (range, array or callable
+    ///   index arguments, cancellation, arity outside 2..=3, or a schema whose
+    ///   base or index slots validation could treat differently).
+    fn index_argument_outcome<'a, 'b>(
+        function: &dyn Function,
         args: &[ArgumentHandle<'a, 'b>],
-    ) -> Result<Option<ExcelError>, ()> {
-        if !(2..=3).contains(&args.len()) {
-            return Err(());
+    ) -> IndexArgumentOutcome {
+        use crate::args::{coerce_scalar_slot, schema_slot};
+        if !(2..=3).contains(&args.len()) || args.len() < function.min_args() {
+            return IndexArgumentOutcome::Decline;
         }
-        for arg in &args[1..] {
+        // An empty schema makes `validate_and_prepare` return after the arity
+        // check, so no slot is coerced.
+        let schema = function.arg_schema();
+        if !schema.is_empty() {
+            // The base slot must be one validation never fails on.
+            let Some(base_spec) = schema_slot(schema, 0) else {
+                return IndexArgumentOutcome::Decline;
+            };
+            if base_spec.by_ref
+                || base_spec.shape == ShapeKind::Scalar
+                || matches!(base_spec.coercion, CoercionPolicy::Criteria)
+            {
+                return IndexArgumentOutcome::Decline;
+            }
+        }
+        let mut eval_error = None;
+        for (idx, arg) in args.iter().enumerate().skip(1) {
+            let policy = if schema.is_empty() {
+                CoercionPolicy::None
+            } else {
+                let Some(spec) = schema_slot(schema, idx) else {
+                    return IndexArgumentOutcome::Decline;
+                };
+                if spec.by_ref
+                    || spec.shape != ShapeKind::Scalar
+                    || matches!(spec.coercion, CoercionPolicy::Criteria)
+                {
+                    return IndexArgumentOutcome::Decline;
+                }
+                spec.coercion
+            };
             let scalar = match arg.value() {
                 Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(_)))
                 | Ok(crate::traits::CalcValue::Range(_))
-                | Ok(crate::traits::CalcValue::Callable(_))
-                | Err(_) => return Err(()),
+                | Ok(crate::traits::CalcValue::Callable(_)) => {
+                    return IndexArgumentOutcome::Decline;
+                }
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => {
+                    return IndexArgumentOutcome::Decline;
+                }
+                Err(error) => {
+                    // Validation stores this as data and keeps going; `eval`
+                    // returns it unless an earlier slot already failed.
+                    eval_error.get_or_insert(error);
+                    continue;
+                }
                 Ok(crate::traits::CalcValue::Scalar(value))
                 | Ok(crate::traits::CalcValue::AnnotatedScalar(value, _)) => value,
             };
-            if let Err(error) = crate::coercion::to_number_strict(&scalar) {
-                return Ok(Some(error));
+            if let Err(error) = coerce_scalar_slot(&scalar, policy) {
+                return IndexArgumentOutcome::ValidationError(error);
+            }
+            if eval_error.is_none() {
+                // `eval` reads the index strictly (`index_argument`),
+                // whatever the slot policy.
+                if let Err(error) = crate::coercion::to_number_strict(&scalar) {
+                    eval_error = Some(error);
+                }
             }
         }
-        Ok(None)
+        match eval_error {
+            Some(error) => IndexArgumentOutcome::EvalError(error),
+            None => IndexArgumentOutcome::Proceed,
+        }
     }
 
-    fn validated_dispatch<'a, 'b>(
+    /// The validated fallback: `validate_and_prepare`, then `eval`, then the
+    /// format policy. `pub(crate)` so tests can compare it with
+    /// `precise_dispatch`.
+    pub(crate) fn validated_dispatch<'a, 'b>(
         &self,
         args: &[ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
