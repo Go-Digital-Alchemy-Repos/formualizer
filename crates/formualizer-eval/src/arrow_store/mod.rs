@@ -1992,7 +1992,9 @@ impl OverlayFragment {
 }
 #[derive(Debug, Default, Clone)]
 pub struct Overlay {
-    points: HashMap<usize, OverlayValue>,
+    // Ordered by offset so range questions visit only the points inside the range
+    // (GOD-377: a HashMap forced every range read to scan every point in the chunk).
+    points: BTreeMap<usize, OverlayValue>,
     format_points: HashMap<usize, FormatId>,
     fragments: Vec<OverlayFragment>,
     // Deterministic (and intentionally approximate) accounting of overlay memory.
@@ -2008,7 +2010,7 @@ impl Overlay {
 
     pub fn new() -> Self {
         Self {
-            points: HashMap::new(),
+            points: BTreeMap::new(),
             format_points: HashMap::new(),
             fragments: Vec::new(),
             estimated_bytes: 0,
@@ -2120,12 +2122,8 @@ impl Overlay {
             }
             OverlayFragment::DenseRange { .. } | OverlayFragment::RunRange { .. } => {
                 if let Some(range) = fragment.interval_coverage() {
-                    let keys: Vec<_> = self
-                        .points
-                        .keys()
-                        .copied()
-                        .filter(|off| range.contains(off))
-                        .collect();
+                    let keys: Vec<_> =
+                        self.points_in_range(range).map(|(off, _)| *off).collect();
                     for off in keys {
                         if let Some(old) = self.points.remove(&off) {
                             removed = removed.saturating_add(Self::point_estimate(&old));
@@ -2210,10 +2208,8 @@ impl Overlay {
 
         let mut delta = 0isize;
         let removed_points: Vec<_> = self
-            .points
-            .keys()
-            .copied()
-            .filter(|off| range.contains(off))
+            .points_in_range(range.clone())
+            .map(|(off, _)| *off)
             .collect();
         for off in removed_points {
             if let Some(old) = self.points.remove(&off) {
@@ -2280,7 +2276,7 @@ impl Overlay {
 
     #[inline]
     pub(crate) fn has_any_in_range(&self, range: core::ops::Range<usize>) -> bool {
-        self.points.keys().any(|k| range.contains(k))
+        self.points_in_range(range.clone()).next().is_some()
             || self
                 .fragments
                 .iter()
@@ -2300,10 +2296,8 @@ impl Overlay {
                 let _ = out.apply_fragment(sliced);
             }
         }
-        for (k, v) in self.points.iter() {
-            if *k >= off && *k < end {
-                let _ = out.set_scalar(*k - off, v.clone());
-            }
+        for (k, v) in self.points_in_range(off..end) {
+            let _ = out.set_scalar(*k - off, v.clone());
         }
         for (k, format) in &self.format_points {
             if *k >= off && *k < end {
@@ -2328,8 +2322,23 @@ impl Overlay {
     }
 
     /// Iterate over physical point entries only.
+    #[cfg(test)]
     pub(crate) fn iter_points(&self) -> impl Iterator<Item = (&usize, &OverlayValue)> {
         self.points.iter()
+    }
+
+    /// Iterate, in offset order, over physical point entries whose offset lies in
+    /// `[range.start, range.end)`. Cost is O(log points + points in range); an empty
+    /// or inverted range yields nothing (matching `Range::contains`).
+    pub(crate) fn points_in_range(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> std::collections::btree_map::Range<'_, usize, OverlayValue> {
+        if range.start < range.end {
+            self.points.range(range)
+        } else {
+            self.points.range(0..0)
+        }
     }
 }
 
@@ -3188,11 +3197,9 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
             payload.number_at(idx)
         });
-        for (off, value) in layer.iter_points() {
-            if range.contains(off) {
-                slots.set(*off - range.start, value.numeric_lane_value());
-                record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
-            }
+        for (off, value) in layer.points_in_range(range.clone()) {
+            slots.set(*off - range.start, value.numeric_lane_value());
+            record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
         }
     }
 
@@ -3204,11 +3211,9 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
             payload.boolean_at(idx)
         });
-        for (off, value) in layer.iter_points() {
-            if range.contains(off) {
-                slots.set(*off - range.start, value.boolean_lane_value());
-                record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
-            }
+        for (off, value) in layer.points_in_range(range.clone()) {
+            slots.set(*off - range.start, value.boolean_lane_value());
+            record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
         }
     }
 
@@ -3220,14 +3225,12 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
             payload.text_at(idx).map(ToString::to_string)
         });
-        for (off, value) in layer.iter_points() {
-            if range.contains(off) {
-                slots.set(
-                    *off - range.start,
-                    value.text_lane_value().map(ToString::to_string),
-                );
-                record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
-            }
+        for (off, value) in layer.points_in_range(range.clone()) {
+            slots.set(
+                *off - range.start,
+                value.text_lane_value().map(ToString::to_string),
+            );
+            record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
         }
     }
 
@@ -3239,11 +3242,9 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
             payload.error_at(idx)
         });
-        for (off, value) in layer.iter_points() {
-            if range.contains(off) {
-                slots.set(*off - range.start, value.error_lane_value());
-                record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
-            }
+        for (off, value) in layer.points_in_range(range.clone()) {
+            slots.set(*off - range.start, value.error_lane_value());
+            record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
         }
     }
 
@@ -3255,11 +3256,9 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
             payload.type_tag_at(idx).map(|tag| tag as u8)
         });
-        for (off, value) in layer.iter_points() {
-            if range.contains(off) {
-                slots.set(*off - range.start, Some(value.type_tag() as u8));
-                record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
-            }
+        for (off, value) in layer.points_in_range(range.clone()) {
+            slots.set(*off - range.start, Some(value.type_tag() as u8));
+            record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
         }
     }
 
@@ -3269,11 +3268,9 @@ impl<'a> OverlayCascade<'a> {
         slots: &mut OverlaySlots<String>,
     ) {
         Self::apply_fragment_layer(layer, range.clone(), slots, Self::payload_lowered_text_at);
-        for (off, value) in layer.iter_points() {
-            if range.contains(off) {
-                slots.set(*off - range.start, value.lowered_text_value());
-                record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
-            }
+        for (off, value) in layer.points_in_range(range.clone()) {
+            slots.set(*off - range.start, value.lowered_text_value());
+            record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
         }
     }
 
@@ -3446,7 +3443,7 @@ impl Overlay {
         range: core::ops::Range<usize>,
         shape: OverlayFragmentShape,
     ) -> Option<&OverlayFragment> {
-        if range.is_empty() || self.points.keys().any(|off| range.contains(off)) {
+        if range.is_empty() || self.points_in_range(range.clone()).next().is_some() {
             return None;
         }
         let mut found = None;
@@ -6296,6 +6293,151 @@ mod tests {
         let selected = cascade.select_type_tags(0..2, &base);
         assert_eq!(selected.value(0), TypeTag::DateTime as u8);
         assert_eq!(selected.value(1), TypeTag::Duration as u8);
+    }
+
+    #[test]
+    fn overlay_sparse_point_range_queries_use_half_open_bounds() {
+        let mut overlay = Overlay::new();
+        for off in [0usize, 5, 9, 10, 20, 100] {
+            overlay.set_scalar(off, OverlayValue::Number(off as f64));
+        }
+        let offsets = |range: core::ops::Range<usize>| -> Vec<usize> {
+            overlay.points_in_range(range).map(|(off, _)| *off).collect()
+        };
+
+        assert_eq!(offsets(5..10), vec![5, 9], "start inclusive, end exclusive");
+        assert_eq!(offsets(0..1), vec![0]);
+        assert_eq!(offsets(100..101), vec![100]);
+        assert_eq!(offsets(0..usize::MAX), vec![0, 5, 9, 10, 20, 100]);
+        assert!(offsets(0..0).is_empty(), "empty range");
+        assert!(offsets(10..10).is_empty(), "empty range on a stored point");
+        assert!(offsets(11..5).is_empty(), "inverted range");
+        assert!(offsets(21..100).is_empty(), "gap between points");
+        assert!(offsets(101..200).is_empty(), "past the last point");
+
+        assert!(!overlay.has_any_in_range(1..5));
+        assert!(overlay.has_any_in_range(1..6));
+        assert!(overlay.has_any_in_range(10..11));
+        assert!(!overlay.has_any_in_range(11..20));
+        assert!(!overlay.has_any_in_range(5..5));
+        assert!(!overlay.has_any_in_range(9..5));
+        assert!(!overlay.has_any_in_range(101..usize::MAX));
+
+        let sliced = overlay.slice(5, 5);
+        assert_eq!(
+            sliced.iter().collect::<Vec<_>>(),
+            vec![
+                (0, OverlayValue::Number(5.0)),
+                (4, OverlayValue::Number(9.0)),
+            ]
+        );
+        assert!(overlay.slice(21, 79).is_empty());
+        assert_eq!(sliced.estimated_bytes(), sliced.debug_recomputed_estimated_bytes());
+    }
+
+    #[test]
+    fn overlay_sparse_point_ranges_keep_fragment_and_layer_precedence() {
+        let mut computed = Overlay::new();
+        computed.apply_fragment(
+            OverlayFragment::dense_range(
+                0,
+                (1..=4)
+                    .map(|v| OverlayValue::Number(v as f64))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        computed.set_scalar(4, OverlayValue::Number(40.0));
+        computed.set_scalar(10, OverlayValue::Number(10.5));
+        computed.set_scalar(11, OverlayValue::Number(11.5));
+        computed.set_scalar(12, OverlayValue::Number(12.5));
+        let div = map_error_code(ExcelErrorKind::Div);
+        computed.set_scalar(13, OverlayValue::Error(div));
+        computed.set_scalar(14, OverlayValue::Text(Arc::from("t")));
+        let mut user = Overlay::new();
+        user.set(2, OverlayValue::Number(99.0));
+        user.set(11, OverlayValue::Number(-1.0));
+
+        // A point just past the fragment's end does not block the direct dense path;
+        // a point inside the range does.
+        assert!(computed.full_cover_dense_fragment(0..4).is_some());
+        assert!(computed.full_cover_dense_fragment(1..4).is_some());
+        assert!(computed.full_cover_dense_fragment(0..5).is_none());
+        assert!(computed.full_cover_dense_fragment(4..4).is_none());
+
+        let cascade = OverlayCascade::new(&user, &computed);
+        let base = Float64Array::from((0..16).map(|i| 100.0 + i as f64).collect::<Vec<_>>());
+        let numbers = cascade.select_numbers(0..16, &base);
+        let expected: Vec<Option<f64>> = vec![
+            Some(1.0),
+            Some(2.0),
+            Some(99.0),
+            Some(4.0),
+            Some(40.0),
+            Some(105.0),
+            Some(106.0),
+            Some(107.0),
+            Some(108.0),
+            Some(109.0),
+            Some(10.5),
+            Some(-1.0),
+            Some(12.5),
+            None,
+            None,
+            Some(115.0),
+        ];
+        let got: Vec<Option<f64>> = (0..16)
+            .map(|i| (!numbers.is_null(i)).then(|| numbers.value(i)))
+            .collect();
+        assert_eq!(got, expected);
+
+        // A window whose exclusive end sits on a stored point must not apply it.
+        let window_base = Float64Array::from(vec![210.0, 211.0, 212.0]);
+        let window = cascade.select_numbers(10..13, &window_base);
+        assert_eq!(window.value(0), 10.5);
+        assert_eq!(window.value(1), -1.0);
+        assert_eq!(window.value(2), 12.5);
+        let gap_base = Float64Array::from(vec![5.0, 6.0, 7.0, 8.0, 9.0]);
+        let gap = cascade.select_numbers(5..10, &gap_base);
+        assert_eq!(
+            gap.iter().collect::<Vec<_>>(),
+            gap_base.iter().collect::<Vec<_>>(),
+            "no points in range -> base"
+        );
+
+        let err_base = UInt8Array::from(vec![0u8; 4]);
+        let errors = cascade.select_errors(11..15, &err_base);
+        assert!(errors.is_null(0));
+        assert!(errors.is_null(1));
+        assert_eq!(errors.value(2), div);
+        assert!(errors.is_null(3));
+
+        let tag_base = UInt8Array::from(vec![TypeTag::Empty as u8; 3]);
+        let tags = cascade.select_type_tags(12..15, &tag_base);
+        assert_eq!(tags.value(0), TypeTag::Number as u8);
+        assert_eq!(tags.value(1), TypeTag::Error as u8);
+        assert_eq!(tags.value(2), TypeTag::Text as u8);
+
+        // Range removals and fragment writes drop only the points inside their ranges.
+        let mut removed = computed.clone();
+        removed.remove_range(10..13);
+        assert_eq!(
+            removed.points_in_range(0..usize::MAX).map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![4, 13, 14]
+        );
+        assert_eq!(removed.estimated_bytes(), removed.debug_recomputed_estimated_bytes());
+
+        let mut covered = computed.clone();
+        covered.apply_fragment(
+            OverlayFragment::dense_range(12, vec![OverlayValue::Number(0.0); 2]).unwrap(),
+        );
+        assert_eq!(
+            covered.points_in_range(0..usize::MAX).map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![4, 10, 11, 14]
+        );
+        assert_eq!(covered.get(13), Some(OverlayValue::Number(0.0)));
+        assert_eq!(covered.estimated_bytes(), covered.debug_recomputed_estimated_bytes());
+        assert!(covered.debug_is_normalized());
     }
 
     #[test]
