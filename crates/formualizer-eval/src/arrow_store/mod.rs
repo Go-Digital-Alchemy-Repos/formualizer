@@ -6295,6 +6295,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)] // inverted ranges are asserted on purpose
     fn overlay_sparse_point_range_queries_use_half_open_bounds() {
         let mut overlay = Overlay::new();
         for off in [0usize, 5, 9, 10, 20, 100] {
