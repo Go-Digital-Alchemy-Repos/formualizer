@@ -645,6 +645,13 @@ pub(crate) struct FormulaSpanDemotionReport {
     pub(crate) placements_materialized: usize,
 }
 
+/// A demand walk's result: the vertices to evaluate, their virtual
+/// dependencies and (OT-291) the saved-extent ordering hints it recorded.
+type DemandSubgraphWithHints = (
+    Vec<VertexId>,
+    FxHashMap<VertexId, Vec<VertexId>>,
+    FxHashMap<VertexId, Vec<VertexId>>,
+);
 type PlannedFormulaMaterialize = BTreeMap<String, Vec<(u32, u32, AstNodeId, DependencyPlanRow)>>;
 type CompressedReplayBatch = (
     FormulaIngestBatch,
@@ -1441,6 +1448,36 @@ pub(crate) mod edge_hash_test_hook {
 
     pub(crate) fn take() -> Vec<super::EdgeHashSummary> {
         SUMMARIES.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+}
+
+/// OT-291 test hook: what each `schedule_with_order_hints` call did with its
+/// saved-extent ordering hints, recorded on the calling thread.
+#[cfg(test)]
+pub(crate) mod order_hint_test_hook {
+    use crate::engine::vertex::VertexId;
+    use std::cell::RefCell;
+
+    /// One schedule build: the hint edges `(reader, producer)` offered, the
+    /// ones the returned schedule honours, and whether the returned schedule
+    /// still reports cycles (those are then made of real edges only).
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct HintBuild {
+        pub offered: Vec<(VertexId, VertexId)>,
+        pub applied: Vec<(VertexId, VertexId)>,
+        pub cycles_in_result: usize,
+    }
+
+    thread_local! {
+        static BUILDS: RefCell<Vec<HintBuild>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn push(build: HintBuild) {
+        BUILDS.with(|v| v.borrow_mut().push(build));
+    }
+
+    pub(crate) fn take() -> Vec<HintBuild> {
+        BUILDS.with(|v| std::mem::take(&mut *v.borrow_mut()))
     }
 }
 
@@ -27515,8 +27552,7 @@ where
         let use_virtual = !sched_vdeps.is_empty();
 
         let order_hints = builder.take_order_hints();
-        let (schedule, applied_hints) = if let Some((sched_vertices, sched_vdeps)) =
-            relay.as_ref()
+        let (schedule, applied_hints) = if let Some((sched_vertices, sched_vdeps)) = relay.as_ref()
         {
             self.schedule_with_order_hints(
                 sched_vertices,
@@ -27569,7 +27605,13 @@ where
         base: &FxHashMap<VertexId, Vec<VertexId>>,
         synthetic_base: Option<VertexId>,
         hints: &FxHashMap<VertexId, Vec<VertexId>>,
-    ) -> Result<(crate::engine::scheduler::Schedule, Vec<(VertexId, VertexId)>), ExcelError> {
+    ) -> Result<
+        (
+            crate::engine::scheduler::Schedule,
+            Vec<(VertexId, VertexId)>,
+        ),
+        ExcelError,
+    > {
         let scheduler = Scheduler::new(&self.graph);
         let run = |map: &FxHashMap<VertexId, Vec<VertexId>>| match synthetic_base {
             Some(synthetic) => {
@@ -27601,15 +27643,24 @@ where
         }
         extra.sort_unstable();
         extra.dedup();
-        loop {
+        #[cfg(test)]
+        let offered = extra.clone();
+        let (schedule, extra) = loop {
             let mut merged = base.clone();
             for &(reader, producer) in &extra {
                 merged.entry(reader).or_default().push(producer);
             }
             let schedule = run(&merged)?;
             if schedule.cycles.is_empty() {
-                return Ok((schedule, extra));
+                break (schedule, extra);
             }
+            // A hint whose reader and producer share a strongly connected
+            // component is (part of) what closes it: the saved extent is
+            // stale or self-referential. Drop every such hint, so the anchor
+            // falls back to the pre-OT-291 admit-and-replan for those readers
+            // and the cycle-error stamping never sees a hint edge. Removing
+            // edges can only split components, so this terminates, and a
+            // component with no hint edge inside it is a component of `base`.
             let mut cycle_of: FxHashMap<VertexId, usize> = FxHashMap::default();
             for (index, cycle) in schedule.cycles.iter().enumerate() {
                 for &vertex in cycle {
@@ -27618,16 +27669,23 @@ where
             }
             let before = extra.len();
             extra.retain(|(reader, producer)| {
-                cycle_of.get(reader).is_none() || cycle_of.get(reader) != cycle_of.get(producer)
+                !cycle_of.contains_key(reader) || cycle_of.get(reader) != cycle_of.get(producer)
             });
             if extra.len() == before {
                 // Every remaining cycle is made of real edges.
-                return Ok((schedule, extra));
+                break (schedule, extra);
             }
             if extra.is_empty() {
-                return Ok((run(base)?, extra));
+                break (run(base)?, extra);
             }
-        }
+        };
+        #[cfg(test)]
+        order_hint_test_hook::push(order_hint_test_hook::HintBuild {
+            offered,
+            applied: extra.clone(),
+            cycles_in_result: schedule.cycles.len(),
+        });
+        Ok((schedule, extra))
     }
 
     fn can_use_static_schedule_cache(&self, to_evaluate: &[VertexId]) -> bool {
@@ -27906,11 +27964,7 @@ where
     fn build_demand_subgraph_with_hints(
         &self,
         target_vertices: &[VertexId],
-    ) -> (
-        Vec<VertexId>,
-        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
-        rustc_hash::FxHashMap<VertexId, Vec<VertexId>>,
-    ) {
+    ) -> DemandSubgraphWithHints {
         let builder = VirtualDepBuilder::new(self);
         let (vertices, vdeps) = self.build_demand_subgraph_with(target_vertices, &builder);
         (vertices, vdeps, builder.take_order_hints())

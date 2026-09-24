@@ -1098,6 +1098,15 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
     /// them again would bypass the region-node relay. Every build over the
     /// same builder sees the same graph and dirty flags, so a later record
     /// for `v` is identical to an earlier one.
+    ///
+    /// The hint is kept after the anchor has committed a spill, including
+    /// one smaller than the saved extent: the saved extent stays part of the
+    /// anchor's invalidation footprint (`planning_extent` in
+    /// `DependencyGraph::collect_output_dependents`, reached from every
+    /// commit through the anchor cell), so each commit still invalidates the
+    /// readers inside it. Dropping their ordering would let them run first
+    /// and be re-run by the replan, which is the OT-291 double fire in a
+    /// persisted session (see `saved_extent_hint_persists_after_commit_*`).
     fn record_soft_producers(&self, v: VertexId, memo: &AnchorRegionMemo) -> Vec<VertexId> {
         let soft = RangeVirtualDepProvider::get_soft_producers_memoized(self.engine, v, memo);
         let hints: Vec<VertexId> = soft
