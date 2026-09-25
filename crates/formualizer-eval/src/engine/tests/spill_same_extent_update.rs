@@ -14,7 +14,6 @@ use crate::engine::{
     EvalConfig, EvalStats,
 };
 use crate::function::{FnCaps, Function};
-use crate::function_registry;
 use crate::test_workbook::TestWorkbook;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
@@ -126,8 +125,11 @@ fn base_config() -> EvalConfig {
 }
 
 fn engine_with(cfg: EvalConfig, t: Toggles) -> E {
-    function_registry::register_function(Arc::new(RectFn));
-    let mut engine = Engine::new(TestWorkbook::new(), cfg);
+    // Workbook-scoped, not `register_function`: every global registration
+    // moves the registry's semantic epoch and retires the banked chain of
+    // every engine in the test binary, which made chain tests elsewhere flaky.
+    let workbook = TestWorkbook::new().with_function(Arc::new(RectFn));
+    let mut engine = Engine::new(workbook, cfg);
     engine.spill_same_extent_update = t.same_extent;
     engine.spill_pending_by_position = t.by_position;
     engine
@@ -256,7 +258,8 @@ fn assert_same_grids_within(
             for (step, ((g_off, _), (g, _))) in baseline.iter().zip(got.iter()).enumerate() {
                 for (i, (o, n)) in g_off.iter().zip(g.iter()).enumerate() {
                     if tolerant_idx.contains(&i)
-                        && let (Some(LiteralValue::Number(o)), Some(LiteralValue::Number(n))) = (o, n)
+                        && let (Some(LiteralValue::Number(o)), Some(LiteralValue::Number(n))) =
+                            (o, n)
                     {
                         assert!(
                             (o - n).abs() <= tol,
@@ -290,7 +293,10 @@ fn identical_recommit_into_phantom_scc_replans_only_with_toggles_off() {
     let all = assert_same_grids(&cfg, workbook, steps);
 
     let off = &stats_for(&all, OFF)[1];
-    assert!(off.replan_iterations >= 1, "toggles off must replan: {off:?}");
+    assert!(
+        off.replan_iterations >= 1,
+        "toggles off must replan: {off:?}"
+    );
     assert!(off.token_scc_blocked() > 0, "{off:?}");
     assert!(off.pass_pending_at_drain[0] > 0, "{off:?}");
     assert_eq!(off.spill_commit_same_footprint, 1, "{off:?}");
@@ -302,7 +308,10 @@ fn identical_recommit_into_phantom_scc_replans_only_with_toggles_off() {
         for s in &stats_for(&all, t)[1..] {
             assert_eq!(s.replan_iterations, 0, "{t:?}: {s:?}");
             assert_eq!(s.token_scc_blocked(), 0, "{t:?}: {s:?}");
-            assert!(s.pass_pending_at_drain.iter().all(|&n| n == 0), "{t:?}: {s:?}");
+            assert!(
+                s.pass_pending_at_drain.iter().all(|&n| n == 0),
+                "{t:?}: {s:?}"
+            );
             assert_eq!(s.spill_same_extent_updates, 1, "{t:?}: {s:?}");
             assert_eq!(s.spill_same_extent_empty_diffs, 1, "{t:?}: {s:?}");
             assert_eq!(s.spill_commit_identical, 1, "{t:?}: {s:?}");
@@ -321,13 +330,13 @@ fn identical_recommit_into_phantom_scc_replans_only_with_toggles_off() {
 fn same_extent_values_change_updates_only_changed_readers() {
     let cfg = base_config();
     let steps: &[Step] = &[
-        |e| value(e, 3, 1, 8.0),               // a: D1 changes
-        |e| value(e, 4, 1, 1.0),               // b: C1 (anchor cell) changes
+        |e| value(e, 3, 1, 8.0), // a: D1 changes
+        |e| value(e, 4, 1, 1.0), // b: C1 (anchor cell) changes
         |e| {
-            value(e, 3, 1, 11.0);              // both change together
+            value(e, 3, 1, 11.0); // both change together
             value(e, 4, 1, 12.0);
         },
-        |e| value(e, 5, 1, 3.0),               // identical again
+        |e| value(e, 5, 1, 3.0), // identical again
     ];
     let all = assert_same_grids(&cfg, workbook, steps);
 
@@ -497,9 +506,11 @@ fn undo_after_noop_and_values_only_commit_matches_toggles_off() {
                 log.events()
                     .iter()
                     .filter_map(|e| match e {
-                        ChangeEvent::SpillCommitted { old, .. } => {
-                            Some(if old.is_some() { "commit_old" } else { "commit_new" })
-                        }
+                        ChangeEvent::SpillCommitted { old, .. } => Some(if old.is_some() {
+                            "commit_old"
+                        } else {
+                            "commit_new"
+                        }),
                         ChangeEvent::SpillCleared { .. } => Some("cleared"),
                         _ => None,
                     })
@@ -536,11 +547,14 @@ fn undo_after_noop_and_values_only_commit_matches_toggles_off() {
     for (i, g) in off.iter().enumerate() {
         let spill_idx = |r: u32, c: u32| ((r - 1) * GRID_COLS + (c - 1)) as usize;
         for (r, c) in [(1u32, 3u32), (1, 4), (2, 3), (2, 4), (3, 3), (3, 4)] {
-            assert_eq!(g.0[spill_idx(r, c)], g.2[spill_idx(r, c)], "edit {i} r{r}c{c}");
+            assert_eq!(
+                g.0[spill_idx(r, c)],
+                g.2[spill_idx(r, c)],
+                "edit {i} r{r}c{c}"
+            );
         }
     }
 }
-
 
 // (8) T3 gate: a pass whose schedule holds no registered spill anchor installs
 // no position map, so a first-time spill (anchor not yet registered) keeps

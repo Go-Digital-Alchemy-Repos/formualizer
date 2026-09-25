@@ -12,7 +12,6 @@
 
 use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, Engine, EvalConfig, EvalStats};
 use crate::function::{FnCaps, Function};
-use crate::function_registry;
 use crate::test_workbook::TestWorkbook;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
@@ -77,14 +76,17 @@ impl Function for Rect3x2 {
 }
 
 fn engine(by_position: bool) -> E {
-    function_registry::register_function(Arc::new(Rect3x2));
     let mut cfg = EvalConfig::default().with_cycle(CycleConfig {
         detection: CycleDetection::Runtime,
         policy: CyclePolicy::Error,
     });
     cfg.speculative_chain = true;
     cfg.enable_parallel = false;
-    let mut engine = Engine::new(TestWorkbook::new(), cfg);
+    // Workbook-scoped, not `register_function`: a global registration moves
+    // the registry's semantic epoch, which retires the banked chain of every
+    // engine in the test binary (`observe_function_semantic_epoch`).
+    let workbook = TestWorkbook::new().with_function(Arc::new(Rect3x2));
+    let mut engine = Engine::new(workbook, cfg);
     engine.spill_same_extent_update = true;
     engine.spill_pending_by_position = by_position;
     engine
@@ -130,12 +132,29 @@ fn grid(engine: &E) -> Vec<Option<LiteralValue>> {
     out
 }
 
+type Steps = Vec<(Vec<Option<LiteralValue>>, EvalStats, &'static str)>;
+
+/// `run_once`, repeated when the process-global function registry moved
+/// during the attempt. Another test's `register_function` moves the semantic
+/// epoch, and `observe_function_semantic_epoch` then drops this engine's
+/// banked chain, so a step takes the exact path ("no_chain") for a reason
+/// that has nothing to do with the toggles under test (see `spec_chain.rs`,
+/// `chain_sequence`, and `write_noops_volatile.rs`). An attempt whose epoch
+/// did not move is returned as is, so no assertion is weakened.
+fn run(by_position: bool, reverse: bool) -> Steps {
+    for _ in 0..5 {
+        let epoch = crate::function_registry::semantic_epoch();
+        let steps = run_once(by_position, reverse);
+        if crate::function_registry::semantic_epoch() == epoch {
+            return steps;
+        }
+    }
+    panic!("the global function registry moved during all 5 attempts");
+}
+
 /// Build, settle, bank the chain, then edit A1 once per step and
 /// evaluate. `reverse` corrupts the banked order before each walk.
-fn run(
-    by_position: bool,
-    reverse: bool,
-) -> Vec<(Vec<Option<LiteralValue>>, EvalStats, &'static str)> {
+fn run_once(by_position: bool, reverse: bool) -> Steps {
     let mut e = engine(by_position);
     workbook(&mut e);
     e.evaluate_all().unwrap();
