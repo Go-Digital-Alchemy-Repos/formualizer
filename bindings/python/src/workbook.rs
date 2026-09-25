@@ -1139,6 +1139,24 @@ impl PyWorkbook {
         Ok(self.read_inner()?.engine().dirty_propagation_visits())
     }
 
+    /// GOD-383 Trial A T2b write-path toggles and their cumulative counters:
+    /// `clear_volatile_on_value` / `write_noops` (the `FZ_CLEAR_VOLATILE_ON_VALUE`
+    /// and `FZ_WRITE_NOOPS` readings at engine construction) and
+    /// `volatile_cleared_on_value`, `set_formula_noops`, `empty_write_noops`.
+    pub fn write_toggle_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let wb = self.read_inner()?;
+        let engine = wb.engine();
+        let (clear_volatile, write_noops) = engine.write_toggles();
+        let (cleared, formula_noops, empty_noops) = engine.write_toggle_counters();
+        let dict = PyDict::new(py);
+        dict.set_item("clear_volatile_on_value", clear_volatile)?;
+        dict.set_item("write_noops", write_noops)?;
+        dict.set_item("volatile_cleared_on_value", cleared)?;
+        dict.set_item("set_formula_noops", formula_noops)?;
+        dict.set_item("empty_write_noops", empty_noops)?;
+        Ok(dict)
+    }
+
     /// Turn the calculation chain on or off on the live engine.
     ///
     /// Turning it off drops any banked chain with it. Turning it on banks

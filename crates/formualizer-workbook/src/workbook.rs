@@ -2224,6 +2224,25 @@ impl Workbook {
         col: u32,
         formula: &str,
     ) -> Result<(), IoError> {
+        // GOD-383 Trial A T2b (`FZ_WRITE_NOOPS=1`, off by default): the
+        // logged path goes through the vertex editor and would bypass the
+        // engine's identical-formula no-op, so check it here. The unlogged
+        // paths reach the same check inside `Engine::set_cell_formula`. A
+        // parse error is left to the full path below.
+        if self.enable_changelog && self.engine.write_toggles().1 {
+            let with_eq = if formula.starts_with('=') {
+                formula.to_string()
+            } else {
+                format!("={formula}")
+            };
+            if let Ok(ast) = formualizer_parse::parser::parse(&with_eq)
+                && self
+                    .engine
+                    .is_unchanged_formula_write(sheet, row, col, &ast)
+            {
+                return Ok(());
+            }
+        }
         self.ensure_arrow_sheet_capacity(sheet, row as usize, col as usize);
         let staged_before = self
             .enable_changelog

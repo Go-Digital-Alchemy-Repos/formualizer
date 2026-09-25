@@ -72,6 +72,7 @@ mod transactions;
 mod vertex_lifecycle;
 mod virtual_region_nodes;
 mod volatile_rng;
+mod write_noops_volatile;
 
 mod engine_action_api_614;
 mod engine_action_rollback_615;
