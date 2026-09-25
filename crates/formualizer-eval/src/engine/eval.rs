@@ -26909,6 +26909,15 @@ where
     /// settled a cycle unit, since a read-guard fallback carries clause (f)'s
     /// double-settle hazard exactly like the spill and demotion ones.
     fn try_spec_chain_evaluate(&mut self) -> Result<Option<EvalResult>, ExcelError> {
+        // GOD-383 T4: the walk may install chain positions (toggle B); retire
+        // them at every exit, error and fallback alike, so no commit outside
+        // the walk (the exact path, a logged edit) consults them.
+        let result = self.try_spec_chain_evaluate_inner();
+        self.pass_positions = None;
+        result
+    }
+
+    fn try_spec_chain_evaluate_inner(&mut self) -> Result<Option<EvalResult>, ExcelError> {
         // A walk that ended on an `Err` (cancellation, a resource budget, an
         // evaluation error) unwinds without reaching its own cleanup, so the
         // guard is retired here rather than only at the walk's exits.
@@ -27010,8 +27019,12 @@ where
             // One guard per round, over this round's pending set: a demoted
             // vertex is counted again by the round that will evaluate it.
             self.install_chain_read_guard(&pending, &schedule);
+            // GOD-383 T4: toggle B on the chain walk (reinstalled per round,
+            // because each round walks a different pending set from unit 0).
+            self.chain_positions_install(&schedule, &pending);
             for (unit_index, &unit) in schedule.units.iter().enumerate() {
                 self.cancellation_checkpoint("Evaluation cancelled during chain walk")?;
+                self.pass_positions_enter(unit_index);
                 match unit {
                     ScheduleUnit::Cycle(index) => {
                         let cycle_members = schedule.unit_cycle(index);
@@ -33701,6 +33714,68 @@ where
                     for &v in schedule.unit_cycle(i) {
                         map.insert(v, position);
                     }
+                }
+            }
+        }
+        self.pass_positions = Some(PassPositions { map, current: 0 });
+    }
+
+    /// GOD-383 T4: toggle B on the speculative-chain walk. Records, for the
+    /// round about to be walked, the banked unit index of every vertex the
+    /// round will evaluate (`pending`: the walk skips every other vertex).
+    /// Gated like `pass_positions_install` (T3): no map unless the round's
+    /// walk set holds a registered spill anchor.
+    ///
+    /// Invariant: a closure vertex is left un-pended only if it is guaranteed
+    /// to be evaluated after the commit, either later in this walk or by the
+    /// exact path after a fallback.
+    /// - Un-pended means (`pending_by_position`): in this round's walk set,
+    ///   at a banked unit strictly after the anchor's, not dynamic, and not
+    ///   downstream (within the closure) of a pended vertex or of the anchor
+    ///   through a pended vertex. Closure vertices outside the walk set
+    ///   (dirtied by the commit itself, members of skipped cycle units,
+    ///   non-chain vertices) have no position and are pended.
+    /// - Walk completes the round: the walk visits every walk-set vertex at
+    ///   its banked unit, so the un-pended vertex is evaluated after the
+    ///   anchor's unit and reads the committed values; only then does the
+    ///   round clear dirty flags. Any pended vertex left in
+    ///   `pending_output_invalidations` makes the round take the spill
+    ///   fallback, which re-dirties exactly the pended set; un-pended
+    ///   vertices are downstream of none of them, so their walked values
+    ///   stand when the exact path re-settles the pended set.
+    /// - Mid-walk fallbacks (`read_guard_out_of_order*`,
+    ///   `partially_pending_cycle_unit*`), cancellation and errors return
+    ///   before the round's `clear_dirty_flags`: every walk-set vertex, and
+    ///   so every un-pended closure vertex, is still dirty, and the exact
+    ///   path evaluates it. The demotion fallback runs after the clear, but
+    ///   only when `pending_output_invalidations` was empty at the round's
+    ///   end, i.e. the un-pended vertices were walked; its residual is still
+    ///   dirty. No fallback clears a dirty flag the walk did not earn.
+    fn chain_positions_install(
+        &mut self,
+        schedule: &crate::engine::scheduler::Schedule,
+        pending: &FxHashSet<VertexId>,
+    ) {
+        if !self.spill_pending_by_position
+            || self.graph.spill_registry_counts().0 == 0
+            || !pending
+                .iter()
+                .any(|&v| self.graph.spill_registry_has_anchor(v))
+        {
+            self.pass_positions = None;
+            return;
+        }
+        let mut map: FxHashMap<VertexId, u32> =
+            FxHashMap::with_capacity_and_hasher(pending.len(), Default::default());
+        for (index, unit) in schedule.units.iter().enumerate() {
+            let position = index as u32;
+            let members: &[VertexId] = match *unit {
+                ScheduleUnit::Layer(i) => &schedule.unit_layer(i).vertices,
+                ScheduleUnit::Cycle(i) => schedule.unit_cycle(i),
+            };
+            for &v in members {
+                if pending.contains(&v) {
+                    map.entry(v).or_insert(position);
                 }
             }
         }
