@@ -495,6 +495,13 @@ pub(crate) fn env_toggle(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+/// GOD-383 Trial A T3: an engine toggle that is on by default. Unset (or any
+/// value other than `0`) = on; `0` = off (legacy behaviour). Read once per
+/// `Engine` construction like [`env_toggle`].
+pub(crate) fn env_toggle_default_on(name: &str) -> bool {
+    !matches!(std::env::var(name).as_deref(), Ok("0"))
+}
+
 /// Whether the optional full dirty-flag scan (D3) is enabled.
 pub(crate) fn dirty_scan_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

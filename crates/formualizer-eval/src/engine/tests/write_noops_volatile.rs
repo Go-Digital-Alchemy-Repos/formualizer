@@ -536,3 +536,61 @@ fn offset_indirect_rand_overwritten_then_restored() {
         volatile_kinds_scenario(true)
     );
 }
+
+// ---------------------------------------------------------------------------
+// (T3, review 3 finding 5) The logged route: a TODAY() cell overwritten
+// through the VertexEditor with a change logger (the route
+// `Workbook::set_value` takes with the changelog on) leaves the volatile set.
+// ---------------------------------------------------------------------------
+
+fn today_overwrite_logged(on: bool) -> Snap {
+    let (mut e, calls) = engine(on, frozen_config(pinned(2025, 1, 15)));
+    let cells = [(1, 1), (1, 2)];
+    formula(&mut e, 1, 1, "=TODAY()");
+    formula(&mut e, 1, 2, "=TCOUNT(A1)+1");
+    e.evaluate_all().unwrap();
+    let sheet_id = e.graph.sheet_id("Sheet1").unwrap();
+    let a1 = CellRef::new(sheet_id, Coord::from_excel(1, 1, true, true));
+    let mut log = crate::engine::ChangeLog::new();
+    e.edit_with_logger(&mut log, |editor| {
+        editor.set_cell_value(a1, LiteralValue::Number(40_000.0));
+    })
+    .unwrap();
+    e.evaluate_all().unwrap();
+    assert_eq!(num(&e, 1, 2), 40_001.0);
+    let (total, needing, _) = e.graph.volatile_refresh_census();
+    let recomputed = calls_during(&calls, || {
+        e.evaluate_all().unwrap();
+    });
+    if on {
+        assert_eq!((total, needing), (0, 0), "logged route: no stale volatile");
+        assert_eq!(recomputed, 0);
+        assert_eq!(e.write_toggle_counters().0, 1);
+    } else {
+        assert_eq!(
+            (total, needing),
+            (1, 1),
+            "legacy: stale entry needs refresh"
+        );
+        assert_eq!(recomputed, 1);
+        assert_eq!(e.write_toggle_counters().0, 0);
+    }
+    snap(&e, &cells)
+}
+
+#[test]
+fn today_formula_overwritten_through_logged_editor_leaves_volatile_set() {
+    assert_eq!(today_overwrite_logged(false), today_overwrite_logged(true));
+}
+
+/// T3: with the variable unset the volatility clear is on; FZ_WRITE_NOOPS
+/// stays off.
+#[test]
+fn write_toggles_defaults_with_env_unset() {
+    let unset = |n: &str| std::env::var(n).is_err();
+    if !unset("FZ_CLEAR_VOLATILE_ON_VALUE") || !unset("FZ_WRITE_NOOPS") {
+        return;
+    }
+    let e = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    assert_eq!(e.write_toggles(), (true, false));
+}

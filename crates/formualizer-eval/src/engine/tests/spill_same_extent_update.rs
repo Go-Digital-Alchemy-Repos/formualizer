@@ -541,3 +541,72 @@ fn undo_after_noop_and_values_only_commit_matches_toggles_off() {
     }
 }
 
+
+// (8) T3 gate: a pass whose schedule holds no registered spill anchor installs
+// no position map, so a first-time spill (anchor not yet registered) keeps
+// today's whole-closure pend and toggle B's counters stay at zero.
+#[test]
+fn first_time_spill_pends_as_today_with_position_toggle_on() {
+    for t in [B, AB] {
+        let mut engine = engine_with(base_config(), t);
+        workbook(&mut engine);
+        engine.evaluate_all().unwrap();
+        let s = engine.eval_stats().clone();
+        assert!(s.spill_commit_count >= 1, "{t:?}: {s:?}");
+        assert_eq!(s.pending_by_position_pended, 0, "{t:?}: {s:?}");
+        assert_eq!(s.pending_by_position_skipped, 0, "{t:?}: {s:?}");
+    }
+}
+
+// (9) Review 3 finding 7: an anchor inside a static SCC. The case the review
+// asked about (a pended closure vertex feeding back to the anchor, so the
+// walk through the anchor pends the whole closure) needs the anchor to spill
+// while it sits in a cycle. The engine instead stamps such an anchor #CIRC
+// and never commits its spill, whether the SCC member reads the spill (D1)
+// or only an input, and under both the error and the iterative cycle
+// policy; so toggle B never runs for it (both counters stay 0) and every
+// toggle combination yields the toggles-off grid.
+#[test]
+fn anchor_inside_static_scc_is_circ_and_position_pending_never_runs() {
+    let reads_spill: Step = |e| {
+        workbook(e);
+        // C1 names J5 on a dead branch: C1 <-> J5 is a static SCC.
+        formula(e, 1, 3, "=T2A_RECT(A1,A2,A3,A4,IF(FALSE,J5,A5))");
+        formula(e, 5, 10, "=IF(FALSE,C1,D1+1)");
+        formula(e, 5, 11, "=J5*2");
+    };
+    let reads_input: Step = |e| {
+        workbook(e);
+        formula(e, 1, 3, "=T2A_RECT(A1,A2,A3,A4,IF(FALSE,J5,A5))");
+        formula(e, 5, 10, "=IF(FALSE,C1,A5+1)");
+        formula(e, 5, 11, "=D1*2");
+    };
+    let steps: &[Step] = &[|e| value(e, 3, 1, 8.0), |e| value(e, 5, 1, 1.0)];
+    for cfg in [
+        base_config(),
+        base_config().with_cycle(CycleConfig::iterate(100, 0.001)),
+    ] {
+        for setup in [reads_spill, reads_input] {
+            let all = assert_same_grids(&cfg, setup, steps);
+            for t in ALL {
+                for s in &stats_for(&all, t)[1..] {
+                    assert!(s.scc_tasks >= 1, "{t:?}: {s:?}");
+                    assert_eq!(s.spill_commit_count, 0, "{t:?}: {s:?}");
+                    assert_eq!(s.pending_by_position_pended, 0, "{t:?}: {s:?}");
+                    assert_eq!(s.pending_by_position_skipped, 0, "{t:?}: {s:?}");
+                }
+            }
+            let mut engine = engine_with(cfg.clone(), AB);
+            setup(&mut engine);
+            engine.evaluate_all().unwrap();
+            assert!(
+                matches!(
+                    engine.get_cell_value("Sheet1", 1, 3),
+                    Some(LiteralValue::Error(ref err)) if err.kind == ExcelErrorKind::Circ
+                ),
+                "{:?}",
+                engine.get_cell_value("Sheet1", 1, 3)
+            );
+        }
+    }
+}

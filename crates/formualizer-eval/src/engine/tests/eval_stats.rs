@@ -98,10 +98,35 @@ fn eval_stats_reset_per_call_and_zero_when_nothing_changed() {
     }
 }
 
+/// GOD-383 Trial A T3: the T2a spill toggles default on; the "today"
+/// assertions below pin the legacy path by switching both off explicitly.
+fn engine_spill_toggles(on: bool) -> Engine<TestWorkbook> {
+    let mut engine = engine();
+    engine.spill_same_extent_update = on;
+    engine.spill_pending_by_position = on;
+    engine
+}
+
+#[test]
+fn spill_toggles_default_on_with_env_unset() {
+    // The test process leaves the variables unset (or sets them to "1").
+    for name in [
+        "FZ_SPILL_SAME_EXTENT_UPDATE",
+        "FZ_SPILL_PENDING_BY_POSITION",
+    ] {
+        if std::env::var(name).is_ok_and(|v| v == "0") {
+            return;
+        }
+    }
+    let engine = engine();
+    assert!(engine.spill_same_extent_update);
+    assert!(engine.spill_pending_by_position);
+}
+
 #[test]
 fn eval_stats_report_spill_invalidation_replan_into_scc() {
     for cancellable in [false, true] {
-        let mut engine = engine();
+        let mut engine = engine_spill_toggles(false);
         spill_feeding_scc(&mut engine);
         eval(&mut engine, cancellable);
         eval(&mut engine, cancellable);
@@ -134,9 +159,39 @@ fn eval_stats_report_spill_invalidation_replan_into_scc() {
     }
 }
 
+/// T3 default (toggles on): the same edit updates the spill in place and the
+/// SCC reader, scheduled after the anchor, is not pended, so no replan.
 #[test]
-fn eval_stats_count_identical_spill_recommit() {
-    let mut engine = engine();
+fn eval_stats_spill_values_change_into_scc_without_replan_when_toggles_on() {
+    for cancellable in [false, true] {
+        let mut engine = engine_spill_toggles(true);
+        spill_feeding_scc(&mut engine);
+        eval(&mut engine, cancellable);
+        eval(&mut engine, cancellable);
+        assert_eq!(num(&engine, 1, 3), 3.0);
+
+        value(&mut engine, 1, 2, 5.0);
+        eval(&mut engine, cancellable);
+        let s = engine.eval_stats().clone();
+        assert_eq!(num(&engine, 1, 3), 11.0);
+        assert_eq!(num(&engine, 1, 4), 11.0);
+        assert_eq!(s.replan_iterations, 0, "{s:?}");
+        assert_eq!(s.pending_at_drain_total, 0, "{s:?}");
+        assert_eq!(s.token_scc_blocked(), 0, "{s:?}");
+        assert_eq!(s.spill_clear_count, 0, "{s:?}");
+        assert_eq!(s.spill_same_extent_updates, 1, "{s:?}");
+        assert_eq!(s.spill_same_extent_empty_diffs, 0, "{s:?}");
+        assert_eq!(s.spill_commit_differing_cells, 3, "{s:?}");
+        assert_eq!(s.spill_commit_identical, 0, "{s:?}");
+        assert_eq!(s.output_footprint_epoch_delta, 0, "{s:?}");
+        assert!(s.pending_by_position_skipped > 0, "{s:?}");
+        assert_eq!(s.pending_by_position_pended, 0, "{s:?}");
+        assert_eq!(*s.pass_outcome.last().unwrap(), "converged", "{s:?}");
+    }
+}
+
+fn identical_spill_recommit(on: bool) -> crate::engine::EvalStats {
+    let mut engine = engine_spill_toggles(on);
     value(&mut engine, 1, 2, 1.0);
     // INT(B1/100) is 0 for B1 in 1..99: the anchor re-evaluates on a B1
     // edit but re-commits the same footprint with the same values.
@@ -146,10 +201,27 @@ fn eval_stats_count_identical_spill_recommit() {
     engine.evaluate_all().unwrap();
     value(&mut engine, 1, 2, 2.0);
     engine.evaluate_all().unwrap();
-    let s = engine.eval_stats().clone();
     assert_eq!(num(&engine, 1, 3), 3.0);
+    engine.eval_stats().clone()
+}
+
+#[test]
+fn eval_stats_count_identical_spill_recommit() {
+    // Toggles off (legacy): clear + commit of an identical footprint.
+    let s = identical_spill_recommit(false);
     assert_eq!(s.spill_clear_count, 1, "{s:?}");
     assert_eq!(s.spill_commit_count, 1, "{s:?}");
     assert_eq!(s.spill_commit_same_footprint, 1, "{s:?}");
     assert_eq!(s.spill_commit_identical, 1, "{s:?}");
+    assert_eq!(s.spill_same_extent_updates, 0, "{s:?}");
+
+    // T3 default (toggles on): a values-only update with an empty diff, no clear.
+    let s = identical_spill_recommit(true);
+    assert_eq!(s.spill_clear_count, 0, "{s:?}");
+    assert_eq!(s.spill_commit_count, 1, "{s:?}");
+    assert_eq!(s.spill_commit_same_footprint, 1, "{s:?}");
+    assert_eq!(s.spill_commit_identical, 1, "{s:?}");
+    assert_eq!(s.spill_same_extent_updates, 1, "{s:?}");
+    assert_eq!(s.spill_same_extent_empty_diffs, 1, "{s:?}");
+    assert_eq!(s.spill_commit_differing_cells, 0, "{s:?}");
 }

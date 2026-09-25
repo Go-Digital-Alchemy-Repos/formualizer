@@ -90,6 +90,12 @@ fn env_toggle_on(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1"))
 }
 
+/// GOD-383 Trial A T3: a write-path toggle that is on by default; only `0`
+/// turns it off (legacy behaviour).
+fn env_toggle_default_on(name: &str) -> bool {
+    !matches!(std::env::var(name).as_deref(), Ok("0"))
+}
+
 #[inline]
 pub(crate) fn normalize_stored_literal(value: LiteralValue) -> LiteralValue {
     match value {
@@ -205,8 +211,8 @@ pub struct DependencyGraph {
     // and set representation behind this single authority.
     formula_dirty: FormulaDirtyState,
     volatile_vertices: FxHashSet<VertexId>,
-    /// GOD-383 Trial A T2b (`FZ_CLEAR_VOLATILE_ON_VALUE=1`, read once when the
-    /// graph is built, i.e. once per `Engine` construction): a formula vertex
+    /// GOD-383 Trial A T2b (`FZ_CLEAR_VOLATILE_ON_VALUE`; default on since T3,
+    /// `0` = off; read once when the graph is built, i.e. once per `Engine` construction): a formula vertex
     /// overwritten by a value loses its volatile and dynamic flags and leaves
     /// `volatile_vertices`, so it is no longer re-dirtied after every
     /// evaluation. Off: the stale flags stay (legacy behaviour).
@@ -1406,7 +1412,7 @@ impl DependencyGraph {
             deferred_dirty_depth: 0,
             deferred_dirty_pending: Vec::new(),
             volatile_vertices: FxHashSet::default(),
-            clear_volatile_on_value: env_toggle_on("FZ_CLEAR_VOLATILE_ON_VALUE"),
+            clear_volatile_on_value: env_toggle_default_on("FZ_CLEAR_VOLATILE_ON_VALUE"),
             write_noops: env_toggle_on("FZ_WRITE_NOOPS"),
             volatile_cleared_on_value: 0,
             set_formula_noops: std::sync::atomic::AtomicU64::new(0),

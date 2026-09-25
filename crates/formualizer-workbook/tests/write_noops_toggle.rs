@@ -82,3 +82,41 @@ fn identical_set_formula_and_empty_over_empty_agree_across_toggle() {
         );
     }
 }
+
+/// Review 3 finding 5 (T3): a `TODAY()` cell overwritten by `set_value`
+/// stops re-dirtying its reader with `FZ_CLEAR_VOLATILE_ON_VALUE` on, on the
+/// changelog (VertexEditor) route as well as the direct one; values agree.
+fn today_overwrite(changelog: bool, clear_on: bool) -> Vec<Option<LiteralValue>> {
+    let (mut wb, calls) = workbook(changelog, false);
+    wb.engine_mut().set_write_toggles(clear_on, false);
+    wb.set_formula(SHEET, 1, 1, "=TODAY()").unwrap();
+    wb.set_formula(SHEET, 1, 2, "=MYFN(A1)+1").unwrap();
+    wb.evaluate_all().unwrap();
+    wb.set_value(SHEET, 1, 1, LiteralValue::Number(40_000.0))
+        .unwrap();
+    wb.evaluate_all().unwrap();
+    let before = calls.load(Ordering::SeqCst);
+    wb.evaluate_all().unwrap();
+    let recomputed = calls.load(Ordering::SeqCst) - before;
+    let cleared = wb.engine().write_toggle_counters().0;
+    if clear_on {
+        assert_eq!(recomputed, 0, "changelog={changelog}");
+        assert_eq!(cleared, 1, "changelog={changelog}");
+    } else {
+        assert_eq!(cleared, 0, "changelog={changelog}");
+    }
+    [(1, 1), (1, 2)]
+        .iter()
+        .map(|&(r, c)| wb.get_value(SHEET, r, c))
+        .collect()
+}
+
+#[test]
+fn today_overwritten_by_set_value_leaves_volatile_set_with_and_without_changelog() {
+    for changelog in [false, true] {
+        let off = today_overwrite(changelog, false);
+        let on = today_overwrite(changelog, true);
+        assert_eq!(off, on, "changelog={changelog}");
+        assert_eq!(on[1], Some(LiteralValue::Number(40_001.0)));
+    }
+}

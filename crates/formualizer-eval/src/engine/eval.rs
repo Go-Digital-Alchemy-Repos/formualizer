@@ -1761,7 +1761,7 @@ pub struct Engine<R> {
     eval_stats_last_commit_changed: usize,
     eval_stats_started: Option<crate::instant::FzInstant>,
     /// GOD-383 Trial A T2a toggles, read once per construction from the
-    /// environment ("1" = on, default off): `FZ_SPILL_SAME_EXTENT_UPDATE`
+    /// environment (default on since T3; "0" = off): `FZ_SPILL_SAME_EXTENT_UPDATE`
     /// (values-only update of a registered spill whose extent is unchanged)
     /// and `FZ_SPILL_PENDING_BY_POSITION` (pend only invalidation-closure
     /// vertices the running pass has already reached).
@@ -4179,8 +4179,8 @@ where
             eval_stats_recheck: RecheckScratch::default(),
             eval_stats_last_commit_changed: 0,
             eval_stats_started: None,
-            spill_same_extent_update: eval_stats::env_toggle("FZ_SPILL_SAME_EXTENT_UPDATE"),
-            spill_pending_by_position: eval_stats::env_toggle("FZ_SPILL_PENDING_BY_POSITION"),
+            spill_same_extent_update: eval_stats::env_toggle_default_on("FZ_SPILL_SAME_EXTENT_UPDATE"),
+            spill_pending_by_position: eval_stats::env_toggle_default_on("FZ_SPILL_PENDING_BY_POSITION"),
             pass_positions: None,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
@@ -4373,8 +4373,8 @@ where
             eval_stats_recheck: RecheckScratch::default(),
             eval_stats_last_commit_changed: 0,
             eval_stats_started: None,
-            spill_same_extent_update: eval_stats::env_toggle("FZ_SPILL_SAME_EXTENT_UPDATE"),
-            spill_pending_by_position: eval_stats::env_toggle("FZ_SPILL_PENDING_BY_POSITION"),
+            spill_same_extent_update: eval_stats::env_toggle_default_on("FZ_SPILL_SAME_EXTENT_UPDATE"),
+            spill_pending_by_position: eval_stats::env_toggle_default_on("FZ_SPILL_PENDING_BY_POSITION"),
             pass_positions: None,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
@@ -33676,9 +33676,15 @@ where
     R: EvaluationContext,
 {
     /// Toggle B: record the unit position of every vertex of the schedule the
-    /// pass is about to walk. A no-op (positions unknown) with the toggle off.
+    /// pass is about to walk. A no-op (positions unknown, so every commit
+    /// pends its whole closure as before) with the toggle off, and also when
+    /// the schedule holds no registered spill anchor (T3): such a pass can
+    /// only commit first-time spills, whose anchor position is unknown
+    /// anyway, so it pays no map build. With no anchors registered at all
+    /// the check is free; otherwise it is one lookup per scheduled vertex,
+    /// stopping at the first anchor.
     fn pass_positions_install(&mut self, schedule: &crate::engine::scheduler::Schedule) {
-        if !self.spill_pending_by_position {
+        if !self.spill_pending_by_position || !self.schedule_has_registered_spill_anchor(schedule) {
             self.pass_positions = None;
             return;
         }
@@ -33699,6 +33705,27 @@ where
             }
         }
         self.pass_positions = Some(PassPositions { map, current: 0 });
+    }
+
+    /// True when some vertex of `schedule` is a registered spill anchor.
+    fn schedule_has_registered_spill_anchor(
+        &self,
+        schedule: &crate::engine::scheduler::Schedule,
+    ) -> bool {
+        if self.graph.spill_registry_counts().0 == 0 {
+            return false;
+        }
+        schedule.units.iter().any(|unit| match *unit {
+            ScheduleUnit::Layer(i) => schedule
+                .unit_layer(i)
+                .vertices
+                .iter()
+                .any(|&v| self.graph.spill_registry_has_anchor(v)),
+            ScheduleUnit::Cycle(i) => schedule
+                .unit_cycle(i)
+                .iter()
+                .any(|&v| self.graph.spill_registry_has_anchor(v)),
+        })
     }
 
     #[inline]
