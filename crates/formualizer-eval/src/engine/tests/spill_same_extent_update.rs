@@ -556,19 +556,89 @@ fn undo_after_noop_and_values_only_commit_matches_toggles_off() {
     }
 }
 
-// (8) T3 gate: a pass whose schedule holds no registered spill anchor installs
-// no position map, so a first-time spill (anchor not yet registered) keeps
-// today's whole-closure pend and toggle B's counters stay at zero.
+// (8) T6: a cold engine's first evaluation (no spill anchor registered yet)
+// installs the position map, so a first-time spill with toggle B on pends
+// only the closure vertices the pass has reached and skips the rest (T3's
+// gate pended the whole closure here). Grids equal toggle B off.
 #[test]
-fn first_time_spill_pends_as_today_with_position_toggle_on() {
-    for t in [B, AB] {
+fn first_time_spill_pends_by_position_on_cold_engine_with_position_toggle_on() {
+    for (t, t_off) in [(B, OFF), (AB, A)] {
         let mut engine = engine_with(base_config(), t);
         workbook(&mut engine);
         engine.evaluate_all().unwrap();
         let s = engine.eval_stats().clone();
         assert!(s.spill_commit_count >= 1, "{t:?}: {s:?}");
-        assert_eq!(s.pending_by_position_pended, 0, "{t:?}: {s:?}");
-        assert_eq!(s.pending_by_position_skipped, 0, "{t:?}: {s:?}");
+        assert!(s.pending_by_position_skipped > 0, "{t:?}: {s:?}");
+
+        let mut off = engine_with(base_config(), t_off);
+        workbook(&mut off);
+        off.evaluate_all().unwrap();
+        let s_off = off.eval_stats().clone();
+        assert_eq!(s_off.pending_by_position_pended, 0, "{t_off:?}: {s_off:?}");
+        assert_eq!(s_off.pending_by_position_skipped, 0, "{t_off:?}: {s_off:?}");
+        assert_eq!(grid(&engine), grid(&off), "{t:?} vs {t_off:?}");
+    }
+}
+
+/// Cold first-time spill with one reader scheduled before the anchor and one
+/// after it: B1 is a formula, so the anchor C1 (reading B1) sits in a later
+/// layer than F1 (`=D1*10`, no formula precedent); F2 (`=C1+D2`) reads the
+/// anchor cell and is scheduled after it. C1 spills 3x2 over C1:D3 with
+/// C1=9, D1=7, D2=3.
+fn cold_spill_before_and_after_readers(engine: &mut E) {
+    value(engine, 1, 1, 3.0);
+    value(engine, 2, 1, 2.0);
+    value(engine, 3, 1, 7.0);
+    value(engine, 4, 1, 9.0);
+    value(engine, 5, 1, 0.0);
+    formula(engine, 1, 2, "=A1*1");
+    formula(engine, 1, 3, "=T2A_RECT(B1,A2,A3,A4,A5)");
+    formula(engine, 1, 6, "=D1*10");
+    formula(engine, 2, 6, "=C1+D2");
+}
+
+// (8b) T6 distinguishing test: on the cold first evaluation toggle B pends
+// the reader scheduled before the anchor (F1, already evaluated against the
+// empty D1) and skips the one scheduled after it (F2). With T3's gate both
+// counters were 0 and the whole closure was pended. Values equal toggle B
+// off under both entry points.
+#[test]
+fn cold_first_time_spill_pends_earlier_reader_and_skips_later_reader() {
+    for cancellable in [false, true] {
+        let eval = |engine: &mut E| {
+            if cancellable {
+                engine.evaluate_all_cancellable(CancelToken::new()).unwrap();
+            } else {
+                engine.evaluate_all().unwrap();
+            }
+        };
+        let mut off = engine_with(base_config(), OFF);
+        cold_spill_before_and_after_readers(&mut off);
+        eval(&mut off);
+        let s_off = off.eval_stats().clone();
+        assert!(s_off.spill_commit_count >= 1, "{s_off:?}");
+        assert_eq!(s_off.pending_by_position_pended, 0, "{s_off:?}");
+        assert_eq!(s_off.pending_by_position_skipped, 0, "{s_off:?}");
+        assert_eq!(num(&off, 1, 6), 70.0);
+        assert_eq!(num(&off, 2, 6), 12.0);
+
+        for t in [B, AB] {
+            let mut engine = engine_with(base_config(), t);
+            cold_spill_before_and_after_readers(&mut engine);
+            eval(&mut engine);
+            let s = engine.eval_stats().clone();
+            assert!(s.spill_commit_count >= 1, "{t:?}: {s:?}");
+            assert!(s.pending_by_position_pended > 0, "{t:?}: {s:?}");
+            assert!(s.pending_by_position_skipped > 0, "{t:?}: {s:?}");
+            assert!(
+                s.inv_pending_added < s_off.inv_pending_added,
+                "{t:?}: on {s:?} off {s_off:?}"
+            );
+            assert_eq!(num(&engine, 1, 4), 7.0, "{t:?}");
+            assert_eq!(num(&engine, 1, 6), 70.0, "{t:?}");
+            assert_eq!(num(&engine, 2, 6), 12.0, "{t:?}");
+            assert_eq!(grid(&engine), grid(&off), "{t:?} (cancellable {cancellable})");
+        }
     }
 }
 

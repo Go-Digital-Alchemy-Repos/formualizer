@@ -33690,14 +33690,26 @@ where
 {
     /// Toggle B: record the unit position of every vertex of the schedule the
     /// pass is about to walk. A no-op (positions unknown, so every commit
-    /// pends its whole closure as before) with the toggle off, and also when
-    /// the schedule holds no registered spill anchor (T3): such a pass can
-    /// only commit first-time spills, whose anchor position is unknown
-    /// anyway, so it pays no map build. With no anchors registered at all
-    /// the check is free; otherwise it is one lookup per scheduled vertex,
-    /// stopping at the first anchor.
+    /// pends its whole closure as before) with the toggle off.
+    ///
+    /// With the toggle on the map is built when either
+    /// - no spill anchor is registered at all (T6): a cold engine's first
+    ///   evaluation commits its spills first-time, and the anchor's position
+    ///   comes from this schedule, not from the spill registry, so without
+    ///   the map the whole closure is pended and the pass replans (T3's
+    ///   gate did that: 268,517 vertices pended on a fresh Rev request); or
+    /// - the schedule holds a registered spill anchor (T3).
+    ///
+    /// A pass whose schedule holds no registered anchor while anchors are
+    /// registered elsewhere (a warm light call) still pays no map build; a
+    /// first-time spill committed in such a pass pends its whole closure as
+    /// before T2a. The registered-anchor check is one lookup per scheduled
+    /// vertex, stopping at the first anchor.
     fn pass_positions_install(&mut self, schedule: &crate::engine::scheduler::Schedule) {
-        if !self.spill_pending_by_position || !self.schedule_has_registered_spill_anchor(schedule) {
+        if !self.spill_pending_by_position
+            || (self.graph.spill_registry_counts().0 != 0
+                && !self.schedule_has_registered_spill_anchor(schedule))
+        {
             self.pass_positions = None;
             return;
         }
@@ -33723,8 +33735,10 @@ where
     /// GOD-383 T4: toggle B on the speculative-chain walk. Records, for the
     /// round about to be walked, the banked unit index of every vertex the
     /// round will evaluate (`pending`: the walk skips every other vertex).
-    /// Gated like `pass_positions_install` (T3): no map unless the round's
-    /// walk set holds a registered spill anchor.
+    /// Gated as T3 gated `pass_positions_install`: no map unless the round's
+    /// walk set holds a registered spill anchor (T6's cold-engine case does
+    /// not arise here: a chain walk only follows a bank, so its anchors are
+    /// registered).
     ///
     /// Invariant: a closure vertex is left un-pended only if it is guaranteed
     /// to be evaluated after the commit, either later in this walk or by the
