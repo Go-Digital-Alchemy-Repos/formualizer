@@ -382,6 +382,81 @@ fn build_stamp(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(out.into_any().unbind())
 }
 
+/// GOD-383 Trial A: optional in-process sampling profiler (`profiling`
+/// feature, Linux only). Not part of the default build.
+#[cfg(all(feature = "profiling", target_os = "linux"))]
+mod profiling {
+    use pyo3::exceptions::PyRuntimeError;
+    use pyo3::prelude::*;
+    use std::sync::Mutex;
+
+    struct ActiveGuard(pprof::ProfilerGuard<'static>);
+    // SAFETY: the guard is only created, reported and dropped under the
+    // mutex below; pprof's global profiler state is itself lock-protected.
+    unsafe impl Send for ActiveGuard {}
+
+    static GUARD: Mutex<Option<ActiveGuard>> = Mutex::new(None);
+
+    /// Start SIGPROF sampling at `hz` samples per second.
+    #[pyfunction]
+    pub fn _profile_start(hz: i32) -> PyResult<()> {
+        let mut slot = GUARD.lock().unwrap();
+        if slot.is_some() {
+            return Err(PyRuntimeError::new_err("profiler already running"));
+        }
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(hz)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("profiler start failed: {e}")))?;
+        *slot = Some(ActiveGuard(guard));
+        Ok(())
+    }
+
+    /// Stop sampling and write folded stacks (`thread;root;...;leaf count`
+    /// per line) to `path`. Returns the total sample count.
+    #[pyfunction]
+    pub fn _profile_stop(py: Python<'_>, path: &str) -> PyResult<u64> {
+        let guard = GUARD
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("profiler not running"))?;
+        let path = path.to_string();
+        py.detach(move || {
+            let report = guard
+                .0
+                .report()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("profiler report failed: {e}")))?;
+            drop(guard);
+            let mut out = String::new();
+            let mut total: u64 = 0;
+            for (frames, count) in report.data.iter() {
+                let mut line = if frames.thread_name.is_empty() {
+                    frames.thread_id.to_string()
+                } else {
+                    frames.thread_name.clone()
+                };
+                for frame in frames.frames.iter().rev() {
+                    for symbol in frame.iter().rev() {
+                        line.push(';');
+                        line.push_str(&symbol.to_string().replace(';', ":"));
+                    }
+                }
+                line.push(' ');
+                line.push_str(&count.to_string());
+                line.push('\n');
+                out.push_str(&line);
+                total += (*count).max(0) as u64;
+            }
+            std::fs::write(&path, out)
+                .map_err(|e| PyRuntimeError::new_err(format!("write {path}: {e}")))?;
+            Ok(total)
+        })
+    }
+}
+
 #[pymodule]
 fn formualizer_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register all submodules
@@ -413,6 +488,12 @@ fn formualizer_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // belong in the module's `__all__`, and the public package re-exports it
     // explicitly.
     m.setattr("__build__", build_stamp(m.py())?)?;
+
+    #[cfg(all(feature = "profiling", target_os = "linux"))]
+    {
+        m.add_function(wrap_pyfunction!(profiling::_profile_start, m)?)?;
+        m.add_function(wrap_pyfunction!(profiling::_profile_stop, m)?)?;
+    }
 
     // Backward-compatible aliases for older names which started with `Py...`.
     // These are not the preferred API, but keeping them avoids breaking existing callers.

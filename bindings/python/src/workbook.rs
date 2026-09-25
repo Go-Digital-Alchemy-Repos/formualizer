@@ -1112,6 +1112,33 @@ impl PyWorkbook {
         ))
     }
 
+    /// Counters and phase timers of the last `evaluate_all()` call (GOD-383
+    /// Trial A instrumentation), as a flat dict of ints and strings.
+    ///
+    /// Reset at the start of every `evaluate_all()`; keys prefixed `ns_` are
+    /// cumulative wall nanoseconds per phase (several are nested, see the
+    /// engine's `eval_stats` module docs). Per-pass values are
+    /// comma-joined strings. Observational only.
+    pub fn eval_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use formualizer::eval::engine::EvalStatValue;
+        let wb = self.read_inner()?;
+        let dict = PyDict::new(py);
+        for (key, value) in wb.engine().eval_stats().to_pairs() {
+            match value {
+                EvalStatValue::Int(v) => dict.set_item(key, v)?,
+                EvalStatValue::Float(v) => dict.set_item(key, v)?,
+                EvalStatValue::Str(v) => dict.set_item(key, v)?,
+            }
+        }
+        Ok(dict)
+    }
+
+    /// Dirty-propagation BFS visits over the engine's life (cumulative);
+    /// diff two readings to measure the propagation cost of writes.
+    pub fn dirty_propagation_visits(&self) -> PyResult<u64> {
+        Ok(self.read_inner()?.engine().dirty_propagation_visits())
+    }
+
     /// Turn the calculation chain on or off on the live engine.
     ///
     /// Turning it off drops any banked chain with it. Turning it on banks

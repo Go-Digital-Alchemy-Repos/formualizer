@@ -3139,6 +3139,37 @@ impl DependencyGraph {
         self.clock_frozen
     }
 
+    /// GOD-383 T1 (R1 D3): size of the legacy `formula_dirty` set.
+    pub(crate) fn formula_dirty_legacy_len(&self) -> usize {
+        self.formula_dirty.legacy_len()
+    }
+
+    /// GOD-383 T1 (R1 D3): formula vertices whose dirty flag is set. A full
+    /// scan of the formula vertices; callers gate it.
+    pub(crate) fn count_dirty_formula_vertices(&self) -> usize {
+        self.vertex_formulas
+            .keys()
+            .filter(|&&v| self.store.is_dirty(v))
+            .count()
+    }
+
+    /// GOD-383 T1 (R1 D1): `(volatile vertices, needing refresh at the next
+    /// redirty, clock-only)`.
+    pub(crate) fn volatile_refresh_census(&self) -> (usize, usize, usize) {
+        let total = self.volatile_vertices.len();
+        let clock_only = self
+            .volatile_vertices
+            .iter()
+            .filter(|&&id| self.is_clock_only_volatile(id))
+            .count();
+        let needing = if self.clock_frozen {
+            total - clock_only
+        } else {
+            total
+        };
+        (total, needing, clock_only)
+    }
+
     /// Re-dirty every volatile vertex regardless of the frozen-clock skip.
     /// Used when the clock source itself moves, so cells that were parked as
     /// clock-only constants pick up the new timestamp.

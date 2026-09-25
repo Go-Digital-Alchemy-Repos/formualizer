@@ -26,6 +26,11 @@ from .formualizer_py import EvaluationConfig, WorkbookConfig
 #: would break wheel reproducibility.
 __build__ = _py.__build__
 
+# GOD-383 Trial A: present only in a wheel built with the `profiling` feature.
+if hasattr(_py, "_profile_start"):
+    _profile_start = _py._profile_start
+    _profile_stop = _py._profile_stop
+
 #: Workbook seed pinned by the qualification harness. Every random-dependent
 #: builtin (RAND, RANDBETWEEN, RANDARRAY) derives from it, so two runs that
 #: share this seed produce identical values.

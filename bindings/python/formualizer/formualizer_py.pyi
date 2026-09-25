@@ -2002,6 +2002,21 @@ class Workbook:
             print(t.chain_walks, t.read_guard_coarse_hits, t.read_guard_violations)
         ```
         """
+    def eval_stats(self) -> dict:
+        r"""
+        Counters and phase timers of the last `evaluate_all()` call (GOD-383
+        Trial A instrumentation), as a flat dict of ints and strings.
+        
+        Reset at the start of every `evaluate_all()`; keys prefixed `ns_` are
+        cumulative wall nanoseconds per phase (several are nested, see the
+        engine's `eval_stats` module docs). Per-pass values are
+        comma-joined strings. Observational only.
+        """
+    def dirty_propagation_visits(self) -> builtins.int:
+        r"""
+        Dirty-propagation BFS visits over the engine's life (cumulative);
+        diff two readings to measure the propagation cost of writes.
+        """
     def set_speculative_chain(self, enabled: builtins.bool) -> None:
         r"""
         Turn the calculation chain on or off on the live engine.

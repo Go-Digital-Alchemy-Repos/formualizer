@@ -1,6 +1,10 @@
 use crate::SheetId;
 use crate::arrow_store::{OverlayFragment, OverlayValue, SheetStore};
 use crate::engine::arena::AstNodeId;
+use crate::engine::eval_stats::{
+    self, EvalStats, EvalStatsAtomics, InvalidationOrigin, RecheckScratch, SpillClearSnapshot,
+    TokenOutcome, TokenSite,
+};
 use crate::engine::eval_delta::{
     DeltaCollector, DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy,
 };
@@ -1744,6 +1748,18 @@ pub struct Engine<R> {
     /// Monotonic over the engine's life; perf-shape observability only.
     virtual_dep_recheck_rebuilds: u64,
     virtual_dep_recheck_skips: u64,
+    /// GOD-383 T1 instrumentation: the working stats of the current
+    /// `evaluate_all` call, the published stats of the last one, the
+    /// `&self`-path counters, the last spill-clear snapshot (identical
+    /// re-commit detection), the last recheck's readings and the call's
+    /// start instant. Observational only.
+    eval_stats_work: EvalStats,
+    last_eval_stats: EvalStats,
+    eval_stats_atomics: EvalStatsAtomics,
+    eval_stats_last_clear: Option<SpillClearSnapshot>,
+    eval_stats_recheck: RecheckScratch,
+    eval_stats_last_commit_changed: usize,
+    eval_stats_started: Option<crate::instant::FzInstant>,
     finalized_output_cycle_vertices: FxHashSet<VertexId>,
 
     /// Formula results persisted in the source workbook. Excel uses these as
@@ -2828,6 +2844,8 @@ struct ScheduleBuildMeta {
     vdeps_vertices: usize,
     vdeps_edges: usize,
     builder_elapsed_ms: u128,
+    /// Always measured (GOD-383 T1 `ns_vdep_builder`).
+    builder_elapsed_ns: u64,
     used_virtual_schedule: bool,
     schedule_cache_hit: bool,
     schedule_cache_eligible: bool,
@@ -4134,6 +4152,13 @@ where
             vdep_build_footprint_epoch: std::sync::atomic::AtomicU64::new(0),
             virtual_dep_recheck_rebuilds: 0,
             virtual_dep_recheck_skips: 0,
+            eval_stats_work: EvalStats::default(),
+            last_eval_stats: EvalStats::default(),
+            eval_stats_atomics: EvalStatsAtomics::default(),
+            eval_stats_last_clear: None,
+            eval_stats_recheck: RecheckScratch::default(),
+            eval_stats_last_commit_changed: 0,
+            eval_stats_started: None,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             rich_error_details: FxHashMap::default(),
@@ -4318,6 +4343,13 @@ where
             vdep_build_footprint_epoch: std::sync::atomic::AtomicU64::new(0),
             virtual_dep_recheck_rebuilds: 0,
             virtual_dep_recheck_skips: 0,
+            eval_stats_work: EvalStats::default(),
+            last_eval_stats: EvalStats::default(),
+            eval_stats_atomics: EvalStatsAtomics::default(),
+            eval_stats_last_clear: None,
+            eval_stats_recheck: RecheckScratch::default(),
+            eval_stats_last_commit_changed: 0,
+            eval_stats_started: None,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             rich_error_details: FxHashMap::default(),
@@ -5185,6 +5217,40 @@ where
     /// `graph.redirty_volatiles()` call at every evaluation-flow exit; must
     /// run AFTER the flow's `clear_dirty_flags`.
     fn redirty_for_next_recalc(&mut self) {
+        let started = crate::instant::FzInstant::now();
+        let visits_before = self.graph.dirty_propagation_visits();
+        let formula_dirty_before = self.graph.formula_dirty_legacy_len() as u64;
+        let scan = eval_stats::dirty_scan_enabled();
+        let flagged_before = if scan {
+            self.graph.count_dirty_formula_vertices() as i64
+        } else {
+            -1
+        };
+        let (volatile_count, needing_refresh, clock_only) = self.graph.volatile_refresh_census();
+        let clock_frozen = self.graph.clock_frozen();
+        self.redirty_for_next_recalc_inner();
+        let visits_after = self.graph.dirty_propagation_visits();
+        let formula_dirty_after = self.graph.formula_dirty_legacy_len() as u64;
+        let flagged_after = if scan {
+            self.graph.count_dirty_formula_vertices() as i64
+        } else {
+            -1
+        };
+        let w = &mut self.eval_stats_work;
+        w.redirty_calls += 1;
+        w.dirty_propagation_visits_redirty += visits_after.wrapping_sub(visits_before);
+        w.formula_dirty_before_redirty = formula_dirty_before;
+        w.formula_dirty_after_redirty = formula_dirty_after;
+        w.dirty_flag_formulas_before_redirty = flagged_before;
+        w.dirty_flag_formulas_after_redirty = flagged_after;
+        w.volatile_count = volatile_count as u64;
+        w.volatiles_needing_refresh = needing_refresh as u64;
+        w.volatiles_clock_only = clock_only as u64;
+        w.clock_frozen = i64::from(clock_frozen);
+        w.ns_dirty_redirty += eval_stats::ns_since(started);
+    }
+
+    fn redirty_for_next_recalc_inner(&mut self) {
         self.graph.redirty_volatiles();
         let pending = std::mem::take(&mut self.pending_iterative_redirty);
         let dirty_at_begin = std::mem::take(&mut self.retained_scc_dirty_at_begin);
@@ -20095,14 +20161,32 @@ where
         &mut self,
         buffer: &mut ComputedWriteBuffer,
     ) -> Result<(), ExcelError> {
-        self.flush_computed_write_buffer_inner(buffer, false)
+        self.flush_computed_write_buffer_timed(buffer, false)
     }
 
     fn flush_authoritative_computed_write_buffer(
         &mut self,
         buffer: &mut ComputedWriteBuffer,
     ) -> Result<(), ExcelError> {
-        self.flush_computed_write_buffer_inner(buffer, true)
+        self.flush_computed_write_buffer_timed(buffer, true)
+    }
+
+    /// GOD-383 T1: times non-empty flushes only (an empty flush is a no-op
+    /// early return in `flush_computed_write_buffer_inner`).
+    fn flush_computed_write_buffer_timed(
+        &mut self,
+        buffer: &mut ComputedWriteBuffer,
+        synchronize_formula_plane_formats: bool,
+    ) -> Result<(), ExcelError> {
+        if buffer.is_empty() {
+            return self.flush_computed_write_buffer_inner(buffer, synchronize_formula_plane_formats);
+        }
+        let started = crate::instant::FzInstant::now();
+        let result =
+            self.flush_computed_write_buffer_inner(buffer, synchronize_formula_plane_formats);
+        self.eval_stats_work.ns_overlay_flush += eval_stats::ns_since(started);
+        self.eval_stats_work.overlay_flushes += 1;
+        result
     }
 
     fn flush_computed_write_buffer_inner(
@@ -21542,7 +21626,7 @@ where
             return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Ref)
                 .with_message(format!("Vertex not found: {vertex_id:?}")));
         }
-        let invalidation_token = self.output_invalidation_token(vertex_id);
+        let invalidation_token = self.output_invalidation_token(vertex_id, TokenSite::Direct);
         if self.active_resource_ledger.is_some()
             && matches!(
                 self.graph.get_vertex_kind(vertex_id),
@@ -25693,9 +25777,12 @@ where
     /// Evaluate all dirty/volatile vertices
     pub fn evaluate_all(&mut self) -> Result<EvalResult, ExcelError> {
         self.begin_public_upstream_diagnostic_request();
-        self.observe_evaluation_resource_request(EvaluationRequestKind::Full, |engine| {
+        self.eval_stats_begin("evaluate_all");
+        let result = self.observe_evaluation_resource_request(EvaluationRequestKind::Full, |engine| {
             engine.evaluate_all_unobserved()
-        })
+        });
+        self.eval_stats_finish(&result);
+        result
     }
 
     fn evaluate_all_unobserved(&mut self) -> Result<EvalResult, ExcelError> {
@@ -25730,6 +25817,7 @@ where
         self.transition_off_mode_spans_to_legacy()?;
         self.begin_evaluation_request();
         if self.config.formula_plane_mode == FormulaPlaneMode::AuthoritativeExperimental {
+            self.eval_stats_work.path = "formula_plane";
             return self.evaluate_authoritative_formula_plane_all();
         }
         self.evaluate_all_legacy_impl()
@@ -25747,6 +25835,7 @@ where
         let mut computed_vertices = 0;
         let mut cycle_count = 0;
         for &unit in &schedule.units {
+            let unit_started = crate::instant::FzInstant::now();
             match unit {
                 ScheduleUnit::Cycle(i) => {
                     if self.handle_cycle_unit(schedule.unit_cycle(i), None, None, None)? > 0 {
@@ -25762,6 +25851,10 @@ where
                     }
                 }
             }
+            self.eval_stats_note_unit(
+                matches!(unit, ScheduleUnit::Cycle(_)),
+                eval_stats::ns_since(unit_started),
+            );
         }
         Ok((computed_vertices, cycle_count))
     }
@@ -25832,11 +25925,16 @@ where
         // installed this serves the whole request without touching the
         // schedule builder; every miss returns `None` and drops through to the
         // exact path below, which reinstalls a fresh chain.
-        if self.config.speculative_chain
-            && let Some(result) = self.try_spec_chain_evaluate()?
-        {
-            return Ok(result);
+        if self.config.speculative_chain {
+            let chain_started = crate::instant::FzInstant::now();
+            let chain = self.try_spec_chain_evaluate();
+            self.eval_stats_work.ns_chain_walk += eval_stats::ns_since(chain_started);
+            if let Some(result) = chain? {
+                self.eval_stats_work.path = "chain";
+                return Ok(result);
+            }
         }
+        self.eval_stats_work.path = "full";
         self.reset_virtual_dep_telemetry_if_disabled();
         #[cfg(feature = "tracing")]
         let _span_eval = tracing::info_span!("evaluate_all").entered();
@@ -25851,7 +25949,7 @@ where
             .then(|| self.start_virtual_dep_telemetry());
 
         loop {
-            let to_evaluate = self.graph.get_evaluation_vertices();
+            let to_evaluate = self.eval_stats_get_evaluation_vertices();
             if to_evaluate.is_empty() {
                 if let Some(t) = telemetry.as_mut()
                     && t.bailout_reason.is_none()
@@ -25861,23 +25959,41 @@ where
                 break;
             }
 
+            let schedule_started = crate::instant::FzInstant::now();
             let (schedule, old_vdeps, meta) = self.create_evaluation_schedule(&to_evaluate)?;
+            self.eval_stats_note_schedule(
+                replan_iterations,
+                to_evaluate.len(),
+                schedule.cycles.len(),
+                &meta,
+                eval_stats::ns_since(schedule_started),
+            );
             if let Some(t) = telemetry.as_mut() {
                 Self::accumulate_schedule_meta(t, &meta);
             }
 
+            let walk_started = crate::instant::FzInstant::now();
             let (pass_computed, pass_cycles) = self.legacy_pass_run_units(&schedule)?;
+            self.eval_stats_pass_walked(
+                replan_iterations,
+                pass_computed,
+                eval_stats::ns_since(walk_started),
+            );
             computed_vertices += pass_computed;
             cycle_errors += pass_cycles;
 
             // Check if dynamic dependencies changed
+            let recheck_started = crate::instant::FzInstant::now();
             let changed_vertices = self.changed_virtual_dep_vertices(&to_evaluate, &old_vdeps);
+            self.eval_stats_note_recheck(changed_vertices.len(), eval_stats::ns_since(recheck_started));
             if let Some(t) = telemetry.as_mut() {
                 t.changed_vdeps_total += changed_vertices.len();
             }
 
             self.resource_checkpoint(0)?;
+            let clear_started = crate::instant::FzInstant::now();
             self.clear_scheduled_dirty_flags(&schedule, &to_evaluate);
+            self.eval_stats_work.ns_dirty_clear_flags += eval_stats::ns_since(clear_started);
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
@@ -25916,6 +26032,7 @@ where
             }
 
             replan_iterations += 1;
+            self.eval_stats_work.replan_iterations = replan_iterations as u64;
         }
 
         if let Some(mut t) = telemetry {
@@ -27362,6 +27479,7 @@ where
                     vdeps_vertices: 0,
                     vdeps_edges: 0,
                     builder_elapsed_ms: 0,
+                    builder_elapsed_ns: 0,
                     used_virtual_schedule: false,
                     schedule_cache_hit: true,
                     schedule_cache_eligible: true,
@@ -27474,6 +27592,7 @@ where
             .config
             .enable_virtual_dep_telemetry
             .then(crate::instant::FzInstant::now);
+        let stats_build_started = crate::instant::FzInstant::now();
         let mut regionized: Option<RegionizedBuild> = None;
         let (mut vdeps, augmented) = if use_region_nodes {
             let built = builder.build_regionized(to_evaluate);
@@ -27541,6 +27660,7 @@ where
             relay.as_ref().map(|(_, m)| m).unwrap_or(&vdeps);
 
         let builder_elapsed_ms = build_started.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+        let builder_elapsed_ns = eval_stats::ns_since(stats_build_started);
         let vdeps_edges = if self.config.enable_virtual_dep_telemetry {
             sched_vdeps.values().map(|deps| deps.len()).sum::<usize>()
         } else {
@@ -27573,6 +27693,7 @@ where
             vdeps_vertices,
             vdeps_edges,
             builder_elapsed_ms,
+            builder_elapsed_ns,
             used_virtual_schedule: use_virtual || order_hints_applied,
             schedule_cache_hit: false,
             schedule_cache_eligible: false,
@@ -27806,6 +27927,10 @@ where
             && let Some(vertex) = to_evaluate.first().copied()
         {
             self.force_virtual_dep_changes_remaining_for_test -= 1;
+            self.eval_stats_recheck = RecheckScratch {
+                reason: "forced_for_test",
+                ..RecheckScratch::default()
+            };
             return vec![vertex];
         }
         // Post-pass recheck guard.
@@ -27844,17 +27969,29 @@ where
             != self
                 .vdep_build_footprint_epoch
                 .load(std::sync::atomic::Ordering::Relaxed);
-        if !has_pending_invalidation
-            && !footprint_moved
-            && !to_evaluate
-                .iter()
-                .chain(old_vdeps.keys())
-                .any(|&v| self.graph.is_dynamic(v))
-        {
+        let formula_dirty_at_recheck = self.graph.formula_dirty_legacy_len() as u64;
+        // GOD-383 T1: always evaluated (the original short-circuited it behind
+        // the two cheaper guards; when either is set a full rebuild follows,
+        // which dominates this scan) so the stats can name every open guard.
+        let dynamic_open = to_evaluate
+            .iter()
+            .chain(old_vdeps.keys())
+            .any(|&v| self.graph.is_dynamic(v));
+        if !has_pending_invalidation && !footprint_moved && !dynamic_open {
             self.virtual_dep_recheck_skips = self.virtual_dep_recheck_skips.saturating_add(1);
+            self.eval_stats_recheck = RecheckScratch {
+                reason: "skip",
+                formula_dirty: formula_dirty_at_recheck,
+                ..RecheckScratch::default()
+            };
             return Vec::new();
         }
         self.virtual_dep_recheck_rebuilds = self.virtual_dep_recheck_rebuilds.saturating_add(1);
+        let recheck_reason =
+            RecheckScratch::reason_for(has_pending_invalidation, footprint_moved, dynamic_open);
+        self.eval_stats_work.recheck_open_pending += u64::from(has_pending_invalidation);
+        self.eval_stats_work.recheck_open_footprint += u64::from(footprint_moved);
+        self.eval_stats_work.recheck_open_dynamic += u64::from(dynamic_open);
 
         let builder = VirtualDepBuilder::new(self);
         let mut comparison_domain = to_evaluate.to_vec();
@@ -27921,6 +28058,12 @@ where
                 }
                 changed
             }
+        };
+        self.eval_stats_recheck = RecheckScratch {
+            reason: recheck_reason,
+            pending_at_drain: self.pending_output_invalidations.get_mut().unwrap().len() as u64,
+            changed_readers: changed.len() as u64,
+            formula_dirty: formula_dirty_at_recheck,
         };
         changed.extend(std::mem::take(
             self.pending_output_invalidations.get_mut().unwrap(),
@@ -28112,13 +28255,19 @@ where
         cancel: crate::engine::CancelToken,
     ) -> Result<EvalResult, ExcelError> {
         self.begin_public_upstream_diagnostic_request();
-        self.observe_evaluation_resource_request(EvaluationRequestKind::FullCancellable, |engine| {
-            engine.observe_function_semantic_epoch()?;
-            engine.active_cancel_flag = Some(cancel.clone());
-            let res = engine.evaluate_all_cancellable_impl(cancel.as_flag());
-            engine.active_cancel_flag = None;
-            res
-        })
+        self.eval_stats_begin("evaluate_all_cancellable");
+        let result = self.observe_evaluation_resource_request(
+            EvaluationRequestKind::FullCancellable,
+            |engine| {
+                engine.observe_function_semantic_epoch()?;
+                engine.active_cancel_flag = Some(cancel.clone());
+                let res = engine.evaluate_all_cancellable_impl(cancel.as_flag());
+                engine.active_cancel_flag = None;
+                res
+            },
+        );
+        self.eval_stats_finish(&result);
+        result
     }
 
     fn evaluate_all_cancellable_impl(
@@ -28153,6 +28302,7 @@ where
                     "Evaluation cancelled before FormulaPlane scheduling".to_string(),
                 ));
             }
+            self.eval_stats_work.path = "formula_plane";
             return self.evaluate_authoritative_formula_plane_all();
         }
         // Excel-style speculative calculation chain, exactly as in
@@ -28162,11 +28312,16 @@ where
         // fast path that replaces the whole schedule-and-walk below; the
         // cancellation checks it skips are the per-unit ones of a pass that no
         // longer happens.
-        if self.config.speculative_chain
-            && let Some(result) = self.try_spec_chain_evaluate()?
-        {
-            return Ok(result);
+        if self.config.speculative_chain {
+            let chain_started = crate::instant::FzInstant::now();
+            let chain = self.try_spec_chain_evaluate();
+            self.eval_stats_work.ns_chain_walk += eval_stats::ns_since(chain_started);
+            if let Some(result) = chain? {
+                self.eval_stats_work.path = "chain";
+                return Ok(result);
+            }
         }
+        self.eval_stats_work.path = "full";
         self.reset_virtual_dep_telemetry_if_disabled();
         let start = crate::instant::FzInstant::now();
         let mut computed_vertices = 0;
@@ -28190,7 +28345,7 @@ where
                     .with_message("Evaluation cancelled before scheduling".to_string()));
             }
 
-            let to_evaluate = self.graph.get_evaluation_vertices();
+            let to_evaluate = self.eval_stats_get_evaluation_vertices();
             if to_evaluate.is_empty() {
                 if let Some(t) = telemetry.as_mut()
                     && t.bailout_reason.is_none()
@@ -28200,14 +28355,25 @@ where
                 break;
             }
 
+            let schedule_started = crate::instant::FzInstant::now();
             let (schedule, old_vdeps, meta) = self.create_evaluation_schedule(&to_evaluate)?;
+            self.eval_stats_note_schedule(
+                replan_iterations,
+                to_evaluate.len(),
+                schedule.cycles.len(),
+                &meta,
+                eval_stats::ns_since(schedule_started),
+            );
             if let Some(t) = telemetry.as_mut() {
                 Self::accumulate_schedule_meta(t, &meta);
             }
 
             // Walk units in condensation order, checking cancellation between
             // units (formerly between cycles and between layers).
+            let walk_started = crate::instant::FzInstant::now();
+            let computed_before_walk = computed_vertices;
             for &unit in &schedule.units {
+                let unit_started = crate::instant::FzInstant::now();
                 match unit {
                     ScheduleUnit::Cycle(i) => {
                         // Check cancellation between cycles
@@ -28255,14 +28421,27 @@ where
                         }
                     }
                 }
+                self.eval_stats_note_unit(
+                    matches!(unit, ScheduleUnit::Cycle(_)),
+                    eval_stats::ns_since(unit_started),
+                );
             }
+            self.eval_stats_pass_walked(
+                replan_iterations,
+                computed_vertices - computed_before_walk,
+                eval_stats::ns_since(walk_started),
+            );
 
+            let recheck_started = crate::instant::FzInstant::now();
             let changed_vertices = self.changed_virtual_dep_vertices(&to_evaluate, &old_vdeps);
+            self.eval_stats_note_recheck(changed_vertices.len(), eval_stats::ns_since(recheck_started));
             if let Some(t) = telemetry.as_mut() {
                 t.changed_vdeps_total += changed_vertices.len();
             }
             self.resource_checkpoint(0)?;
+            let clear_started = crate::instant::FzInstant::now();
             self.clear_scheduled_dirty_flags(&schedule, &to_evaluate);
+            self.eval_stats_work.ns_dirty_clear_flags += eval_stats::ns_since(clear_started);
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
@@ -28290,6 +28469,7 @@ where
                 );
             }
             replan_iterations += 1;
+            self.eval_stats_work.replan_iterations = replan_iterations as u64;
         }
 
         if let Some(mut t) = telemetry {
@@ -28877,7 +29057,7 @@ where
 
     /// Evaluate a single vertex without mutating the graph (for parallel evaluation)
     fn evaluate_vertex_immutable(&self, vertex_id: VertexId) -> Result<LiteralValue, ExcelError> {
-        let invalidation_token = self.output_invalidation_token(vertex_id);
+        let invalidation_token = self.output_invalidation_token(vertex_id, TokenSite::Layer);
         let result = self.evaluate_vertex_immutable_inner(vertex_id);
         self.retire_output_invalidation(vertex_id, invalidation_token);
         result
@@ -30757,7 +30937,7 @@ impl<R> Engine<R>
 where
     R: EvaluationContext,
 {
-    fn output_invalidation_token(&self, vertex: VertexId) -> Option<u64> {
+    fn output_invalidation_token(&self, vertex: VertexId, site: TokenSite) -> Option<u64> {
         let pending = self.pending_output_invalidations.lock().unwrap();
         if !pending.contains(&vertex) {
             return None;
@@ -30765,6 +30945,8 @@ where
         // Runtime reference formulas may read precedents absent from static range edges.
         // Conservatively retain their work for the next confirmed dependency schedule.
         if self.graph.is_dynamic(vertex) {
+            self.eval_stats_atomics
+                .record_token(site, TokenOutcome::NoneDynamic);
             return None;
         }
         let deps = self.graph.get_dependencies(vertex);
@@ -30775,8 +30957,12 @@ where
             .chain(virtual_deps.iter())
             .any(|v| pending.contains(v))
         {
+            self.eval_stats_atomics
+                .record_token(site, TokenOutcome::NonePendingDep);
             return None;
         }
+        self.eval_stats_atomics
+            .record_token(site, TokenOutcome::Issued);
         Some(
             self.output_invalidation_epoch
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -30797,7 +30983,55 @@ where
         }
     }
 
-    fn record_changed_output_invalidations(&mut self, anchor: VertexId, cells: &[CellRef]) {
+    fn record_changed_output_invalidations(
+        &mut self,
+        anchor: VertexId,
+        cells: &[CellRef],
+        origin: InvalidationOrigin,
+    ) {
+        let started = crate::instant::FzInstant::now();
+        let pending_before = self.pending_output_invalidations.get_mut().unwrap().len();
+        let affected_len = self.record_changed_output_invalidations_inner(anchor, cells);
+        let pending_after = self.pending_output_invalidations.get_mut().unwrap().len();
+        let w = &mut self.eval_stats_work;
+        w.ns_output_invalidation += eval_stats::ns_since(started);
+        w.inv_pending_added += pending_after.saturating_sub(pending_before) as u64;
+        if origin == InvalidationOrigin::SpillClear {
+            w.spill_clear_followers += cells.len() as u64;
+        }
+        if cells.is_empty() {
+            w.inv_empty_calls += 1;
+            return;
+        }
+        let (calls, n_cells, affected) = match origin {
+            InvalidationOrigin::SpillClear => (
+                &mut w.inv_spill_clear_calls,
+                &mut w.inv_spill_clear_cells,
+                &mut w.inv_spill_clear_affected,
+            ),
+            InvalidationOrigin::SpillCommitMulti => (
+                &mut w.inv_commit_multi_calls,
+                &mut w.inv_commit_multi_cells,
+                &mut w.inv_commit_multi_affected,
+            ),
+            InvalidationOrigin::Commit1x1 => (
+                &mut w.inv_commit_1x1_calls,
+                &mut w.inv_commit_1x1_cells,
+                &mut w.inv_commit_1x1_affected,
+            ),
+        };
+        *calls += 1;
+        *n_cells += cells.len() as u64;
+        *affected += affected_len as u64;
+        w.inv_affected_max = w.inv_affected_max.max(affected_len as u64);
+    }
+
+    /// Returns the size of the invalidation closure.
+    fn record_changed_output_invalidations_inner(
+        &mut self,
+        anchor: VertexId,
+        cells: &[CellRef],
+    ) -> usize {
         // A new committed footprint can add hard virtual edges without changing graph CSR.
         self.cached_static_schedule = None;
         // The chain is already covered here: the spill commit that reaches this
@@ -30807,6 +31041,7 @@ where
         // through a two-step argument about the epoch.
         self.drop_spec_chain();
         let affected = self.graph.invalidate_changed_output_cells(cells);
+        let affected_len = affected.len();
         if !affected.is_empty() {
             self.output_invalidation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -30815,6 +31050,7 @@ where
             .get_mut()
             .unwrap()
             .extend(affected.into_iter().filter(|&v| v != anchor));
+        affected_len
     }
 
     fn nonempty_spill_followers(&self, anchor: VertexId, cells: &[CellRef]) -> Vec<CellRef> {
@@ -30837,6 +31073,17 @@ where
     }
 
     fn clear_spill_projection_and_mirror(
+        &mut self,
+        anchor_vertex: VertexId,
+        delta: Option<&mut DeltaCollector>,
+    ) {
+        let started = crate::instant::FzInstant::now();
+        self.eval_stats_note_spill_clear_begin(anchor_vertex);
+        self.clear_spill_projection_and_mirror_inner(anchor_vertex, delta);
+        self.eval_stats_work.ns_spill_clear += eval_stats::ns_since(started);
+    }
+
+    fn clear_spill_projection_and_mirror_inner(
         &mut self,
         anchor_vertex: VertexId,
         delta: Option<&mut DeltaCollector>,
@@ -30886,7 +31133,11 @@ where
                 );
             }
         }
-        self.record_changed_output_invalidations(anchor_vertex, &changed_followers);
+        self.record_changed_output_invalidations(
+            anchor_vertex,
+            &changed_followers,
+            InvalidationOrigin::SpillClear,
+        );
     }
 
     /// Apply the evaluation outcome for one cyclic SCC: stamp `#CIRC!` on its
@@ -32391,7 +32642,7 @@ classify_calls={} classify_skipped={}",
         ctx: &RecordingContext<'_, R>,
         collector: &LiveEdgeCollector,
     ) -> Result<LiteralValue, ExcelError> {
-        let invalidation_token = self.output_invalidation_token(vertex_id);
+        let invalidation_token = self.output_invalidation_token(vertex_id, TokenSite::Scc);
         let result = self.evaluate_vertex_recorded_inner(vertex_id, ctx, collector);
         self.retire_output_invalidation(vertex_id, invalidation_token);
         result
@@ -32650,6 +32901,52 @@ classify_calls={} classify_skipped={}",
         anchor_vertex: VertexId,
         targets: &[CellRef],
         rows: Vec<Vec<LiteralValue>>,
+        delta: Option<&mut DeltaCollector>,
+        overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
+    ) -> Result<(), ExcelError> {
+        let started = crate::instant::FzInstant::now();
+        let (same_footprint, snapshot_values_equal) =
+            self.eval_stats_commit_precheck(anchor_vertex, targets, &rows);
+        self.eval_stats_last_commit_changed = usize::MAX;
+        let result = self.commit_spill_and_mirror_inner(
+            anchor_vertex,
+            targets,
+            rows,
+            delta,
+            overwritable_formulas,
+        );
+        if result.is_ok() {
+            let changed = self.eval_stats_last_commit_changed;
+            let w = &mut self.eval_stats_work;
+            w.spill_commit_count += 1;
+            if targets.len() > 1 {
+                w.spill_commit_multi += 1;
+            } else {
+                w.spill_commit_1x1 += 1;
+            }
+            if changed != usize::MAX {
+                w.spill_commit_changed_cells += changed as u64;
+            }
+            if same_footprint {
+                w.spill_commit_same_footprint += 1;
+                let identical = match snapshot_values_equal {
+                    Some(equal) => equal,
+                    None => changed == 0,
+                };
+                if identical {
+                    w.spill_commit_identical += 1;
+                }
+            }
+        }
+        self.eval_stats_work.ns_spill_commit += eval_stats::ns_since(started);
+        result
+    }
+
+    fn commit_spill_and_mirror_inner(
+        &mut self,
+        anchor_vertex: VertexId,
+        targets: &[CellRef],
+        rows: Vec<Vec<LiteralValue>>,
         mut delta: Option<&mut DeltaCollector>,
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
     ) -> Result<(), ExcelError> {
@@ -32789,8 +33086,266 @@ classify_calls={} classify_skipped={}",
                 );
             }
         }
-        self.record_changed_output_invalidations(anchor_vertex, &changed_cells);
+        let origin = if targets.len() > 1 || prev_spill_cells.len() > 1 {
+            InvalidationOrigin::SpillCommitMulti
+        } else {
+            InvalidationOrigin::Commit1x1
+        };
+        self.eval_stats_last_commit_changed = changed_cells.len();
+        self.record_changed_output_invalidations(anchor_vertex, &changed_cells, origin);
         Ok(())
+    }
+}
+
+/// GOD-383 Trial A T1: `evaluate_all` instrumentation helpers. Observational
+/// only; see `crate::engine::eval_stats`.
+impl<R> Engine<R>
+where
+    R: EvaluationContext,
+{
+    /// Stats of the last `evaluate_all` / `evaluate_all_cancellable` call.
+    pub fn eval_stats(&self) -> &EvalStats {
+        &self.last_eval_stats
+    }
+
+    fn eval_stats_begin(&mut self, entry: &'static str) {
+        self.eval_stats_atomics.reset();
+        self.eval_stats_last_clear = None;
+        self.eval_stats_recheck = RecheckScratch::default();
+        let mut w = EvalStats {
+            entry,
+            ..EvalStats::default()
+        };
+        w.base_dirty_visits = self.graph.dirty_propagation_visits();
+        w.base_footprint_epoch = self.graph.output_footprint_epoch();
+        w.base_topology_epoch = self.topology_epoch;
+        w.base_topology_revision = self.graph.topology_revision();
+        w.base_recheck_rebuilds = self.virtual_dep_recheck_rebuilds;
+        w.base_recheck_skips = self.virtual_dep_recheck_skips;
+        w.pending_formula_dirty_at_start = self.graph.formula_dirty_legacy_len() as u64;
+        self.eval_stats_work = w;
+        self.eval_stats_started = Some(crate::instant::FzInstant::now());
+    }
+
+    fn eval_stats_finish(&mut self, result: &Result<EvalResult, ExcelError>) {
+        let ns_total = self
+            .eval_stats_started
+            .take()
+            .map(eval_stats::ns_since)
+            .unwrap_or(0);
+        let tokens = self.eval_stats_atomics.snapshot();
+        let visits = self.graph.dirty_propagation_visits();
+        let footprint = self.graph.output_footprint_epoch();
+        let topology_epoch = self.topology_epoch;
+        let topology_revision = self.graph.topology_revision();
+        let rebuilds = self.virtual_dep_recheck_rebuilds;
+        let skips = self.virtual_dep_recheck_skips;
+        let cycle = self.last_cycle_telemetry.clone();
+        let chain_path = self.spec_chain_telemetry.last_path.unwrap_or("");
+        let chain_reason = self.spec_chain_telemetry.last_reason.unwrap_or("");
+        let w = &mut self.eval_stats_work;
+        w.ns_total = ns_total;
+        w.tokens = tokens;
+        match result {
+            Ok(r) => {
+                w.outcome = "ok";
+                w.computed_vertices = r.computed_vertices as u64;
+                w.cycle_errors = r.cycle_errors as u64;
+            }
+            Err(_) => w.outcome = "error",
+        }
+        w.dirty_propagation_visits_delta = visits.wrapping_sub(w.base_dirty_visits);
+        w.output_footprint_epoch_delta = footprint.wrapping_sub(w.base_footprint_epoch);
+        w.topology_epoch_delta = topology_epoch.wrapping_sub(w.base_topology_epoch);
+        w.topology_revision_delta = topology_revision.wrapping_sub(w.base_topology_revision);
+        w.vdep_recheck_rebuilds = rebuilds.wrapping_sub(w.base_recheck_rebuilds);
+        w.vdep_recheck_skips = skips.wrapping_sub(w.base_recheck_skips);
+        w.scc_tasks = cycle.static_sccs as u64;
+        w.scc_phantom = cycle.phantom_sccs as u64;
+        w.scc_live_cycles = cycle.live_cycles_witnessed as u64;
+        w.scc_settle_passes_total = cycle.settle_passes_total as u64;
+        w.scc_max_passes_single = cycle.max_passes_single_scc as u64;
+        w.scc_iterated = cycle.iterated_sccs as u64;
+        w.scc_capped = cycle.capped_sccs as u64;
+        w.scc_circ_stamped = cycle.circ_cells_stamped as u64;
+        w.spec_chain_last_path = chain_path;
+        w.spec_chain_last_reason = chain_reason;
+        self.last_eval_stats = self.eval_stats_work.clone();
+    }
+
+    fn eval_stats_get_evaluation_vertices(&mut self) -> Vec<VertexId> {
+        let started = crate::instant::FzInstant::now();
+        let vertices = self.graph.get_evaluation_vertices();
+        self.eval_stats_work.ns_dirty_get_eval_vertices += eval_stats::ns_since(started);
+        vertices
+    }
+
+    fn eval_stats_note_schedule(
+        &mut self,
+        replan_iterations: usize,
+        to_evaluate: usize,
+        static_sccs: usize,
+        meta: &ScheduleBuildMeta,
+        ns: u64,
+    ) {
+        let scc_base = self.last_cycle_telemetry.static_sccs as u64;
+        let settle_base = self.last_cycle_telemetry.settle_passes_total as u64;
+        let w = &mut self.eval_stats_work;
+        w.schedule_builds += 1;
+        w.schedule_cache_hits += u64::from(meta.schedule_cache_hit);
+        w.vdep_candidates += meta.candidate_vertices as u64;
+        w.vdep_vertices += meta.vdeps_vertices as u64;
+        w.vdep_edges += meta.vdeps_edges as u64;
+        w.ns_vdep_builder += meta.builder_elapsed_ns;
+        w.ns_schedule_build += ns;
+        if replan_iterations > 0 {
+            w.ns_replan_schedule_build += ns;
+        } else {
+            w.evaluation_vertices_first_pass = to_evaluate as u64;
+            w.scc_static_first_pass = static_sccs as u64;
+        }
+        w.passes += 1;
+        w.pass_to_evaluate.push(to_evaluate as u64);
+        w.pass_static_sccs.push(static_sccs as u64);
+        w.scc_static_total += static_sccs as u64;
+        w.pass_scc_tasks_base = scc_base;
+        w.pass_settle_base = settle_base;
+    }
+
+    #[inline]
+    fn eval_stats_note_unit(&mut self, is_cycle: bool, ns: u64) {
+        if is_cycle {
+            self.eval_stats_work.ns_scc_settle += ns;
+        } else {
+            self.eval_stats_work.ns_layer_eval += ns;
+        }
+    }
+
+    fn eval_stats_pass_walked(&mut self, replan_iterations: usize, computed: usize, ns: u64) {
+        let scc_now = self.last_cycle_telemetry.static_sccs as u64;
+        let settle_now = self.last_cycle_telemetry.settle_passes_total as u64;
+        let w = &mut self.eval_stats_work;
+        w.pass_computed.push(computed as u64);
+        w.pass_scc_tasks
+            .push(scc_now.saturating_sub(w.pass_scc_tasks_base));
+        w.pass_settle_passes
+            .push(settle_now.saturating_sub(w.pass_settle_base));
+        if replan_iterations > 0 {
+            w.ns_replan_eval += ns;
+        }
+    }
+
+    fn eval_stats_note_recheck(&mut self, changed: usize, ns: u64) {
+        let scratch = std::mem::take(&mut self.eval_stats_recheck);
+        let w = &mut self.eval_stats_work;
+        w.ns_recheck += ns;
+        w.pass_recheck.push(scratch.reason);
+        w.pass_pending_at_drain.push(scratch.pending_at_drain);
+        w.pass_changed_readers.push(scratch.changed_readers);
+        w.pass_formula_dirty_at_recheck.push(scratch.formula_dirty);
+        w.pass_changed.push(changed as u64);
+        w.pending_at_drain_total += scratch.pending_at_drain;
+        w.pending_at_drain_max = w.pending_at_drain_max.max(scratch.pending_at_drain);
+        w.changed_readers_total += scratch.changed_readers;
+        let outcome = if changed == 0 {
+            "converged"
+        } else {
+            match (scratch.pending_at_drain > 0, scratch.changed_readers > 0) {
+                (true, true) => "both",
+                (true, false) => "pending",
+                (false, true) => "changed_readers",
+                (false, false) => "other",
+            }
+        };
+        w.pass_outcome.push(outcome);
+    }
+
+    /// Count a spill clear and snapshot the region's values so the commit
+    /// that follows for the same anchor can tell an identical re-commit.
+    fn eval_stats_note_spill_clear_begin(&mut self, anchor: VertexId) {
+        let cells = match self.graph.spill_cells_for_anchor(anchor) {
+            Some(cells) if !cells.is_empty() => cells.to_vec(),
+            _ => {
+                self.eval_stats_last_clear = None;
+                return;
+            }
+        };
+        let values: Vec<LiteralValue> = cells
+            .iter()
+            .map(|cell| {
+                self.read_cell_value(
+                    self.graph.sheet_name(cell.sheet_id),
+                    cell.coord.row() + 1,
+                    cell.coord.col() + 1,
+                )
+                .unwrap_or(LiteralValue::Empty)
+            })
+            .collect();
+        self.eval_stats_work.spill_clear_count += 1;
+        self.eval_stats_work.spill_clear_cells += cells.len() as u64;
+        self.eval_stats_last_clear = Some(SpillClearSnapshot {
+            anchor,
+            cells,
+            values,
+        });
+    }
+
+    /// `(same_footprint, values_equal_to_pre_clear_snapshot)`; the second is
+    /// `None` when no clear snapshot applies (the commit's own changed-cell
+    /// count then decides identity).
+    fn eval_stats_commit_precheck(
+        &mut self,
+        anchor: VertexId,
+        targets: &[CellRef],
+        rows: &[Vec<LiteralValue>],
+    ) -> (bool, Option<bool>) {
+        let snapshot = self.eval_stats_last_clear.take();
+        let prev = self.graph.spill_cells_for_anchor(anchor);
+        let prev_empty = prev.is_none_or(|c| c.is_empty());
+        let same_set = |a: &[CellRef], b: &[CellRef]| {
+            if a.len() != b.len() {
+                return false;
+            }
+            if a == b {
+                return true;
+            }
+            let mut a = a.to_vec();
+            let mut b = b.to_vec();
+            a.sort_unstable();
+            b.sort_unstable();
+            a == b
+        };
+        match snapshot {
+            Some(snap) if snap.anchor == anchor && prev_empty => {
+                if !same_set(&snap.cells, targets) {
+                    return (false, Some(false));
+                }
+                let width = rows.first().map(|r| r.len()).unwrap_or(0);
+                let old: FxHashMap<CellRef, &LiteralValue> =
+                    snap.cells.iter().copied().zip(snap.values.iter()).collect();
+                let empty = LiteralValue::Empty;
+                let equal = targets.iter().enumerate().all(|(idx, cell)| {
+                    let new = if width == 0 {
+                        &empty
+                    } else {
+                        rows.get(idx / width)
+                            .and_then(|r| r.get(idx % width))
+                            .unwrap_or(&empty)
+                    };
+                    old.get(cell).is_some_and(|o| *o == new)
+                });
+                (true, Some(equal))
+            }
+            _ => {
+                let same = match prev {
+                    Some(prev) if !prev.is_empty() => same_set(prev, targets),
+                    _ => {
+                        targets.len() == 1 && self.graph.get_cell_ref(anchor) == Some(targets[0])
+                    }
+                };
+                (same, None)
+            }
+        }
     }
 }
 
@@ -33201,6 +33756,20 @@ where
         log: Option<&mut ChangeLog>,
         computed_writes: Option<&mut ComputedWriteBuffer>,
     ) -> Result<(), ExcelError> {
+        let started = crate::instant::FzInstant::now();
+        self.eval_stats_note_spill_clear_begin(anchor_vertex);
+        let result = self.apply_spill_clear_inner(anchor_vertex, delta, log, computed_writes);
+        self.eval_stats_work.ns_spill_clear += eval_stats::ns_since(started);
+        result
+    }
+
+    fn apply_spill_clear_inner(
+        &mut self,
+        anchor_vertex: VertexId,
+        delta: Option<&mut DeltaCollector>,
+        log: Option<&mut ChangeLog>,
+        computed_writes: Option<&mut ComputedWriteBuffer>,
+    ) -> Result<(), ExcelError> {
         if let Some(buffer) = computed_writes {
             self.flush_computed_write_buffer(buffer)?;
         }
@@ -33269,7 +33838,11 @@ where
                 old,
             });
         }
-        self.record_changed_output_invalidations(anchor_vertex, &changed_followers);
+        self.record_changed_output_invalidations(
+            anchor_vertex,
+            &changed_followers,
+            InvalidationOrigin::SpillClear,
+        );
         Ok(())
     }
 

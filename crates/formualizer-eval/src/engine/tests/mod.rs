@@ -20,6 +20,7 @@ mod dirty_propagation;
 mod dirty_propagation_precision;
 mod elementwise_lift_spill_plane;
 mod elementwise_trig_lifting;
+mod eval_stats;
 mod evaluation;
 mod evaluation_resource_ledger;
 mod evaluation_resource_observability;

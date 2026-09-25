@@ -36,6 +36,11 @@ tracing_chrome = ["tracing", "formualizer/tracing_chrome"]
 # cross-call RSS retention on glibc by avoiding the per-thread-arena
 # fragmentation caused by per-call rayon worker pools (see issue #63).
 allocator-jemalloc = ["dep:tikv-jemallocator"]
+# GOD-383 Trial A: in-process sampling profiler (pprof-rs, setitimer/SIGPROF,
+# frame-pointer unwinding) exposed as `formualizer._profile_start(hz)` /
+# `formualizer._profile_stop(path)`, writing folded stacks. Linux only; build
+# with RUSTFLAGS="-C force-frame-pointers=yes". Never in a default build.
+profiling = ["dep:pprof"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["chrono", "abi3-py310", "multiple-pymethods"] }
@@ -70,3 +75,7 @@ formualizer = { path = "../../crates/formualizer", default-features = false, fea
 # present at exec time and the import fails with "cannot allocate memory in
 # static TLS block" on glibc.
 tikv-jemallocator = { version = "0.6", optional = true, features = ["disable_initial_exec_tls"] }
+
+# Optional sampling profiler (see the `profiling` feature).
+[target.'cfg(target_os = "linux")'.dependencies]
+pprof = { version = "0.15", optional = true, default-features = false, features = ["frame-pointer", "large-depth"] }

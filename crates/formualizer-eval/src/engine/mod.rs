@@ -9,6 +9,7 @@ pub(crate) mod convergence;
 pub mod effects;
 pub mod eval;
 pub mod eval_delta;
+pub mod eval_stats;
 pub mod formula_ingest;
 mod formula_source;
 pub(crate) mod fragmented_transaction;
@@ -65,6 +66,7 @@ pub use eval::{
     SpecChainTelemetry, StampedSccDiagnostic, StampedSccDiagnosticEdge, TableMetadata,
     UpstreamDiagnosticsSnapshot, VirtualDepTelemetry,
 };
+pub use eval_stats::{EvalStatValue, EvalStats};
 pub use eval_delta::{
     DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy, EvalDeltaRecord, TARGET_EVAL_DELTA_VERSION,
     TargetEvalDelta,
