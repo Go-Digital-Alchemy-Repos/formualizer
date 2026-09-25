@@ -1760,6 +1760,16 @@ pub struct Engine<R> {
     eval_stats_recheck: RecheckScratch,
     eval_stats_last_commit_changed: usize,
     eval_stats_started: Option<crate::instant::FzInstant>,
+    /// GOD-383 Trial A T2a toggles, read once per construction from the
+    /// environment ("1" = on, default off): `FZ_SPILL_SAME_EXTENT_UPDATE`
+    /// (values-only update of a registered spill whose extent is unchanged)
+    /// and `FZ_SPILL_PENDING_BY_POSITION` (pend only invalidation-closure
+    /// vertices the running pass has already reached).
+    pub(crate) spill_same_extent_update: bool,
+    pub(crate) spill_pending_by_position: bool,
+    /// Unit positions of the schedule the current pass is walking; set only
+    /// while `spill_pending_by_position` is on and a pass walks its units.
+    pass_positions: Option<PassPositions>,
     finalized_output_cycle_vertices: FxHashSet<VertexId>,
 
     /// Formula results persisted in the source workbook. Excel uses these as
@@ -4159,6 +4169,9 @@ where
             eval_stats_recheck: RecheckScratch::default(),
             eval_stats_last_commit_changed: 0,
             eval_stats_started: None,
+            spill_same_extent_update: eval_stats::env_toggle("FZ_SPILL_SAME_EXTENT_UPDATE"),
+            spill_pending_by_position: eval_stats::env_toggle("FZ_SPILL_PENDING_BY_POSITION"),
+            pass_positions: None,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             rich_error_details: FxHashMap::default(),
@@ -4350,6 +4363,9 @@ where
             eval_stats_recheck: RecheckScratch::default(),
             eval_stats_last_commit_changed: 0,
             eval_stats_started: None,
+            spill_same_extent_update: eval_stats::env_toggle("FZ_SPILL_SAME_EXTENT_UPDATE"),
+            spill_pending_by_position: eval_stats::env_toggle("FZ_SPILL_PENDING_BY_POSITION"),
+            pass_positions: None,
             finalized_output_cycle_vertices: FxHashSet::default(),
             saved_formula_values: FxHashMap::default(),
             rich_error_details: FxHashMap::default(),
@@ -25832,9 +25848,20 @@ where
         &mut self,
         schedule: &crate::engine::scheduler::Schedule,
     ) -> Result<(usize, usize), ExcelError> {
+        self.pass_positions_install(schedule);
+        let result = self.legacy_pass_run_units_inner(schedule);
+        self.pass_positions = None;
+        result
+    }
+
+    fn legacy_pass_run_units_inner(
+        &mut self,
+        schedule: &crate::engine::scheduler::Schedule,
+    ) -> Result<(usize, usize), ExcelError> {
         let mut computed_vertices = 0;
         let mut cycle_count = 0;
-        for &unit in &schedule.units {
+        for (unit_index, &unit) in schedule.units.iter().enumerate() {
+            self.pass_positions_enter(unit_index);
             let unit_started = crate::instant::FzInstant::now();
             match unit {
                 ScheduleUnit::Cycle(i) => {
@@ -28372,12 +28399,15 @@ where
             // units (formerly between cycles and between layers).
             let walk_started = crate::instant::FzInstant::now();
             let computed_before_walk = computed_vertices;
-            for &unit in &schedule.units {
+            self.pass_positions_install(&schedule);
+            for (unit_index, &unit) in schedule.units.iter().enumerate() {
+                self.pass_positions_enter(unit_index);
                 let unit_started = crate::instant::FzInstant::now();
                 match unit {
                     ScheduleUnit::Cycle(i) => {
                         // Check cancellation between cycles
                         if cancel_flag.load(Ordering::Relaxed) {
+                            self.pass_positions = None;
                             if let Some(mut t) = telemetry {
                                 t.bailout_reason = Some("cancelled");
                                 t.replan_iterations = replan_iterations;
@@ -28388,13 +28418,13 @@ where
                             ));
                         }
 
-                        if self.handle_cycle_unit(
+                        let handled = self.handle_cycle_unit(
                             schedule.unit_cycle(i),
                             None,
                             None,
                             Some(cancel_flag),
-                        )? > 0
-                        {
+                        );
+                        if self.pass_positions_guard(handled)? > 0 {
                             cycle_errors += 1;
                         }
                     }
@@ -28402,6 +28432,7 @@ where
                         let layer = schedule.unit_layer(i);
                         // Check cancellation between layers
                         if cancel_flag.load(Ordering::Relaxed) {
+                            self.pass_positions = None;
                             if let Some(mut t) = telemetry {
                                 t.bailout_reason = Some("cancelled");
                                 t.replan_iterations = replan_iterations;
@@ -28412,13 +28443,12 @@ where
                         }
 
                         // Evaluate vertices in this layer (parallel or sequential)
-                        if self.thread_pool.is_some() && layer.vertices.len() > 1 {
-                            computed_vertices +=
-                                self.evaluate_layer_parallel_cancellable(layer, cancel_flag)?;
+                        let evaluated = if self.thread_pool.is_some() && layer.vertices.len() > 1 {
+                            self.evaluate_layer_parallel_cancellable(layer, cancel_flag)
                         } else {
-                            computed_vertices +=
-                                self.evaluate_layer_sequential_cancellable(layer, cancel_flag)?;
-                        }
+                            self.evaluate_layer_sequential_cancellable(layer, cancel_flag)
+                        };
+                        computed_vertices += self.pass_positions_guard(evaluated)?;
                     }
                 }
                 self.eval_stats_note_unit(
@@ -28426,6 +28456,7 @@ where
                     eval_stats::ns_since(unit_started),
                 );
             }
+            self.pass_positions = None;
             self.eval_stats_pass_walked(
                 replan_iterations,
                 computed_vertices - computed_before_walk,
@@ -31046,10 +31077,18 @@ where
             self.output_invalidation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
-        self.pending_output_invalidations
-            .get_mut()
-            .unwrap()
-            .extend(affected.into_iter().filter(|&v| v != anchor));
+        if self.anchor_position_known(anchor) {
+            let pend = self.pending_by_position(anchor, &affected);
+            self.pending_output_invalidations
+                .get_mut()
+                .unwrap()
+                .extend(pend);
+        } else {
+            self.pending_output_invalidations
+                .get_mut()
+                .unwrap()
+                .extend(affected.into_iter().filter(|&v| v != anchor));
+        }
         affected_len
     }
 
@@ -32905,7 +32944,7 @@ classify_calls={} classify_skipped={}",
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
     ) -> Result<(), ExcelError> {
         let started = crate::instant::FzInstant::now();
-        let (same_footprint, snapshot_values_equal) =
+        let (same_footprint, differing_cells) =
             self.eval_stats_commit_precheck(anchor_vertex, targets, &rows);
         self.eval_stats_last_commit_changed = usize::MAX;
         let result = self.commit_spill_and_mirror_inner(
@@ -32929,11 +32968,8 @@ classify_calls={} classify_skipped={}",
             }
             if same_footprint {
                 w.spill_commit_same_footprint += 1;
-                let identical = match snapshot_values_equal {
-                    Some(equal) => equal,
-                    None => changed == 0,
-                };
-                if identical {
+                w.spill_commit_differing_cells += differing_cells as u64;
+                if differing_cells == 0 {
                     w.spill_commit_identical += 1;
                 }
             }
@@ -33109,6 +33145,7 @@ where
     }
 
     fn eval_stats_begin(&mut self, entry: &'static str) {
+        self.pass_positions = None;
         self.eval_stats_atomics.reset();
         self.eval_stats_last_clear = None;
         self.eval_stats_recheck = RecheckScratch::default();
@@ -33290,62 +33327,471 @@ where
         });
     }
 
-    /// `(same_footprint, values_equal_to_pre_clear_snapshot)`; the second is
-    /// `None` when no clear snapshot applies (the commit's own changed-cell
-    /// count then decides identity).
+    /// `(same_footprint, differing_cells)`: whether the commit's footprint
+    /// equals the footprint just before it (the registered region, or the
+    /// region the immediately preceding clear of the same anchor removed),
+    /// and, when it does, how many target cells' new values differ from the
+    /// reader-observed values before that clear/commit
+    /// (`spill_values_equal_as_read`). `differing_cells` is 0 when the
+    /// footprint differs.
     fn eval_stats_commit_precheck(
         &mut self,
         anchor: VertexId,
         targets: &[CellRef],
         rows: &[Vec<LiteralValue>],
-    ) -> (bool, Option<bool>) {
+    ) -> (bool, usize) {
         let snapshot = self.eval_stats_last_clear.take();
         let prev = self.graph.spill_cells_for_anchor(anchor);
         let prev_empty = prev.is_none_or(|c| c.is_empty());
-        let same_set = |a: &[CellRef], b: &[CellRef]| {
-            if a.len() != b.len() {
-                return false;
+        let width = rows.first().map(|r| r.len()).unwrap_or(0);
+        let empty = LiteralValue::Empty;
+        let new_at = |idx: usize| -> &LiteralValue {
+            if width == 0 {
+                &empty
+            } else {
+                rows.get(idx / width)
+                    .and_then(|r| r.get(idx % width))
+                    .unwrap_or(&empty)
             }
-            if a == b {
-                return true;
-            }
-            let mut a = a.to_vec();
-            let mut b = b.to_vec();
-            a.sort_unstable();
-            b.sort_unstable();
-            a == b
         };
         match snapshot {
             Some(snap) if snap.anchor == anchor && prev_empty => {
-                if !same_set(&snap.cells, targets) {
-                    return (false, Some(false));
+                if !Self::same_cell_set(&snap.cells, targets) {
+                    return (false, 0);
                 }
-                let width = rows.first().map(|r| r.len()).unwrap_or(0);
                 let old: FxHashMap<CellRef, &LiteralValue> =
                     snap.cells.iter().copied().zip(snap.values.iter()).collect();
-                let empty = LiteralValue::Empty;
-                let equal = targets.iter().enumerate().all(|(idx, cell)| {
-                    let new = if width == 0 {
-                        &empty
-                    } else {
-                        rows.get(idx / width)
-                            .and_then(|r| r.get(idx % width))
-                            .unwrap_or(&empty)
-                    };
-                    old.get(cell).is_some_and(|o| *o == new)
-                });
-                (true, Some(equal))
+                let differing = targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, cell)| {
+                        let ds = self.arrow_sheet_date_system(self.graph.sheet_name(cell.sheet_id));
+                        !old.get(*cell).is_some_and(|o| {
+                            Self::spill_values_equal_as_read(o, new_at(*idx), ds)
+                        })
+                    })
+                    .count();
+                (true, differing)
             }
             _ => {
                 let same = match prev {
-                    Some(prev) if !prev.is_empty() => same_set(prev, targets),
+                    Some(prev) if !prev.is_empty() => Self::same_cell_set(prev, targets),
                     _ => {
                         targets.len() == 1 && self.graph.get_cell_ref(anchor) == Some(targets[0])
                     }
                 };
-                (same, None)
+                if !same {
+                    return (false, 0);
+                }
+                let differing = targets
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, cell)| {
+                        let sheet = self.graph.sheet_name(cell.sheet_id);
+                        let ds = self.arrow_sheet_date_system(sheet);
+                        let old = self
+                            .read_cell_value(sheet, cell.coord.row() + 1, cell.coord.col() + 1)
+                            .unwrap_or(LiteralValue::Empty);
+                        !Self::spill_values_equal_as_read(&old, new_at(*idx), ds)
+                    })
+                    .count();
+                (true, differing)
             }
         }
+    }
+
+    fn same_cell_set(a: &[CellRef], b: &[CellRef]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        if a == b {
+            return true;
+        }
+        let mut a = a.to_vec();
+        let mut b = b.to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        a == b
+    }
+}
+
+/// Unit positions of the schedule a pass is walking (GOD-383 T2a,
+/// `FZ_SPILL_PENDING_BY_POSITION`). `map` gives each scheduled vertex the
+/// index of its unit in `Schedule::units` (condensation order); `current` is
+/// the index of the unit being executed.
+#[derive(Debug, Default)]
+struct PassPositions {
+    map: FxHashMap<VertexId, u32>,
+    current: u32,
+}
+
+/// GOD-383 Trial A T2a: same-extent spill update (toggle A) and
+/// position-based pending (toggle B).
+impl<R> Engine<R>
+where
+    R: EvaluationContext,
+{
+    /// Toggle B: record the unit position of every vertex of the schedule the
+    /// pass is about to walk. A no-op (positions unknown) with the toggle off.
+    fn pass_positions_install(&mut self, schedule: &crate::engine::scheduler::Schedule) {
+        if !self.spill_pending_by_position {
+            self.pass_positions = None;
+            return;
+        }
+        let mut map: FxHashMap<VertexId, u32> = FxHashMap::default();
+        for (index, unit) in schedule.units.iter().enumerate() {
+            let position = index as u32;
+            match *unit {
+                ScheduleUnit::Layer(i) => {
+                    for &v in &schedule.unit_layer(i).vertices {
+                        map.insert(v, position);
+                    }
+                }
+                ScheduleUnit::Cycle(i) => {
+                    for &v in schedule.unit_cycle(i) {
+                        map.insert(v, position);
+                    }
+                }
+            }
+        }
+        self.pass_positions = Some(PassPositions { map, current: 0 });
+    }
+
+    #[inline]
+    fn pass_positions_enter(&mut self, unit_index: usize) {
+        if let Some(positions) = self.pass_positions.as_mut() {
+            positions.current = unit_index as u32;
+        }
+    }
+
+    /// Drop the positions when a unit walk returns an error, so a later
+    /// commit outside the pass never consults a stale schedule.
+    #[inline]
+    fn pass_positions_guard<T>(&mut self, result: Result<T, ExcelError>) -> Result<T, ExcelError> {
+        if result.is_err() {
+            self.pass_positions = None;
+        }
+        result
+    }
+
+    /// True when toggle B is on, a pass is walking its units, and `anchor`
+    /// belongs to the unit being executed. Anything else means the anchor's
+    /// position is unknown and the whole closure is pended (today's rule).
+    fn anchor_position_known(&self, anchor: VertexId) -> bool {
+        self.spill_pending_by_position
+            && self
+                .pass_positions
+                .as_ref()
+                .is_some_and(|p| p.map.get(&anchor) == Some(&p.current))
+    }
+
+    /// Toggle B: the closure vertices to pend for a commit by `anchor`.
+    ///
+    /// A closure vertex is pended when the running pass has already reached
+    /// it (its unit is at or before the anchor's: earlier layer, same layer,
+    /// same or earlier SCC task), when it is not in the pass's schedule, or
+    /// when it is dynamic (OFFSET/INDIRECT-style readers keep today's
+    /// conservative retention). The pended set is then closed downstream
+    /// within the closure: a later-scheduled vertex that depends on a pended
+    /// one is pended too, because the pended vertex's value may still change
+    /// in the next pass. Every remaining vertex is scheduled strictly after
+    /// the anchor and reads the committed values when it is evaluated, so it
+    /// is not pended.
+    fn pending_by_position(&mut self, anchor: VertexId, affected: &[VertexId]) -> Vec<VertexId> {
+        let Some(positions) = self.pass_positions.as_ref() else {
+            return affected.iter().copied().filter(|&v| v != anchor).collect();
+        };
+        let current = positions.current;
+        let in_closure: FxHashSet<VertexId> = affected.iter().copied().collect();
+        let mut pended: FxHashSet<VertexId> = FxHashSet::default();
+        let mut stack: Vec<VertexId> = Vec::new();
+        for &v in affected {
+            if v == anchor {
+                continue;
+            }
+            let reached = match positions.map.get(&v) {
+                None => true,
+                Some(&p) => p <= current,
+            };
+            if (reached || self.graph.is_dynamic(v)) && pended.insert(v) {
+                stack.push(v);
+            }
+        }
+        let mut walked: FxHashSet<VertexId> = FxHashSet::default();
+        while let Some(v) = stack.pop() {
+            if !walked.insert(v) {
+                continue;
+            }
+            for d in self.graph.propagation_successors(v) {
+                if !in_closure.contains(&d) {
+                    continue;
+                }
+                if d == anchor {
+                    // Never pend the anchor (today's rule), but walk through it.
+                    stack.push(d);
+                    continue;
+                }
+                if pended.insert(d) {
+                    stack.push(d);
+                }
+            }
+        }
+        let skipped = affected
+            .iter()
+            .filter(|&&v| v != anchor && !pended.contains(&v))
+            .count();
+        let w = &mut self.eval_stats_work;
+        w.pending_by_position_pended += pended.len() as u64;
+        w.pending_by_position_skipped += skipped as u64;
+        pended.into_iter().collect()
+    }
+
+    /// A value as a reader of the cell would observe it after the computed
+    /// overlay holds it: the overlay round trip (Int and Number alike, dates,
+    /// times and durations as serial numbers). Errors, Pending and arrays are
+    /// kept as they are (compared strictly below).
+    fn spill_value_as_read(
+        value: &LiteralValue,
+        date_system: crate::engine::DateSystem,
+    ) -> LiteralValue {
+        match value {
+            LiteralValue::Error(_) | LiteralValue::Pending | LiteralValue::Array(_) => {
+                value.clone()
+            }
+            other => OverlayValue::from_literal_value(other, date_system).to_literal_for(date_system),
+        }
+    }
+
+    /// Reader-observed equality for spill cells. Numbers compare by bit
+    /// pattern, so -0.0 and 0.0 differ (the write happens) and NaN never
+    /// equals anything; errors compare in full (kind, message, extra), which
+    /// is stricter than a reader needs; Pending and arrays always differ.
+    /// Anything that is not provably equal counts as differing, which falls
+    /// back to writing and invalidating that cell.
+    pub(crate) fn spill_values_equal_as_read(
+        old: &LiteralValue,
+        new: &LiteralValue,
+        date_system: crate::engine::DateSystem,
+    ) -> bool {
+        let old = Self::spill_value_as_read(old, date_system);
+        let new = Self::spill_value_as_read(new, date_system);
+        match (&old, &new) {
+            (LiteralValue::Number(a), LiteralValue::Number(b)) => {
+                !a.is_nan() && !b.is_nan() && a.to_bits() == b.to_bits()
+            }
+            (LiteralValue::Pending, _)
+            | (_, LiteralValue::Pending)
+            | (LiteralValue::Array(_), _)
+            | (_, LiteralValue::Array(_)) => false,
+            (a, b) => a == b,
+        }
+    }
+
+    /// Toggle A eligibility: the anchor already has a registered spill whose
+    /// cell set equals the new rectangle, every target cell is still owned by
+    /// this anchor (a follower edited externally drops the registration), the
+    /// region is not blocked or pending, the values are a full rectangle, and
+    /// the engine stores values Arrow-canonically with computed-overlay
+    /// mirroring on and FormulaPlane off. Everything else keeps today's
+    /// clear-then-commit path.
+    fn spill_same_extent_eligible(
+        &self,
+        anchor: VertexId,
+        targets: &[CellRef],
+        rows: &[Vec<LiteralValue>],
+    ) -> bool {
+        if !(self.config.arrow_storage_enabled
+            && self.config.delta_overlay_enabled
+            && self.config.write_formula_overlay_enabled)
+            || self.computed_overlay_mirroring_disabled
+            || self.graph.value_cache_enabled()
+            || self.config.formula_plane_mode != FormulaPlaneMode::Off
+        {
+            return false;
+        }
+        if !matches!(self.graph.get_vertex_kind(anchor), VertexKind::FormulaArray) {
+            return false;
+        }
+        let Some(anchor_cell) = self.graph.get_cell_ref(anchor) else {
+            return false;
+        };
+        let width = rows.first().map(|r| r.len()).unwrap_or(0);
+        if width == 0
+            || rows.iter().any(|r| r.len() != width)
+            || rows.len().saturating_mul(width) != targets.len()
+        {
+            return false;
+        }
+        let (Some(first), Some(last)) = (targets.first(), targets.last()) else {
+            return false;
+        };
+        if *first != anchor_cell {
+            return false;
+        }
+        let Some(prev) = self.graph.spill_cells_for_anchor(anchor) else {
+            return false;
+        };
+        if prev.is_empty() || !Self::same_cell_set(prev, targets) {
+            return false;
+        }
+        if targets
+            .iter()
+            .any(|cell| self.graph.spill_registry_anchor_for_cell(*cell) != Some(anchor))
+        {
+            return false;
+        }
+        // A user value in a follower (delta overlay, which readers see before
+        // the computed overlay) blocks today's re-commit once the clear drops
+        // ownership; leave that decision to today's path.
+        let sheet = self.graph.sheet_name(anchor_cell.sheet_id);
+        if targets.iter().skip(1).any(|cell| {
+            !matches!(
+                self.read_delta_overlay_cell(sheet, cell.coord.row() + 1, cell.coord.col() + 1),
+                None | Some(LiteralValue::Empty)
+            )
+        }) {
+            return false;
+        }
+        let region = Region::rect(
+            anchor_cell.sheet_id,
+            anchor_cell.coord.row(),
+            last.coord.row(),
+            anchor_cell.coord.col(),
+            last.coord.col(),
+        );
+        if self
+            .blocked_pending_spills
+            .iter()
+            .any(|entry| entry.0 == anchor || entry.2.intersects(&region))
+        {
+            return false;
+        }
+        if self.pending_spill_occupied(anchor_cell, last.coord.row(), last.coord.col()) {
+            return false;
+        }
+        self.graph
+            .plan_spill_region_allowing_formula_overwrite(anchor, targets, None)
+            .is_ok()
+    }
+
+    /// Toggle A: apply `[SpillClear, SpillCommit]` for an eligible anchor as a
+    /// values-only update. No clear, no registry change and no
+    /// `output_footprint_epoch` bump (the extent is unchanged). Each target's
+    /// new value is compared with its reader-observed stored value before any
+    /// write; only differing cells are written through the graph, propagate
+    /// dirtiness and reach `record_changed_output_invalidations` (skipped
+    /// entirely on an empty diff, so the chain, the static schedule and the
+    /// invalidation epoch stay). The computed overlay is refreshed for every
+    /// target cell. The ChangeLog gets `SpillCommitted { old: Some(prev) }`.
+    fn apply_spill_same_extent_update(
+        &mut self,
+        anchor: VertexId,
+        targets: &[CellRef],
+        rows: &[Vec<LiteralValue>],
+        mut delta: Option<&mut DeltaCollector>,
+        log: Option<&mut ChangeLog>,
+        computed_writes: Option<&mut ComputedWriteBuffer>,
+    ) -> Result<(), ExcelError> {
+        let started = crate::instant::FzInstant::now();
+        if let Some(buffer) = computed_writes {
+            self.flush_computed_write_buffer(buffer)?;
+        }
+        let old_snapshot = if log.is_some() {
+            self.snapshot_spill_for_anchor(anchor)
+        } else {
+            None
+        };
+        let width = rows[0].len();
+        let mut differing: Vec<(CellRef, LiteralValue)> = Vec::new();
+        for (idx, cell) in targets.iter().enumerate() {
+            let new = &rows[idx / width][idx % width];
+            let sheet = self.graph.sheet_name(cell.sheet_id);
+            let date_system = self.arrow_sheet_date_system(sheet);
+            let old = self
+                .read_cell_value(sheet, cell.coord.row() + 1, cell.coord.col() + 1)
+                .unwrap_or(LiteralValue::Empty);
+            if !Self::spill_values_equal_as_read(&old, new, date_system) {
+                differing.push((*cell, new.clone()));
+            }
+        }
+
+        if !differing.is_empty() {
+            let anchor_cell = self.graph.get_cell_ref(anchor);
+            self.graph.begin_deferred_dirty();
+            for (cell, value) in &differing {
+                if Some(*cell) == anchor_cell {
+                    self.graph.update_vertex_value(anchor, value.clone());
+                } else {
+                    let sheet = self.graph.sheet_name(cell.sheet_id).to_string();
+                    let _ = self.graph.set_cell_value(
+                        &sheet,
+                        cell.coord.row() + 1,
+                        cell.coord.col() + 1,
+                        value.clone(),
+                    );
+                }
+            }
+            self.graph.end_deferred_dirty();
+        }
+        self.spill_mgr.release_owner(anchor);
+
+        if let Some(d) = delta.as_deref_mut() {
+            for (cell, _) in &differing {
+                d.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
+            }
+        }
+
+        // Keep the computed overlay right for every target cell, changed or
+        // not, so a reset overlay cannot leave a reader on a stale base value.
+        for (idx, cell) in targets.iter().enumerate() {
+            let value = &rows[idx / width][idx % width];
+            let sheet = self.graph.sheet_name(cell.sheet_id).to_string();
+            self.mirror_value_to_computed_overlay(
+                &sheet,
+                cell.coord.row() + 1,
+                cell.coord.col() + 1,
+                value,
+            );
+        }
+
+        let changed: Vec<CellRef> = differing.iter().map(|(cell, _)| *cell).collect();
+        if !changed.is_empty() {
+            let origin = if targets.len() > 1 {
+                InvalidationOrigin::SpillCommitMulti
+            } else {
+                InvalidationOrigin::Commit1x1
+            };
+            self.record_changed_output_invalidations(anchor, &changed, origin);
+        }
+
+        if let Some(log) = log {
+            log.record(ChangeEvent::SpillCommitted {
+                anchor,
+                old: old_snapshot,
+                new: SpillSnapshot {
+                    target_cells: targets.to_vec(),
+                    values: rows.to_vec(),
+                },
+            });
+        }
+
+        let w = &mut self.eval_stats_work;
+        w.spill_commit_count += 1;
+        if targets.len() > 1 {
+            w.spill_commit_multi += 1;
+        } else {
+            w.spill_commit_1x1 += 1;
+        }
+        w.spill_commit_same_footprint += 1;
+        w.spill_commit_changed_cells += changed.len() as u64;
+        w.spill_commit_differing_cells += changed.len() as u64;
+        w.spill_same_extent_updates += 1;
+        if changed.is_empty() {
+            w.spill_commit_identical += 1;
+            w.spill_same_extent_empty_diffs += 1;
+        }
+        w.ns_spill_commit += eval_stats::ns_since(started);
+        Ok(())
     }
 }
 
@@ -33653,11 +34099,42 @@ where
         mut computed_writes: Option<&mut ComputedWriteBuffer>,
     ) -> Result<(), ExcelError> {
         let mut suppressed_write = None;
-        for effect in effects {
+        let mut skip_index = None;
+        for (index, effect) in effects.iter().enumerate() {
+            if skip_index == Some(index) {
+                skip_index = None;
+                continue;
+            }
             if let Effect::WriteCell { vertex_id, .. } = effect
                 && suppressed_write == Some(*vertex_id)
             {
                 suppressed_write = None;
+                continue;
+            }
+
+            // FZ_SPILL_SAME_EXTENT_UPDATE: `[SpillClear, SpillCommit]` for one
+            // anchor whose new rectangle equals its registered one is applied
+            // as a values-only update; every other shape keeps the path below.
+            if self.spill_same_extent_update
+                && let Effect::SpillClear { anchor_vertex } = effect
+                && let Some(Effect::SpillCommit {
+                    anchor_vertex: commit_anchor,
+                    target_cells,
+                    values,
+                    ..
+                }) = effects.get(index + 1)
+                && commit_anchor == anchor_vertex
+                && self.spill_same_extent_eligible(*anchor_vertex, target_cells, values)
+            {
+                self.apply_spill_same_extent_update(
+                    *anchor_vertex,
+                    target_cells,
+                    values,
+                    delta.as_deref_mut(),
+                    log.as_deref_mut(),
+                    computed_writes.as_deref_mut(),
+                )?;
+                skip_index = Some(index + 1);
                 continue;
             }
 

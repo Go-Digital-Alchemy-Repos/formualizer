@@ -3002,6 +3002,24 @@ impl DependencyGraph {
         affected.into_iter().collect()
     }
 
+    /// The vertices one dirty-propagation step reaches from `vertex_id`:
+    /// direct and range dependents, name dependents and output-footprint
+    /// readers, the same neighbour sets `mark_dirty_many` walks. Read-only;
+    /// used by the position-based pending filter (GOD-383 T2a) to close the
+    /// pended set downstream within an invalidation closure.
+    pub(crate) fn propagation_successors(&self, vertex_id: VertexId) -> Vec<VertexId> {
+        let mut out = match self.dependents_slice(vertex_id) {
+            Some(dependents) => dependents.to_vec(),
+            None => self.get_dependents(vertex_id),
+        };
+        if let Some(name_set) = self.cell_to_name_dependents.get(&vertex_id) {
+            out.extend(name_set.iter().copied());
+        }
+        out.extend(self.collect_range_dependents_for_vertex(vertex_id));
+        out.extend(self.collect_output_dependents(vertex_id));
+        out
+    }
+
     /// Total vertices processed by dirty-propagation BFS loops since graph
     /// creation (perf-shape observability; see `dirty_propagation_visits`).
     pub(crate) fn dirty_propagation_visits(&self) -> u64 {

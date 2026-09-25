@@ -89,6 +89,7 @@ mod anchor_region_memo;
 mod virtual_dep_recheck_guard;
 mod spill_basic;
 mod spill_identical_recommit;
+mod spill_same_extent_update;
 mod spill_config_defaults;
 mod spill_edges;
 mod spill_parallel_501;

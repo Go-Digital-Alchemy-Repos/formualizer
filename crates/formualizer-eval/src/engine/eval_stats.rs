@@ -203,10 +203,25 @@ pub struct EvalStats {
     /// Commits whose footprint equals the footprint just before them (the
     /// registered region, or the region the immediately preceding clear of
     /// the same anchor removed) and whose every value equals the value that
-    /// cell held before that clear/commit.
+    /// cell held before that clear/commit. Since T2a the comparison is the
+    /// reader-observed one (`Engine::spill_values_equal_as_read`: Int and
+    /// Number alike, dates as serials, -0.0 differs from 0.0, NaN always
+    /// differs, errors compared in full).
     pub spill_commit_identical: u64,
     pub spill_commit_same_footprint: u64,
     pub spill_commit_changed_cells: u64,
+    /// Same-footprint commits: target cells whose reader-observed value
+    /// differs from the value before the clear/commit (0 means identical).
+    pub spill_commit_differing_cells: u64,
+    /// `FZ_SPILL_SAME_EXTENT_UPDATE`: values-only updates of a registered
+    /// spill with an unchanged extent, and those whose diff was empty.
+    pub spill_same_extent_updates: u64,
+    pub spill_same_extent_empty_diffs: u64,
+    /// `FZ_SPILL_PENDING_BY_POSITION`: invalidation-closure vertices added to
+    /// the pending set, and those skipped because the pass schedules them
+    /// strictly after the committing anchor.
+    pub pending_by_position_pended: u64,
+    pub pending_by_position_skipped: u64,
 
     pub output_footprint_epoch_delta: u64,
     pub topology_epoch_delta: u64,
@@ -377,6 +392,23 @@ impl EvalStats {
                 u(self.spill_commit_changed_cells),
             ),
             (
+                "spill_commit_differing_cells",
+                u(self.spill_commit_differing_cells),
+            ),
+            ("spill_same_extent_updates", u(self.spill_same_extent_updates)),
+            (
+                "spill_same_extent_empty_diffs",
+                u(self.spill_same_extent_empty_diffs),
+            ),
+            (
+                "pending_by_position_pended",
+                u(self.pending_by_position_pended),
+            ),
+            (
+                "pending_by_position_skipped",
+                u(self.pending_by_position_skipped),
+            ),
+            (
                 "output_footprint_epoch_delta",
                 u(self.output_footprint_epoch_delta),
             ),
@@ -454,6 +486,13 @@ impl EvalStats {
             ("ns_overlay_flush", u(self.ns_overlay_flush)),
         ]
     }
+}
+
+/// GOD-383 Trial A T2a: an engine toggle read from the environment ("1" = on).
+/// Read once per `Engine` construction, never cached process-wide, so tests
+/// can construct engines with either setting.
+pub(crate) fn env_toggle(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
 }
 
 /// Whether the optional full dirty-flag scan (D3) is enabled.
