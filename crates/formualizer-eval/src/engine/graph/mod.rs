@@ -84,6 +84,12 @@ impl crate::traits::FunctionProvider for RegistryFunctionProvider {
     }
 }
 
+/// GOD-383 Trial A T2b: a write-path toggle is on only when the variable is
+/// exactly `1`; unset or anything else keeps the legacy behaviour.
+fn env_toggle_on(name: &str) -> bool {
+    matches!(std::env::var(name).as_deref(), Ok("1"))
+}
+
 #[inline]
 pub(crate) fn normalize_stored_literal(value: LiteralValue) -> LiteralValue {
     match value {
@@ -199,6 +205,21 @@ pub struct DependencyGraph {
     // and set representation behind this single authority.
     formula_dirty: FormulaDirtyState,
     volatile_vertices: FxHashSet<VertexId>,
+    /// GOD-383 Trial A T2b (`FZ_CLEAR_VOLATILE_ON_VALUE=1`, read once when the
+    /// graph is built, i.e. once per `Engine` construction): a formula vertex
+    /// overwritten by a value loses its volatile and dynamic flags and leaves
+    /// `volatile_vertices`, so it is no longer re-dirtied after every
+    /// evaluation. Off: the stale flags stay (legacy behaviour).
+    clear_volatile_on_value: bool,
+    /// GOD-383 Trial A T2b (`FZ_WRITE_NOOPS=1`, read once like the flag
+    /// above): identical `set_formula` and Empty-over-empty writes are
+    /// no-ops. The predicates live on `Engine`; the flag lives here so every
+    /// engine constructor picks it up with the graph.
+    write_noops: bool,
+    /// Cumulative counters for the two T2b toggles (observational only).
+    volatile_cleared_on_value: u64,
+    set_formula_noops: std::sync::atomic::AtomicU64,
+    empty_write_noops: std::sync::atomic::AtomicU64,
     /// True while the evaluation clock cannot move between recalcs, i.e. the
     /// engine runs in `DeterministicMode::Enabled`. Clock-only volatiles
     /// (`NOW()`/`TODAY()` and formulas built solely from them) are constants
@@ -1385,6 +1406,11 @@ impl DependencyGraph {
             deferred_dirty_depth: 0,
             deferred_dirty_pending: Vec::new(),
             volatile_vertices: FxHashSet::default(),
+            clear_volatile_on_value: env_toggle_on("FZ_CLEAR_VOLATILE_ON_VALUE"),
+            write_noops: env_toggle_on("FZ_WRITE_NOOPS"),
+            volatile_cleared_on_value: 0,
+            set_formula_noops: std::sync::atomic::AtomicU64::new(0),
+            empty_write_noops: std::sync::atomic::AtomicU64::new(0),
             clock_frozen: config.deterministic_mode.is_enabled(),
             ref_error_vertices: FxHashSet::default(),
             formula_to_range_deps: FxHashMap::default(),
@@ -2156,6 +2182,7 @@ impl DependencyGraph {
 
             // Update to value kind
             self.store.set_kind(existing_id, VertexKind::Cell);
+            self.clear_value_vertex_volatility(existing_id);
             if self.value_cache_enabled {
                 let value_ref = self.data_store.store_value(value);
                 self.vertex_values.insert(existing_id, value_ref);
@@ -2244,6 +2271,7 @@ impl DependencyGraph {
                 self.vertex_values.remove(&existing_id);
             }
             self.store.set_kind(existing_id, VertexKind::Cell);
+            self.clear_value_vertex_volatility(existing_id);
             self.ref_error_vertices.remove(&existing_id);
             return Ok(());
         }
@@ -2323,6 +2351,7 @@ impl DependencyGraph {
                     self.vertex_values.remove(&existing_id);
                 }
                 self.store.set_kind(existing_id, VertexKind::Cell);
+                self.clear_value_vertex_volatility(existing_id);
                 continue;
             }
             let packed = GridAddr::from_coord(AbsCoord::from_excel(row, col));
@@ -4656,6 +4685,81 @@ impl DependencyGraph {
             self.store.set_dirty(dep_id, true);
             self.formula_dirty.legacy_insert(dep_id);
         }
+    }
+
+    /// GOD-383 Trial A T2b: a vertex that now holds a value cannot be
+    /// volatile or dynamic. With `FZ_CLEAR_VOLATILE_ON_VALUE` on, drop both
+    /// flags and its `volatile_vertices` entry (the set `redirty_volatiles`,
+    /// `redirty_all_volatiles` and the census read); off, a no-op. Called only
+    /// from the value-write paths after the vertex kind became `Cell`; a later
+    /// formula write re-derives both flags from its dependency plan.
+    fn clear_value_vertex_volatility(&mut self, id: VertexId) {
+        if !self.clear_volatile_on_value {
+            return;
+        }
+        if self.store.is_volatile(id) || self.volatile_vertices.contains(&id) {
+            self.mark_volatile(id, false);
+            self.volatile_cleared_on_value = self.volatile_cleared_on_value.saturating_add(1);
+        }
+        self.store.set_dynamic(id, false);
+    }
+
+    /// GOD-383 Trial A T2b toggle state (`FZ_CLEAR_VOLATILE_ON_VALUE`).
+    pub fn clear_volatile_on_value_enabled(&self) -> bool {
+        self.clear_volatile_on_value
+    }
+
+    /// Override the `FZ_CLEAR_VOLATILE_ON_VALUE` reading (tests, diagnostics).
+    #[doc(hidden)]
+    pub fn set_clear_volatile_on_value(&mut self, on: bool) {
+        self.clear_volatile_on_value = on;
+    }
+
+    /// GOD-383 Trial A T2b toggle state (`FZ_WRITE_NOOPS`).
+    pub fn write_noops_enabled(&self) -> bool {
+        self.write_noops
+    }
+
+    /// Override the `FZ_WRITE_NOOPS` reading (tests, diagnostics).
+    #[doc(hidden)]
+    pub fn set_write_noops(&mut self, on: bool) {
+        self.write_noops = on;
+    }
+
+    pub(crate) fn note_set_formula_noop(&self) {
+        self.set_formula_noops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_empty_write_noop(&self) {
+        self.empty_write_noops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Cumulative `(volatile_cleared_on_value, set_formula_noops,
+    /// empty_write_noops)` over the graph's life.
+    pub fn write_toggle_counters(&self) -> (u64, u64, u64) {
+        (
+            self.volatile_cleared_on_value,
+            self.set_formula_noops
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.empty_write_noops
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// True when the vertex's formula authorship is exactly what an API
+    /// `set_cell_formula` would install, so re-setting it changes nothing.
+    pub(crate) fn formula_authorship_is_api(&self, vertex: VertexId) -> bool {
+        let Some(cell) = self.get_cell_ref(vertex) else {
+            return false;
+        };
+        self.formula_authorship(vertex)
+            == FormulaAuthorship::for_api(
+                self.config.api_created_formula_kind,
+                cell.coord.row() + 1,
+                cell.coord.col() + 1,
+            )
     }
 
     /// Internal: Mark a vertex as volatile

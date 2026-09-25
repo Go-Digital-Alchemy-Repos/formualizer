@@ -2094,6 +2094,16 @@ where
         ast: ASTNode,
     ) -> Result<(), crate::engine::EditorError> {
         if self.capture.is_some() {
+            // GOD-383 Trial A T2b: an identical formula journals and dirties
+            // nothing (`Engine::is_unchanged_formula_write`; off by default).
+            // The non-capture arm reaches the same check in
+            // `Engine::set_cell_formula`.
+            if self
+                .engine
+                .is_unchanged_formula_write(sheet, row, col, &ast)
+            {
+                return Ok(());
+            }
             let old_value = self.engine.read_cell_value(sheet, row, col);
             let mut old_formula = self.engine.read_cell_formula_ast(sheet, row, col);
             let addr = self.addr_for(sheet, row, col);
@@ -20728,6 +20738,9 @@ where
     ///   Arrow capacity for an absent cell, and undoing a logged
     ///   `SetValue { old_value: None, new: Empty }` removes the vertex rather
     ///   than restoring it, so the skip would not be undo-equivalent.
+    ///   GOD-383 Trial A T2b: with `FZ_WRITE_NOOPS=1` the narrow
+    ///   Empty-over-empty case is delegated to
+    ///   [`Self::is_empty_over_empty_noop`].
     /// * `Error` is excluded on both sides. Arrow stores only the error code;
     ///   the message and extras live in `rich_error_details` /
     ///   `spill_error_details`, so a plain `Error(kind)` compares equal to a
@@ -20753,10 +20766,12 @@ where
         col: u32,
         value: &LiteralValue,
     ) -> bool {
+        if matches!(value, LiteralValue::Empty) {
+            return self.is_empty_over_empty_noop(sheet, row, col);
+        }
         if matches!(
             value,
-            LiteralValue::Empty
-                | LiteralValue::Error(_)
+            LiteralValue::Error(_)
                 | LiteralValue::Date(_)
                 | LiteralValue::DateTime(_)
                 | LiteralValue::Time(_)
@@ -20830,6 +20845,232 @@ where
                 .any(|row| row.iter().any(Self::literal_has_nan)),
             _ => false,
         }
+    }
+
+    /// GOD-383 Trial A T2b (`FZ_WRITE_NOOPS=1`): writing `Empty` to a cell
+    /// that is already empty is a no-op. Off (the default): always `false`.
+    ///
+    /// Holds only when the write would change nothing a reader or a later
+    /// write can observe:
+    /// * the sheet exists and the cell lies inside the Arrow sheet's current
+    ///   rows and columns (a write outside grows the sheet);
+    /// * the cell is absent from the graph, or its vertex is a plain value
+    ///   (`VertexKind::Cell`) or an unwritten placeholder (`VertexKind::Empty`)
+    ///   with no structural `#REF!` marking;
+    /// * the cell is not a registered spill target, carries no staged formula
+    ///   text, sits in no FormulaPlane span, and no spill is blocked;
+    /// * the cell has no number format (explicit or derived): a real write
+    ///   clears it;
+    /// * it reads back empty, with no computed-overlay entry either.
+    ///
+    /// The skipped write would have journalled a `SetValue` whose undo removes
+    /// the vertex; skipping leaves nothing to undo and the same cell state.
+    pub fn is_empty_over_empty_noop(&self, sheet: &str, row: u32, col: u32) -> bool {
+        if !self.graph.write_noops_enabled() || row == 0 || col == 0 {
+            return false;
+        }
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else {
+            return false;
+        };
+        let Some(asheet) = self.sheet_store().sheet(sheet) else {
+            return false;
+        };
+        let row0 = row.saturating_sub(1);
+        let col0 = col.saturating_sub(1);
+        if row0 >= asheet.nrows || col0 as usize >= asheet.columns.len() {
+            return false;
+        }
+        let addr = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        if let Some(&vertex_id) = self.graph.get_vertex_id_for_address(&addr) {
+            // A value cell, or the `Empty` placeholder a range or reference
+            // registers for a cell nobody wrote.
+            if !matches!(
+                self.graph.get_vertex_kind(vertex_id),
+                VertexKind::Cell | VertexKind::Empty
+            ) {
+                return false;
+            }
+            if self.graph.is_ref_error(vertex_id) {
+                return false;
+            }
+        }
+        if self.graph.spill_registry_anchor_for_cell(addr).is_some() {
+            return false;
+        }
+        if self.get_staged_formula_text(sheet, row, col).is_some() {
+            return false;
+        }
+        if !self.blocked_pending_spills.is_empty() {
+            return false;
+        }
+        if self.config.formula_plane_mode != FormulaPlaneMode::Off
+            && self
+                .graph
+                .formula_authority()
+                .plane
+                .spans
+                .find_at(PlacementCoord::new(sheet_id, row0, col0))
+                .is_some()
+        {
+            return false;
+        }
+        if !matches!(
+            self.effective_format_id(sheet, row, col),
+            None | Some(crate::format::FormatId::GENERAL)
+        ) {
+            return false;
+        }
+        if self.read_cell_value(sheet, row, col).is_some()
+            || self.read_computed_overlay_cell(sheet, row, col).is_some()
+        {
+            return false;
+        }
+        self.graph.note_empty_write_noop();
+        true
+    }
+
+    /// GOD-383 Trial A T2b (`FZ_WRITE_NOOPS=1`): re-setting a cell to the
+    /// formula it already holds is a no-op (no re-plan, no dirty propagation,
+    /// no topology edit, no cache clears). Off (the default): always `false`.
+    ///
+    /// Identity rule: the canonical text (`formualizer_parse::canonical_formula`)
+    /// of the incoming AST equals that of the AST stored for the cell's vertex.
+    /// Canonical text ignores source tokens and function-name case and
+    /// renders references as resolved, so an equal text re-ingests to the same
+    /// dependency plan at the same placement. Two ASTs that differ only in a
+    /// way the printer renders differently (for example an explicit own-sheet
+    /// qualifier) simply do not match, which falls back to the full write.
+    ///
+    /// Beyond identity, every side effect of `set_cell_formula` must be an
+    /// identity, so the cell must: hold a `FormulaScalar` vertex (not a value
+    /// override, not a legacy array kind the write would convert), carry no
+    /// `#REF!` marking, have API authorship (the write resets authorship), not
+    /// anchor a registered spill, have no staged formula text, no saved file
+    /// value, no delta-overlay value and no Arrow number format (all of which
+    /// the write clears), and sit in no FormulaPlane span; no spill may be
+    /// blocked; every function in the formula must resolve (an unresolved
+    /// `#NAME?` cell is refreshed by a re-set once the function exists) and
+    /// the vertex's volatile flag must agree with the formula's.
+    pub fn is_unchanged_formula_write(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        ast: &ASTNode,
+    ) -> bool {
+        if !self.graph.write_noops_enabled() || row == 0 || col == 0 {
+            return false;
+        }
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else {
+            return false;
+        };
+        let addr = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        let Some(&vertex_id) = self.graph.get_vertex_id_for_address(&addr) else {
+            return false;
+        };
+        if !matches!(
+            self.graph.get_vertex_kind(vertex_id),
+            VertexKind::FormulaScalar
+        ) {
+            return false;
+        }
+        if self.graph.is_ref_error(vertex_id)
+            || !self.graph.formula_authorship_is_api(vertex_id)
+            || self.graph.spill_registry_has_anchor(vertex_id)
+        {
+            return false;
+        }
+        if self.get_staged_formula_text(sheet, row, col).is_some()
+            || !self.blocked_pending_spills.is_empty()
+            || self.saved_formula_values.contains_key(&addr)
+            || self.read_delta_overlay_cell(sheet, row, col).is_some()
+        {
+            return false;
+        }
+        let row0 = row.saturating_sub(1);
+        let col0 = col.saturating_sub(1);
+        if self.config.formula_plane_mode != FormulaPlaneMode::Off
+            && self
+                .graph
+                .formula_authority()
+                .plane
+                .spans
+                .find_at(PlacementCoord::new(sheet_id, row0, col0))
+                .is_some()
+        {
+            return false;
+        }
+        if let Some(asheet) = self.sheet_store().sheet(sheet)
+            && !matches!(
+                asheet.format_id(row0 as usize, col0 as usize),
+                None | Some(crate::format::FormatId::GENERAL)
+            )
+        {
+            return false;
+        }
+        if !self.ast_functions_all_resolve(ast)
+            || self.graph.is_volatile(vertex_id) != self.is_ast_volatile_with_provider(ast)
+        {
+            return false;
+        }
+        let Some(stored) = self.read_cell_formula_ast(sheet, row, col) else {
+            return false;
+        };
+        if formualizer_parse::pretty::canonical_formula(&stored)
+            != formualizer_parse::pretty::canonical_formula(ast)
+        {
+            return false;
+        }
+        self.graph.note_set_formula_noop();
+        true
+    }
+
+    /// True when every function named in `ast` resolves through this engine's
+    /// provider or the global registry.
+    fn ast_functions_all_resolve(&self, ast: &ASTNode) -> bool {
+        match &ast.node_type {
+            ASTNodeType::Function { name, args } => {
+                (self.get_function("", name).is_some()
+                    || crate::function_registry::get("", name).is_some())
+                    && args.iter().all(|arg| self.ast_functions_all_resolve(arg))
+            }
+            ASTNodeType::Call { callee, args } => {
+                self.ast_functions_all_resolve(callee)
+                    && args.iter().all(|arg| self.ast_functions_all_resolve(arg))
+            }
+            ASTNodeType::UnaryOp { expr, .. } => self.ast_functions_all_resolve(expr),
+            ASTNodeType::BinaryOp { left, right, .. } => {
+                self.ast_functions_all_resolve(left) && self.ast_functions_all_resolve(right)
+            }
+            ASTNodeType::Array(rows) => rows
+                .iter()
+                .flatten()
+                .all(|node| self.ast_functions_all_resolve(node)),
+            ASTNodeType::Literal(_) | ASTNodeType::Omitted | ASTNodeType::Reference { .. } => true,
+        }
+    }
+
+    /// GOD-383 Trial A T2b: cumulative `(volatile_cleared_on_value,
+    /// set_formula_noops, empty_write_noops)` over the engine's life.
+    pub fn write_toggle_counters(&self) -> (u64, u64, u64) {
+        self.graph.write_toggle_counters()
+    }
+
+    /// GOD-383 Trial A T2b toggle states `(FZ_CLEAR_VOLATILE_ON_VALUE,
+    /// FZ_WRITE_NOOPS)` as read at construction (or overridden).
+    pub fn write_toggles(&self) -> (bool, bool) {
+        (
+            self.graph.clear_volatile_on_value_enabled(),
+            self.graph.write_noops_enabled(),
+        )
+    }
+
+    /// Override the env readings of the two T2b toggles (tests, diagnostics).
+    #[doc(hidden)]
+    pub fn set_write_toggles(&mut self, clear_volatile_on_value: bool, write_noops: bool) {
+        self.graph
+            .set_clear_volatile_on_value(clear_volatile_on_value);
+        self.graph.set_write_noops(write_noops);
     }
 
     /// Set a cell value
@@ -21113,6 +21354,9 @@ where
         ast: ASTNode,
     ) -> Result<(), ExcelError> {
         self.observe_function_semantic_epoch()?;
+        if self.is_unchanged_formula_write(sheet, row, col, &ast) {
+            return Ok(());
+        }
         let sheet_id = self.graph.sheet_id_mut(sheet);
         self.demote_span_containing_cell_for_write(
             sheet_id,
