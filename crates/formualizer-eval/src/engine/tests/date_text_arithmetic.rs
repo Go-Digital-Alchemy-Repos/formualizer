@@ -313,9 +313,6 @@ fn hyphenated_month_day_year_text_matches_excel() {
         ("=\"03-01-01\"+0", 36_951.0),
         ("=\"02-29-2000\"+0", 36_585.0),
         ("=\"01-15-2000 12:00\"+0", 36_540.5),
-        ("=DATEVALUE(\"01-15-2000\")+0", 36_540.0),
-        ("=DATEVALUE(\"3-4-5\")+0", 38_415.0),
-        ("=DATEVALUE(\"03-01-01\")+0", 36_951.0),
     ];
     for (formula, expected) in cases {
         assert_expected(
@@ -323,6 +320,19 @@ fn hyphenated_month_day_year_text_matches_excel() {
             formula,
             EXCEL_DGDT,
             Expected::Number(expected),
+        );
+    }
+    // DATEVALUE carries the date format, so the engine value is a Date; Excel's
+    // serials 36540, 38415 and 36951 are these calendar dates.
+    for (formula, (y, m, d)) in [
+        ("=DATEVALUE(\"01-15-2000\")", (2000, 1, 15)),
+        ("=DATEVALUE(\"3-4-5\")", (2005, 3, 4)),
+        ("=DATEVALUE(\"03-01-01\")", (2001, 3, 1)),
+    ] {
+        assert_eq!(
+            eval_formula(DateSystem::Excel1900, formula),
+            LiteralValue::Date(NaiveDate::from_ymd_opt(y, m, d).unwrap()),
+            "{formula} ({EXCEL_DGDT})"
         );
     }
     for formula in [
