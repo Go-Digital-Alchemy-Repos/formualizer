@@ -394,8 +394,8 @@ pub struct DatedifFn;
 /// Min args: 3
 /// Max args: 3
 /// Variadic: false
-/// Signature: DATEDIF(arg1: number@scalar, arg2: number@scalar, arg3: any@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Signature: DATEDIF(arg1: any@scalar, arg2: any@scalar, arg3: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for DatedifFn {
@@ -408,13 +408,10 @@ impl Function for DatedifFn {
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
         use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::any(),
-            ]
-        });
+        // The two date arguments are `any`: a NumberLenientText pre-coercion
+        // would reject date text before `coerce_datedif_serial` sees it.
+        static SCHEMA: LazyLock<Vec<ArgSchema>> =
+            LazyLock::new(|| vec![ArgSchema::any(), ArgSchema::any(), ArgSchema::any()]);
         &SCHEMA[..]
     }
     fn eval<'a, 'b, 'c>(
