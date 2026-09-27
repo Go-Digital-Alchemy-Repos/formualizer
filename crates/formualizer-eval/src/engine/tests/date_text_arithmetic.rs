@@ -165,7 +165,6 @@ fn invalid_date_time_text_remains_value_error() {
         "=\"\"+0",
         "=\"13/13/13\"+0",
         "=\"123-456\"+0",
-        "=\"03-01-01\"+0",
         "=\"15/01/2003\"+0",
         "=\"2003/1/1\"+0",
         "=\"1/1/03T12:00\"+0",
@@ -291,5 +290,96 @@ fn non_arithmetic_text_semantics_are_unchanged() {
         for (formula, expected) in cases {
             assert_expected(system, formula, "oracle: lo-verified", expected);
         }
+    }
+}
+
+/// Excel oracle: cloud Excel over Microsoft Graph, synthetic probe, round
+/// god-383-spark-correctness-2026-09-27 dg_datetext (receipt
+/// `excel_graph_probe.json`). Excel's en-US parser accepts `-` as a
+/// month/day/year separator in DATEDIF, DATEVALUE and arithmetic alike, and
+/// DATEDIF accepts date text in every shape the arithmetic operators accept.
+const EXCEL_DGDT: &str = "oracle: excel-graph dg_datetext 2026-09-27";
+
+#[test]
+fn hyphenated_month_day_year_text_matches_excel() {
+    let cases = [
+        ("=\"01-15-2000\"+0", 36_540.0),
+        ("=\"1-15-2000\"+0", 36_540.0),
+        ("=\"3-4-2000\"+0", 36_589.0),
+        ("=\"12-31-1999\"+0", 36_525.0),
+        ("=\"01-15-00\"+0", 36_540.0),
+        ("=\"03-04-30\"+0", 11_021.0),
+        ("=\"3-4-5\"+0", 38_415.0),
+        ("=\"03-01-01\"+0", 36_951.0),
+        ("=\"02-29-2000\"+0", 36_585.0),
+        ("=\"01-15-2000 12:00\"+0", 36_540.5),
+        ("=DATEVALUE(\"01-15-2000\")", 36_540.0),
+        ("=DATEVALUE(\"3-4-5\")", 38_415.0),
+        ("=DATEVALUE(\"03-01-01\")", 36_951.0),
+    ];
+    for (formula, expected) in cases {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            EXCEL_DGDT,
+            Expected::Number(expected),
+        );
+    }
+    for formula in [
+        "=\"13-01-2000\"+0",
+        "=\"02-30-2000\"+0",
+        "=\"15-01-2000\"+0",
+        "=\"01-15-200\"+0",
+        "=\"0-15-2000\"+0",
+        "=\"001-15-2000\"+0",
+        "=\"01-15-02000\"+0",
+        "=DATEVALUE(\"13-01-2000\")",
+        "=DATEVALUE(\"01--15-2000\")",
+    ] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            EXCEL_DGDT,
+            Expected::Error(ExcelErrorKind::Value),
+        );
+    }
+}
+
+#[test]
+fn datedif_accepts_date_text_like_excel() {
+    let cases = [
+        ("=DATEDIF(\"01-15-2000\",DATE(2026,1,1),\"Y\")", 25.0),
+        ("=DATEDIF(\"1-15-00\",DATE(2026,1,1),\"Y\")", 25.0),
+        ("=DATEDIF(\"12-31-1999\",DATE(2026,1,1),\"Y\")", 26.0),
+        ("=DATEDIF(\"03-04-30\",DATE(2026,1,1),\"Y\")", 95.0),
+        ("=DATEDIF(\"3-4-5\",DATE(2026,1,1),\"Y\")", 20.0),
+        ("=DATEDIF(\"1/15/2000\",DATE(2026,1,1),\"Y\")", 25.0),
+        ("=DATEDIF(\"2000-01-15\",DATE(2026,1,1),\"Y\")", 25.0),
+        ("=DATEDIF(\"15-Jan-2000\",DATE(2026,1,1),\"Y\")", 25.0),
+        ("=DATEDIF(\"Jan 15, 2000\",DATE(2026,1,1),\"Y\")", 25.0),
+        ("=DATEDIF(\"01-15-2000 12:00\",DATE(2026,1,1),\"Y\")", 25.0),
+    ];
+    for (formula, expected) in cases {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            EXCEL_DGDT,
+            Expected::Number(expected),
+        );
+    }
+    for formula in [
+        "=DATEDIF(\"13-01-2000\",DATE(2026,1,1),\"Y\")",
+        "=DATEDIF(\"15-01-2000\",DATE(2026,1,1),\"Y\")",
+        "=DATEDIF(\"01-15-2000-1\",DATE(2026,1,1),\"Y\")",
+        "=DATEDIF(\"01.15.2000\",DATE(2026,1,1),\"Y\")",
+        "=DATEDIF(\"abcdefg\",DATE(2026,1,1),\"Y\")",
+        "=DATEDIF(\"123-456\",DATE(2026,1,1),\"Y\")",
+    ] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            EXCEL_DGDT,
+            Expected::Error(ExcelErrorKind::Value),
+        );
     }
 }

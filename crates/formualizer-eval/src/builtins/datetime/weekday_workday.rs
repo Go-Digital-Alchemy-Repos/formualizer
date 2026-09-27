@@ -45,6 +45,29 @@ fn coerce_to_serial(arg: &ArgumentHandle, system: DateSystem) -> Result<f64, Exc
     crate::coercion::to_serial_lenient(&v, system).map_err(|_| ExcelError::new_value())
 }
 
+/// DATEDIF's date-argument coercion: as [`coerce_to_serial`], but a Text
+/// argument that is not numeric is parsed as date/time text, the same way the
+/// arithmetic operators coerce it.
+///
+/// Excel's DATEDIF accepts text dates (`DATEDIF("1/15/2000", ...)`,
+/// `DATEDIF("01-15-2000", ...)`); measured on cloud Excel over Graph, round
+/// god-383-spark-correctness-2026-09-27 dg_datetext, ES-011. Scoped to DATEDIF
+/// only: the other builtins in this module keep `coerce_to_serial` until their
+/// own text behaviour is measured.
+fn coerce_datedif_serial(arg: &ArgumentHandle, system: DateSystem) -> Result<f64, ExcelError> {
+    let v = arg.value()?.into_literal();
+    match v {
+        LiteralValue::Error(e) => Err(e),
+        LiteralValue::Text(_) => crate::coercion::to_arithmetic_number_with_locale(
+            &v,
+            &crate::locale::Locale::invariant(),
+            system,
+        )
+        .map_err(|_| ExcelError::new_value()),
+        _ => crate::coercion::to_serial_lenient(&v, system).map_err(|_| ExcelError::new_value()),
+    }
+}
+
 fn coerce_to_int(arg: &ArgumentHandle) -> Result<i64, ExcelError> {
     let v = arg.value()?.into_literal();
     if let LiteralValue::Error(e) = v {
@@ -400,8 +423,8 @@ impl Function for DatedifFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let system = ctx.date_system();
-        let start_serial = coerce_to_serial(&args[0], system)?;
-        let end_serial = coerce_to_serial(&args[1], system)?;
+        let start_serial = coerce_datedif_serial(&args[0], system)?;
+        let end_serial = coerce_datedif_serial(&args[1], system)?;
 
         let unit = match args[2].value()?.into_literal() {
             LiteralValue::Text(s) => s.to_uppercase(),

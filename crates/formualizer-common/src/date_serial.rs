@@ -76,8 +76,37 @@ pub fn parse_excel_date_text(input: &str) -> Option<NaiveDate> {
     if let Some(date) = parse_numeric_slash_date(text) {
         return Some(date);
     }
+    if let Some(date) = parse_numeric_hyphen_mdy_date(text) {
+        return Some(date);
+    }
 
     parse_iso_date(text).or_else(|| parse_month_name_date(text))
+}
+
+/// Parse en-US hyphenated month-day-year text such as `01-15-2000` or `3-4-5`.
+///
+/// Excel (en-US) accepts `-` as a date separator in month/day/year order:
+/// month and day are one or two digits, the year one, two or four digits with
+/// the same two-digit window as slash dates. Measured on cloud Excel over
+/// Graph (DATEDIF, DATEVALUE and `+0` agree), round
+/// god-383-spark-correctness-2026-09-27 dg_datetext. A four-digit first field is
+/// ISO year-first and is left to [`parse_iso_date`].
+fn parse_numeric_hyphen_mdy_date(text: &str) -> Option<NaiveDate> {
+    let parts: Vec<&str> = text.split('-').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        || parts[0].len() > 2
+        || parts[1].len() > 2
+    {
+        return None;
+    }
+
+    let month = parts[0].parse::<u32>().ok()?;
+    let day = parts[1].parse::<u32>().ok()?;
+    let year = parse_excel_year(parts[2])?;
+    NaiveDate::from_ymd_opt(year, month, day)
 }
 
 fn parse_numeric_slash_date(text: &str) -> Option<NaiveDate> {
@@ -639,8 +668,11 @@ mod tests {
             assert_eq!(parse_excel_date_text(input), Some(expected), "{input}");
         }
 
-        // oracle: lo-verified. A short year is not accepted in ISO year position.
-        assert_eq!(parse_excel_date_text("03-01-01"), None);
+        // oracle: Excel (cloud Excel over Graph, dg_datetext 2026-09-27). A
+        // two-digit first field is month-day-year, not a short ISO year:
+        // "03-01-01" is 2001-03-01 (DATEVALUE 36951). This replaces the earlier
+        // LibreOffice-verified `None`.
+        assert_eq!(parse_excel_date_text("03-01-01"), Some(date(2001, 3, 1)));
         assert_eq!(
             parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, "12:00"),
             Some(0.5)
@@ -666,6 +698,54 @@ mod tests {
             assert!(
                 parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, text).is_none(),
                 "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyphenated_month_day_year_matches_excel() {
+        // oracle: Excel (cloud Excel over Graph), round
+        // god-383-spark-correctness-2026-09-27 dg_datetext receipt
+        // excel_graph_probe.json; DATEVALUE serials in the 1900 system.
+        for (input, serial) in [
+            ("01-15-2000", 36_540.0),
+            ("1-15-2000", 36_540.0),
+            ("03-04-2000", 36_589.0),
+            ("3-4-2000", 36_589.0),
+            ("12-31-1999", 36_525.0),
+            ("01-15-00", 36_540.0),
+            ("1-15-00", 36_540.0),
+            ("03-04-30", 11_021.0),
+            ("3-4-5", 38_415.0),
+            ("02-29-2000", 36_585.0),
+            ("03-01-01", 36_951.0),
+            ("01-15-2000 12:00", 36_540.5),
+        ] {
+            assert_eq!(
+                parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, input),
+                Some(serial),
+                "{input}"
+            );
+        }
+        // Excel #VALUE! for every consumer (DATEDIF, DATEVALUE, +0).
+        for input in [
+            "13-01-2000",
+            "02-30-2000",
+            "15-01-2000",
+            "01-15-2000-1",
+            "01--15-2000",
+            "01.15.2000",
+            "123-456",
+            "01-15-200",
+            "0-15-2000",
+            "01-0-2000",
+            "001-15-2000",
+            "01-015-2000",
+            "01-15-02000",
+        ] {
+            assert!(
+                parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, input).is_none(),
+                "{input}"
             );
         }
     }
