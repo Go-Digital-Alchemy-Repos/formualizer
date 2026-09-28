@@ -20,3 +20,5 @@ formualizer-workbook = { path = "../formualizer-workbook", default-features = fa
 formualizer-sheetport = { path = "../formualizer-sheetport", default-features = false, features = ["system-clock"] }
 sheetport-spec = { path = "../sheetport-spec" }
 sha2 = "0.10"
+# Lane B: sibling-plan formula scan (tokenizer).
+formualizer-parse = { path = "../formualizer-parse" }
