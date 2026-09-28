@@ -22,7 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use crate::evaluator::SolveModel;
+use crate::evaluator::{CompiledChildHook, SolveModel};
 use crate::event::{CallStatus, ModelCallEvent};
 use crate::goal_seek::goal_seek_written_cells;
 use crate::ports::{CellKey, PortSession, WireValue};
@@ -434,6 +434,10 @@ pub struct RetainedModel {
     pub(crate) context: CalculationContext,
     pub(crate) pool: Arc<RetainedPool>,
     pub(crate) source: Arc<dyn WorkbookSource>,
+    /// The compiled child the warm's router consults (`SessionPool.warm`'s
+    /// `CalculationSession` builds a `CompiledRoute` when the flag is on).
+    /// Requests install their own hook on their `ModelSession`.
+    pub(crate) compiled: Option<Arc<dyn CompiledChildHook>>,
 }
 
 impl RetainedModel {
@@ -443,7 +447,18 @@ impl RetainedModel {
             context,
             pool: Arc::new(RetainedPool::new(retain_scenarios)),
             source: Arc::new(PathWorkbookSource),
+            compiled: None,
         }
+    }
+
+    /// Install (or clear) the compiled-child hook the warm uses; it is
+    /// consulted only when the context's `compiled` flag is on.
+    pub fn set_compiled_child(&mut self, hook: Option<Arc<dyn CompiledChildHook>>) {
+        self.compiled = hook;
+    }
+
+    pub fn compiled_child(&self) -> Option<&Arc<dyn CompiledChildHook>> {
+        self.compiled.as_ref()
     }
 
     /// Replace the pinned-path loader (tests, injected factories).

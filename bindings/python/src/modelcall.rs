@@ -555,6 +555,13 @@ impl PyNestedCall {
             other => typed(py, &other),
         }
     }
+
+    /// Faults the request has recorded so far (`len(session.faults)`); the
+    /// compiled hook compares it around its run (`fallback:fault`).
+    #[getter]
+    fn faults(&self) -> usize {
+        self.router.fault_count()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +644,14 @@ impl PyRetainedModel {
         dict.set_item("warm_session_timings", timings)?;
         dict.set_item("invocations", events)?;
         Ok(dict)
+    }
+
+    /// The compiled-child hook (`attempt`/`report`) the warm's router
+    /// consults when the context's `compiled` flag is on, or None to clear
+    /// it (a request installs its own on its `ModelSession`).
+    fn set_compiled_child(&mut self, hook: Option<Py<PyAny>>) {
+        self.model
+            .set_compiled_child(hook.map(|target| Arc::new(PyCompiledHook { target }) as Arc<dyn CompiledChildHook>));
     }
 
     /// Forget every retained workbook; returns how many there were.

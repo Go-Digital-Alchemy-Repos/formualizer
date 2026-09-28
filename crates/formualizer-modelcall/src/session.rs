@@ -191,6 +191,15 @@ impl RunState {
         self.fault_indices.iter().filter_map(|index| self.invocations.get(*index).cloned()).collect()
     }
 
+    /// The error of the first fault recorded after the first `before` faults
+    /// (`session.faults[faults]['error']` in `CompiledRoute.attempt`).
+    pub(crate) fn fault_error_since(&self, before: usize) -> Option<String> {
+        self.fault_indices
+            .get(before)
+            .and_then(|index| self.invocations.get(*index))
+            .map(|event| event.error.clone().unwrap_or_default())
+    }
+
     fn first_fault_error(&self) -> Option<String> {
         self.fault_indices
             .first()
@@ -646,14 +655,28 @@ impl RunCore {
         if let Some(hook) = &self.compiled {
             let router_event = self.router_event_for(event, &spec.model_identity());
             let attempt_started = Instant::now();
+            let faults_before = self.state().fault_indices.len();
             let nested = ModelCallRouter::nested(Arc::clone(self), stack.to_vec());
             let attempt = with_nested_router(nested, || hook.attempt(spec, inputs, location, stack));
             self.add_seconds(timing_keys::COMPILED_SECONDS, attempt_started);
-            let attempt = attempt?;
+            let mut attempt = attempt?;
+            // CompiledRoute.attempt (R1 #7): a nested call that faulted during
+            // the compiled run fails the request now, as the engine path would
+            // after evaluating the child, instead of re-firing it on the engine.
+            let fault = self.state().fault_error_since(faults_before);
+            if fault.is_some() {
+                attempt.route = Some(Value::String("fallback:fault".to_owned()));
+            }
             if let (Some(index), Some(route)) = (router_event, attempt.route)
                 && let Some(event) = self.state().invocations.get_mut(index)
             {
                 event.route = Some(route);
+            }
+            if let Some(error) = fault {
+                return Err(ModelCallError::infrastructure(
+                    "CallbackInfrastructureError",
+                    format!("child callback infrastructure fault: {error}"),
+                ));
             }
             if let Some(matrix) = attempt.matrix {
                 self.add_seconds("child_seconds", started);
@@ -1190,7 +1213,7 @@ pub(crate) fn warm_model(
         retained.package.clone(),
         context,
         retained.source.clone(),
-        None,
+        retained.compiled.clone(),
         Some(retained.pool.clone()),
         CancelToken::new(),
     ));
