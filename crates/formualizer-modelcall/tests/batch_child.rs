@@ -417,5 +417,30 @@ fn prefetch_receipt_is_the_same_with_the_batch_evaluator() {
         assert!(threaded_memo.contains(&key) && batched_memo.contains(&key), "sibling {value} adopted");
     }
     println!("LOADS prefetch child threaded={threaded_loads} batch={batched_loads}");
-    assert_eq!((threaded_loads, batched_loads), (3, 1));
+    // prefetch_max 5 >= 3 siblings: one parallel flight (and load) per sibling.
+    assert_eq!((threaded_loads, batched_loads), (3, 3));
+}
+
+/// Siblings beyond `prefetch_max` run as `prefetch_max` parallel chunks, each
+/// on its own loaded child; outcomes still match the per-flight path.
+#[test]
+fn siblings_run_in_parallel_chunks_up_to_prefetch_max() {
+    let (child, grand) = (child(), grand());
+    let package = package(&[("rates/child", &child), ("rates/grand", &grand)]);
+    for (flights, expected_loads) in [(1_u32, 1_usize), (2, 2), (3, 3), (5, 5), (8, 5)] {
+        let requests: Vec<ChildRequest> = (1..=5)
+            .map(|value| {
+                let mut request = request(&package, "child", amount(LiteralValue::Number(f64::from(value))));
+                request.context.flags.prefetch_max = flights;
+                request
+            })
+            .collect();
+        let reference = MemorySource::new(&[&child, &grand]);
+        let expected = per_flight(SubRequestEvaluator::new(reference, None), &requests);
+        let batched = MemorySource::new(&[&child, &grand]);
+        let actual = BatchChildEvaluator::new(batched.clone(), None).evaluate_children(&requests);
+        assert_same_outcomes(&format!("prefetch_max {flights}"), &expected, &actual);
+        println!("LOADS parallel_chunks prefetch_max={flights} child={}", batched.loads("child"));
+        assert_eq!(batched.loads("child"), expected_loads, "prefetch_max {flights}");
+    }
 }

@@ -30,7 +30,12 @@
 //! the normal router and load their own workbooks.
 //!
 //! Requests that do not share `(package, child_version, stack)` are split
-//! into groups, one load per group; outcomes come back in request order.
+//! into groups; outcomes come back in request order. Each group runs as up
+//! to `context.flags.prefetch_max` parallel chunks, each chunk on its own
+//! loaded child (Python's concurrent prefetch flights: Income's five
+//! siblings ran serially on one child at twice the Python wall time). A
+//! chunk batches several scenarios on one load only when the group exceeds
+//! `prefetch_max`.
 
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_eval::engine::CancelToken as EngineCancel;
@@ -87,9 +92,11 @@ impl ChildBatchEvaluator for BatchChildEvaluator {
         }
         let mut outcomes: Vec<Option<ChildOutcome>> = (0..requests.len()).map(|_| None).collect();
         for group in groups {
-            let members: Vec<&ChildRequest> = group.iter().map(|&index| &requests[index]).collect();
-            for (index, outcome) in group.into_iter().zip(self.run_group(&members)) {
-                outcomes[index] = Some(outcome);
+            let flights = requests[group[0]].context.flags.prefetch_max.max(1) as usize;
+            for (indices, group_outcomes) in self.run_parallel(requests, &group, flights) {
+                for (index, outcome) in indices.into_iter().zip(group_outcomes) {
+                    outcomes[index] = Some(outcome);
+                }
             }
         }
         outcomes
@@ -142,7 +149,70 @@ enum Pinned {
 
 type PinnedCells = Vec<((String, u32, u32), Pinned)>;
 
+/// Split `len` scenarios into `flights` contiguous chunks whose sizes differ
+/// by at most one (the first `len % flights` chunks take the extra one).
+fn chunk_bounds(len: usize, flights: usize) -> Vec<std::ops::Range<usize>> {
+    let flights = flights.clamp(1, len.max(1));
+    let (base, extra) = (len / flights, len % flights);
+    let mut start = 0;
+    (0..flights)
+        .map(|chunk| {
+            let end = start + base + usize::from(chunk < extra);
+            let range = start..end;
+            start = end;
+            range
+        })
+        .filter(|range| !range.is_empty())
+        .collect()
+}
+
 impl BatchChildEvaluator {
+    /// Run one group's scenarios as up to `flights` parallel chunks, each
+    /// chunk on its own loaded child (the Python path's concurrent flights);
+    /// a chunk holds more than one scenario only when the group exceeds
+    /// `flights`. Returns each chunk's request indices with its outcomes.
+    fn run_parallel(
+        &self,
+        requests: &[ChildRequest],
+        group: &[usize],
+        flights: usize,
+    ) -> Vec<(Vec<usize>, Vec<ChildOutcome>)> {
+        let chunks: Vec<Vec<usize>> =
+            chunk_bounds(group.len(), flights).into_iter().map(|range| group[range].to_vec()).collect();
+        let run = |indices: &[usize]| {
+            let members: Vec<&ChildRequest> = indices.iter().map(|&index| &requests[index]).collect();
+            self.run_group(&members)
+        };
+        let parallel = chunks.len() > 1;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .iter()
+                .map(|indices| {
+                    parallel.then(|| {
+                        std::thread::Builder::new()
+                            .name("model-call-prefetch-batch".into())
+                            .spawn_scoped(scope, || run(indices))
+                            .ok()
+                    })?
+                })
+                .collect();
+            chunks
+                .iter()
+                .zip(handles)
+                .map(|(indices, handle)| {
+                    // A single chunk, or one whose thread could not start,
+                    // runs here; a chunk that panicked yields no outcomes
+                    // (reported as lost scenarios).
+                    let outcomes = match handle {
+                        Some(handle) => handle.join().unwrap_or_default(),
+                        None => run(indices),
+                    };
+                    (indices.clone(), outcomes)
+                })
+                .collect()
+        })
+    }
+
     fn run_group(&self, requests: &[&ChildRequest]) -> Vec<ChildOutcome> {
         let Some(first) = requests.first() else { return Vec::new() };
         let Some(spec) = first.spec() else {

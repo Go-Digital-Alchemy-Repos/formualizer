@@ -292,7 +292,8 @@ impl RunCore {
             return;
         }
         if let Ok(Some(plan)) = sibling_plan(&self.package.parent) {
-            // Lane P: sibling scenarios sharing one child run on one loaded child.
+            // Lane P/X2: sibling scenarios run as up to prefetch_max parallel
+            // chunks, each on its own loaded child.
             *lock(&self.prefetch) = Some(
                 Prefetcher::new(plan, self.package.clone(), self.context.clone(), evaluator)
                     .with_batch_evaluator(Arc::new(crate::batch_child::BatchChildEvaluator::new(

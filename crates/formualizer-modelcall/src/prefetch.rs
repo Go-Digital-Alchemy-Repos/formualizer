@@ -7,8 +7,9 @@
 //! vectors are known: the observed vector with those constants substituted.
 //! The [`Prefetcher`] evaluates up to `prefetch_max` such sibling vectors
 //! through [`ChildEvaluator`] (each flight on its own thread, or all of one
-//! dispatch on one thread through a [`ChildBatchEvaluator`], one loaded child
-//! for every sibling scenario) while the in-line call runs, joins them after
+//! dispatch handed to a [`ChildBatchEvaluator`], which runs them as up to
+//! `prefetch_max` parallel chunks, one loaded child per chunk) while the
+//! in-line call runs, joins them after
 //! it and adopts each result into the memo under the sibling's own exact key.
 //!
 //! The sibling plan is static: read once per parent `workbook_sha256` from
