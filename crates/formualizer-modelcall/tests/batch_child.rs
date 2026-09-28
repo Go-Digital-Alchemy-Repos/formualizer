@@ -233,7 +233,7 @@ fn per_flight(evaluator: SubRequestEvaluator, requests: &[ChildRequest]) -> Vec<
 }
 
 fn timing_keys(timings: &Timings) -> Vec<String> {
-    let mut keys: Vec<String> = timings.0.keys().cloned().collect();
+    let mut keys: Vec<String> = timings.0.keys().map(str::to_owned).collect();
     keys.sort();
     keys
 }
