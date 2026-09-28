@@ -46,9 +46,15 @@ pub mod batch_child;
 // Lane I: retained workbooks (pool, warm, sealing).
 pub mod retained;
 
+// Architecture B (GOD-383): native compiled workbooks (WP0 seam, WP2 body).
+pub mod compiled;
+
 pub use context::{CalculationContext, CalculationFlags, Operation};
 pub use error::ModelCallError;
-pub use evaluator::{ChildEvaluator, ChildMatrix, ChildRequest, CompiledChildHook, SolveModel};
+pub use evaluator::{
+    CellAddress, ChildEvaluator, ChildMatrix, ChildRequest, CompiledCells, CompiledChildHook, CompiledParent, CompiledRun,
+    CompiledRunStats, CompiledXcall, ParentAttempt, SolveModel,
+};
 pub use event::{CallStatus, ModelCallEvent};
 pub use import_boundary::{CALL_MODEL_FUNCTION, IMPORTED_CALL_NAMES, call_function_names};
 pub use key::{

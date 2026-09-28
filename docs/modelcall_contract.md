@@ -293,3 +293,228 @@ B: `formualizer-parse`) in `crates/formualizer-modelcall/Cargo.toml`, appending 
 - `CalculationFlags` unchanged; `skip_unchanged_writes` now also skips on
   re-entered workbooks (`writes_skipped`, `formula_restores_skipped`,
   `defaults_not_restored_overwritten`, `date_writes_skipped`).
+
+## Architecture B: native compiled workbooks
+
+GOD-383 Amendment 7 (Thomas, 2026-09-28): per-workbook compiled modules are
+linked in-process by the Rust `MDL.CALLMODEL` router; engine and compiled modes
+mix per workbook with per-workbook fallback. Design:
+`artifacts/private/god-383-mdl-calc-path-2026-09-28/round/review/design_fable_architecture_b.md`
+(bakeoff). WP0 (this section, `evaluator.rs` seam types, `src/compiled.rs`
+skeleton) is a contract change, additive.
+
+### Seam types (`evaluator.rs`, `compiled.rs`)
+
+- `CompiledParent::run(spec, inputs, context, xcall: &mut dyn CompiledXcall)
+  -> Result<ParentAttempt, ModelCallError>` and `report()`. `ParentAttempt` is
+  `Compiled(CompiledRun)` or `Declined { route }`; `Err` is an infrastructure
+  fault, never a decline.
+- `CompiledRun { outputs: Vec<(key, ChildMatrix)>, route, stats:
+  CompiledRunStats, cells: Box<dyn CompiledCells> }` with
+  `read_cells(&[(sheet, row, col)])` (1-based, `Workbook::get_value`
+  addressing). Dropping it frees the module run (`cv_run_free`).
+- `CompiledXcall::call(target, block, output, tail) -> Result<ChildMatrix, _>`:
+  the nested router the module's call sites use.
+- `compiled::NativeCompiledHook` implements `CompiledChildHook` and
+  `CompiledParent` over a registry `{workbook_sha256: NativeRegistryEntry
+  {native_path, engine_commit, manifest_sha256}}`; `compiled::NativeModule` is
+  one loaded cdylib. In WP0 both decline with route
+  `engine:native_not_implemented` (`NativeDecline::NotImplemented`), so
+  installing the hook changes no result.
+- `compiled::abi` holds the `#[repr(C)]` types and entry typedefs below; layout
+  is pinned by `abi_layout_is_pinned_on_64_bit`.
+
+### C ABI (`CV_NATIVE_ABI = 1`)
+
+The module is a pyo3-free cdylib (`cv_native`) built from the same `cv_gen`
+rlib as the pyo3 module, in the same build, listed in the same manifest, loaded
+with `libloading`. The bakeoff copy of this ABI is
+`tools/workbook_compiler/rust/cv_py_template/NATIVE_ABI.md`; the two change
+together, and a change bumps `CV_NATIVE_ABI`.
+
+Rules: every entry is `extern "C"` with `catch_unwind` inside (a panic is
+`CV_ERR_PANIC`); strings are UTF-8 pointer + length; matrices are row-major;
+memory the module returns is freed only by the module (`cv_meta_json` is static);
+memory the host passes (ports, xcall answers) is borrowed for the call and
+copied. `cv_run` drives `begin_run`, TODAY, `write_ports`, then `run_units`
+itself (as `bundlerun_template/main.rs`). A ranged port is passed as
+`CV_PORT_ROWS`; the module marks the port supplied (`PortIn::Value(Blank)`, so
+its formula-port units are skipped) and `Store::set`s the rows cell by cell
+before `run_units`; anything but the exact declared rectangle declines
+`admission`.
+
+```c
+#define CV_NATIVE_ABI 1u
+
+/* CvVal.tag */
+#define CV_TAG_BLANK 0u
+#define CV_TAG_NUM   1u
+#define CV_TAG_BOOL  2u   /* num is 0.0 (FALSE) or 1.0 (TRUE) */
+#define CV_TAG_STR   3u
+#define CV_TAG_ERR   4u
+/* CvVal.err_code: xlrt_rs::ErrCode in declaration order */
+#define CV_XLERR_NA 0u
+#define CV_XLERR_VALUE 1u
+#define CV_XLERR_DIV0 2u
+#define CV_XLERR_REF 3u
+#define CV_XLERR_NAME 4u
+#define CV_XLERR_NUM 5u
+#define CV_XLERR_NULL 6u
+#define CV_XLERR_SPILL 7u
+#define CV_XLERR_CALC 8u
+/* CvPort.kind */
+#define CV_PORT_NOT_SUPPLIED 0u
+#define CV_PORT_VALUE 1u
+#define CV_PORT_ROWS 2u
+/* CvArg.kind */
+#define CV_ARG_SCALAR 0u
+#define CV_ARG_ROWS 1u
+/* CvError.code (also the int32 return of cv_run_read_rect / cv_run_stats) */
+#define CV_OK 0u
+#define CV_ERR_DECLINE 1u    /* reason = decline reason; host records fallback:<reason> */
+#define CV_ERR_VIOLATION 2u  /* runtime guard tripped (RunError::Violation); unit set */
+#define CV_ERR_XCALL 3u      /* host callback returned non-zero (RunError::Xcall); unit set */
+#define CV_ERR_PANIC 4u      /* panic caught inside the entry */
+#define CV_ERR_ARGS 5u       /* null pointer, port count, sheet index, rectangle */
+#define CV_ERROR_REASON_CAP 64
+
+typedef struct CvVal {        /* 40 bytes on 64-bit */
+    uint32_t tag;
+    double num;
+    const uint8_t *str_ptr;   /* UTF-8, not NUL-terminated; NULL unless CV_TAG_STR */
+    size_t str_len;
+    uint32_t err_code;        /* only for CV_TAG_ERR */
+} CvVal;
+
+typedef struct CvMatrix {     /* row-major rows*cols; 32 bytes */
+    size_t rows;
+    size_t cols;
+    CvVal *vals;
+    void *owner;              /* module allocation cookie for cv_matrix_free; NULL if host-owned */
+} CvMatrix;
+
+typedef struct CvPort {       /* one input port, PORT_NAMES order; 80 bytes */
+    uint32_t kind;            /* CV_PORT_* */
+    CvVal value;              /* CV_PORT_VALUE */
+    CvMatrix rows;            /* CV_PORT_ROWS: must be the exact declared rectangle, else decline admission */
+} CvPort;
+
+typedef struct CvArg {        /* nested MDL.CALLMODEL argument (xlrt_rs::Arg); 80 bytes */
+    uint32_t kind;            /* CV_ARG_* */
+    CvVal value;
+    CvMatrix rows;
+} CvArg;
+
+typedef struct CvError {      /* host-allocated, module-filled, value-free; 88 bytes */
+    uint32_t code;            /* CV_OK / CV_ERR_* */
+    int64_t unit;             /* failing unit for VIOLATION / XCALL, else -1 */
+    uint32_t reason_len;
+    uint8_t reason[CV_ERROR_REASON_CAP];
+} CvError;
+
+typedef struct CvRunStats {   /* 48 bytes */
+    uint64_t xcalls;
+    uint64_t guard_views;
+    uint64_t guard_probes;
+    int64_t guard_max_row_minus_limit;  /* INT64_MIN when no guard view ran */
+    double t_fresh_s;
+    double t_run_s;
+} CvRunStats;
+
+typedef struct CvRun CvRun;   /* opaque: the run's store and string table */
+
+/* args = [target, block, output, tail...]; 0 with *out filled (host-owned, valid until return;
+   the module copies it), non-zero on failure (the host keeps its own error in ctx). */
+typedef int32_t (*CvXcallFn)(void *ctx, const CvArg *args, size_t n_args, CvMatrix *out);
+
+uint32_t cv_native_abi(void);
+const uint8_t *cv_meta_json(size_t *len);            /* static META_JSON; never freed */
+CvRun *cv_run(const CvPort *ports, size_t n_ports, double today,
+              CvXcallFn xcall /* nullable */, void *ctx, CvError *err);   /* NULL on failure, err filled */
+int32_t cv_run_read_rect(const CvRun *run, uint32_t sheet_index,
+                         uint32_t r1, uint32_t c1, uint32_t r2, uint32_t c2,
+                         CvMatrix *out);             /* 1-based inclusive; out module-owned */
+int32_t cv_run_stats(const CvRun *run, CvRunStats *out);
+void cv_matrix_free(CvMatrix *matrix);
+void cv_run_free(CvRun *run);
+```
+
+### Value law (host side, from `compiled/adapter.py`; receipts stay byte-identical)
+
+- Inputs (LiteralValue -> Val): Empty -> Blank; Int / Number -> Num(f64);
+  Boolean -> Bool; Text -> Str; anything else declines `admission`.
+- Outputs (Val -> LiteralValue): Blank -> Empty; Num non-finite declines
+  `non_finite`; Err `#NUM!` / `#N/A` -> Error(Num / Na), kind only; any other
+  Err declines `output_lane`.
+- Nested-call results into the module: Int declines `xcall_lane`; Error,
+  Pending, Array element, or a non-array answer declines `xcall_error`.
+- Module -> router arguments: `CV_ARG_SCALAR` -> its LiteralValue;
+  `CV_ARG_ROWS` -> `LiteralValue::Array`.
+- Route strings are exactly `compiled`, `engine:<reason>` (no module
+  attempted) and `fallback:<reason>` (attempted, discarded). Fault and
+  deadline semantics are `CompiledRoute.attempt`'s: a router fault during the
+  run (the fault count grew) is an infrastructure error, not a decline; a
+  deadline passed after the run is `fallback:deadline`.
+
+### Pin registry `compiled-pins-1`
+
+A content-addressed bucket document `products/<P>/<V>/compiled/pins/<sha256>.json`,
+pinned by the existing per-deploy env var (its value becomes the document's
+sha256). Trust chain: env -> pins document -> `manifest.json` sha -> file
+digests. With no pins document the loader's single-manifest probing is the
+fallback (today's Rev/Enduris/KH/DG pins keep working).
+
+```json
+{
+  "schema": "compiled-pins-1",
+  "workbooks": {
+    "<workbook_sha256>": {
+      "manifest_sha256": "<sha256 of the artifact manifest.json>",
+      "kind": "<artifact kind>",
+      "role": "child | parent",
+      "generator_sha256": "<rsgen generator sha256>",
+      "runtime_version": "<compiled adapter runtime_version>",
+      "engine_commit": "<fork commit the artifact was differentially tested against>",
+      "platform": "<target triple>",
+      "native_abi": 1
+    },
+    "<workbook_sha256>": "engine"
+  }
+}
+```
+
+The literal `"engine"` records a deliberate engine decision; an absent workbook
+is engine. `child_routes` (target -> version -> sha) stays the only version
+concept; the registry is keyed by sha alone. `role: parent` supersedes
+`MDL_WHOLE_MODEL_MANIFEST*`. The parity loader hands the Rust hook a value-free
+`native_registry_json` (`{sha: {native_path, engine_commit, manifest_sha256}}`)
+through `ModelSession.set_native_compiled`; the hook never reads the bucket or
+the environment.
+
+### read_rect and `CompiledCells` (report rule)
+
+`cv_run_read_rect` is the ABI primitive; `CompiledRun::read_cells` groups
+addresses by sheet and reads each bounding rectangle once. The binding exposes
+a pyclass `formualizer.CompiledCells` with `get_value(sheet, row, col)` so
+`pdf_export.snapshot.capture_report` and `read_conditions` run unchanged.
+A compiled parent serves `report` only when the template's `condition_plans`
+has no non-simple-equality expressions (then `conditional_results` is `{}` per
+sheet); otherwise it falls back with `engine:report_conditions`. `diagnostic`
+runs fall back too (no compiled `inspect_cell`). Compiled parents are admitted
+only without goal seek, without `calculation_normalizations`, with
+`date_system == 1900`; any decline discards the attempt, records
+`fallback:<reason>` under a `parent` key of `compiled.routes` and builds a
+fresh engine `RunCore`. A compiled parent takes no pool entry.
+
+### Work-package file ownership (no two packages edit the same file)
+
+| WP | Files |
+|---|---|
+| 0 (done) | fork `crates/formualizer-modelcall/src/{evaluator,lib,compiled}.rs` (compiled.rs skeleton only), this section; bakeoff `tools/workbook_compiler/rust/cv_py_template/NATIVE_ABI.md` |
+| 1 | bakeoff `tools/workbook_compiler/rsgen_pyo3.py`, `rust_build.py` (flavour `native`), `rust/cv_native_template/`, their tests |
+| 2 | fork `crates/formualizer-modelcall/src/compiled.rs`, `Cargo.toml` (+`libloading`), `tests/native_compiled.rs`, `tests/fixtures/native_stub/` |
+| 3 | fork `crates/formualizer-modelcall/src/{session,ports,receipt}.rs`, `bindings/python/src/modelcall.rs` (`set_native_compiled`, `CompiledCells`) |
+| 4 | parity `workbook_runtime/compiled/{loader,manifest,hook}.py`, `workbook_runtime/runtime.py`, `workbook_runtime/whole_model.py`, `pdf_export/readiness.py`, tests |
+| 5 | bakeoff `tools/workbook_compiler/compiled_pins.py` |
+
+`compiled/adapter.py` and its `runtime_version` are touched by no package.

@@ -156,6 +156,107 @@ pub trait CompiledChildHook: Send + Sync {
     fn report(&self) -> Map<String, Value>;
 }
 
+// ------------------------------------------------------------------ Architecture B seam (GOD-383 archB WP0)
+
+/// One cell a compiled run is asked for: `(sheet name, row, col)`, 1-based,
+/// the addressing of `Workbook::get_value` (and of `SolveModel::get_value`).
+pub type CellAddress = (String, u32, u32);
+
+/// Value-free statistics of one compiled run (`cv_run_stats`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompiledRunStats {
+    pub xcalls: u64,
+    pub guard_views: u64,
+    pub guard_probes: u64,
+    /// `None` when no guard view ran (the module's `i64::MIN` sentinel).
+    pub guard_max_row_minus_limit: Option<i64>,
+    pub t_fresh_s: f64,
+    pub t_run_s: f64,
+}
+
+/// Cell reads against a finished compiled run's store (`cv_run_read_rect`).
+/// An implementation groups the addresses by sheet and reads each sheet's
+/// bounding rectangle once. Values follow the architecture-B value law
+/// (`docs/modelcall_contract.md`): Blank -> Empty, Num -> Number, Bool ->
+/// Boolean, Str -> Text, Err -> Error(kind).
+pub trait CompiledCells: Send {
+    /// One value per address, in the order given.
+    fn read_cells(&self, cells: &[CellAddress]) -> Result<Vec<LiteralValue>, ModelCallError>;
+}
+
+/// A finished compiled run of a whole workbook (a compiled parent): its
+/// declared outputs, a handle for further cell reads (report capture), the
+/// route record and the statistics. Holding it keeps the module's run store
+/// alive; dropping it frees the store (`cv_run_free`).
+pub struct CompiledRun {
+    /// Casefolded output key -> typed matrix, in `spec.outputs` order.
+    pub outputs: Vec<(String, ChildMatrix)>,
+    /// Route record for the receipt's `compiled.routes` (`"compiled"`).
+    pub route: Value,
+    pub stats: CompiledRunStats,
+    pub cells: Box<dyn CompiledCells>,
+}
+
+impl CompiledRun {
+    pub fn read_cells(&self, cells: &[CellAddress]) -> Result<Vec<LiteralValue>, ModelCallError> {
+        self.cells.read_cells(cells)
+    }
+}
+
+impl fmt::Debug for CompiledRun {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledRun")
+            .field("outputs", &self.outputs.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>())
+            .field("route", &self.route)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The nested-call surface a compiled module's `MDL.CALLMODEL` sites use:
+/// the session's router (`ModelCallRouter::nested(core, [parent identity])`),
+/// so children are compiled or engine, with memo and prefetch unchanged.
+/// Arguments follow the module -> router law: a scalar is its
+/// `LiteralValue`, a rows argument is `LiteralValue::Array`.
+pub trait CompiledXcall {
+    fn call(
+        &mut self,
+        target: &LiteralValue,
+        block: &LiteralValue,
+        output: &LiteralValue,
+        tail: &[LiteralValue],
+    ) -> Result<ChildMatrix, ModelCallError>;
+}
+
+/// What a compiled parent did with one request.
+#[derive(Debug)]
+pub enum ParentAttempt {
+    /// The module ran; the session projects `run.outputs`.
+    Compiled(CompiledRun),
+    /// No run (or a discarded one): the session builds a fresh engine parent
+    /// and records `route` (`engine:<reason>` or `fallback:<reason>`) under
+    /// the `parent` key of `compiled.routes`.
+    Declined { route: Value },
+}
+
+/// Optional compiled parent (architecture B item (c)), consulted by
+/// `ModelSession::run` before the engine parent is loaded. `Err` is an
+/// infrastructure fault (a router fault during the run, a module panic),
+/// not a decline.
+pub trait CompiledParent: Send + Sync {
+    fn run(
+        &self,
+        spec: &ModelSpec,
+        inputs: &[(String, LiteralValue)],
+        context: &CalculationContext,
+        xcall: &mut dyn CompiledXcall,
+    ) -> Result<ParentAttempt, ModelCallError>;
+
+    /// `{calls, routes}` for the parent, as `CompiledChildHook::report`.
+    fn report(&self) -> Map<String, Value>;
+}
+
 /// Scope of a defined name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameScope {
