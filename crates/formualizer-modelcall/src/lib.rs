@@ -41,6 +41,7 @@ pub mod session;
 // Lane B.
 pub mod goal_seek;
 pub mod prefetch;
+pub mod batch_child;
 
 // Lane I: retained workbooks (pool, warm, sealing).
 pub mod retained;
