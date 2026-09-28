@@ -1,0 +1,16 @@
+[package]
+name = "formualizer-modelcall"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Child-model call (MDL.CALLMODEL) calculation path: contract types, routing, memo, ports, prefetch and goal seek (GOD-383)"
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+formualizer-common = { path = "../formualizer-common", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

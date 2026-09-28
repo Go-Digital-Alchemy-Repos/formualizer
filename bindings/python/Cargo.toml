@@ -48,6 +48,8 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 # Preserve all structured error payloads in the Python native-value bridge.
 formualizer-common = { path = "../../crates/formualizer-common", features = ["serde"] }
+# GOD-383: child-model call calculation path (ModelSession, MDL.CALLMODEL).
+formualizer-modelcall = { path = "../../crates/formualizer-modelcall" }
 
 [target.'cfg(not(target_os = "emscripten"))'.dependencies]
 # `system-clock` is required for TODAY()/NOW() to read the wall clock. Without

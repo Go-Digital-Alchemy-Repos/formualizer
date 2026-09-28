@@ -34,6 +34,7 @@ mod engine;
 mod enums;
 mod errors;
 mod inspect;
+mod modelcall;
 mod parser;
 mod reference;
 mod sheet; // retain for compatibility
@@ -473,6 +474,7 @@ fn formualizer_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     workbook::register(m)?;
     sheet::register(m)?;
     sheetport::register(m)?;
+    modelcall::register(m)?;
     // Convenience functions
     m.add_function(wrap_pyfunction!(tokenize, m)?)?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
