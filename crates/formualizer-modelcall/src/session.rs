@@ -752,9 +752,6 @@ impl RunCore {
         state.reuse.seal(&state.invocations)
     }
 
-    pub(crate) fn session_reuse(&self) -> Map<String, Value> {
-        self.state().reuse.report()
-    }
 }
 
 fn with_workbook(mut record: Map<String, Value>, identity: &str) -> Map<String, Value> {

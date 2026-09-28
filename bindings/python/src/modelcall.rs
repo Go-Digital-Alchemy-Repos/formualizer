@@ -659,7 +659,7 @@ impl PyRetainedModel {
     }
 }
 
-fn timings_to_py(py: Python<'_>, timings: &formualizer_modelcall::receipt::Timings) -> PyResult<Bound<'_, PyDict>> {
+fn timings_to_py<'py>(py: Python<'py>, timings: &formualizer_modelcall::receipt::Timings) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     for (key, value) in timings.0.iter() {
         match value {
