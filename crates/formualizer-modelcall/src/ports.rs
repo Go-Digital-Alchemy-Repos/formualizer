@@ -1,35 +1,367 @@
 //! Lane A: SheetPort admission (`workbook_runtime/ports.py`): the alias map,
 //! the unknown-input policy, wire decoding (including the CL-105 date-text
-//! rules), CL-097 skip-unchanged writes (`WriteRecord`) and typed reads.
-//! Lane 0 placeholder: fallible entry points return
-//! `ModelCallError::NotImplemented`; `child_port_updates` returns `None`
-//! (the memo then keys by the full input vector, the GOD-379 form, which can
-//! only lose hits, never answers).
+//! rules), CL-097 write statistics (`WriteRecord`), typed reads and the
+//! client output projection (`_project_output`, `output_dates.project_date`).
+//!
+//! Values. `ports.py` works on Python objects; [`WireValue`] is that object
+//! model (`None`, `bool`, `int`, `float`, `str`, `date`, `datetime`, `time`,
+//! `list`, `dict`, and an engine value passed through unconverted, which is
+//! what an engine error or Pending is to the Python code). A client request
+//! is decoded from JSON (`decode_wire = true`); a child call's inputs arrive as
+//! engine values and are converted exactly as the Python callback conversion
+//! (`literal_to_py`) does. The native write converts back as `py_to_literal`
+//! and `py_to_port_value` do.
+//!
+//! Defaults. `ModelSpec.defaults` is JSON. A default that is a native date,
+//! datetime or time (an openpyxl cell value in Python) is carried as a
+//! one-key object `{"$date": "YYYY-MM-DD"}`, `{"$datetime": "..."}` or
+//! `{"$time": "..."}` (ISO text); every other JSON value is read as Python's
+//! `json` module reads it.
+//!
+//! Not ported (this port evaluates a fresh load per call, never a re-entered
+//! pool entry): the formula-default restore on re-entry and the CL-097
+//! skip-unchanged logic. On a fresh load both are no-ops in Python too; the
+//! write record here only reports the four CL-097 counters (all zero), so the
+//! timings keys match.
 
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use formualizer_common::LiteralValue;
+use formualizer_sheetport::{
+    BoundPort, InputUpdate, ManifestBindings, PortValue as SheetValue, SheetPort, SheetPortError, TableValue,
+};
+use formualizer_workbook::Workbook;
+use serde_json::{Map, Value};
+use sheetport_spec::Manifest;
+use std::collections::BTreeMap;
 
-use crate::key::InputPairs;
-use crate::spec::{ModelSpec, UnknownInputPolicy};
+use crate::evaluator::ChildMatrix;
+use crate::key::{InputPairs, casefold};
+use crate::receipt::PortValue;
+use crate::spec::{CellRange, ModelSpec, OrderedMap, PortLocation, UnknownInputPolicy};
 use crate::ModelCallError;
+
+// ---------------------------------------------------------------------------
+// Python object model
+// ---------------------------------------------------------------------------
+
+/// A Python value as `ports.py` sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WireValue {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Date(NaiveDate),
+    DateTime(NaiveDateTime),
+    Time(NaiveTime),
+    List(Vec<WireValue>),
+    Dict(OrderedMap<WireValue>),
+    /// An engine value with no plain Python form (error, Pending, duration).
+    Literal(LiteralValue),
+}
+
+impl WireValue {
+    /// A JSON value as Python's `json` module reads it, plus the `$date`,
+    /// `$datetime` and `$time` tags for native temporal defaults.
+    pub fn from_json(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::None,
+            Value::Bool(flag) => Self::Bool(*flag),
+            Value::Number(number) => {
+                if let Some(integer) = number.as_i64() {
+                    Self::Int(integer)
+                } else if number.is_u64() {
+                    // Beyond i64: Python keeps an int the engine cannot take.
+                    Self::Float(number.as_f64().unwrap_or(f64::NAN))
+                } else {
+                    Self::Float(number.as_f64().unwrap_or(f64::NAN))
+                }
+            }
+            Value::String(text) => Self::Str(text.clone()),
+            Value::Array(items) => Self::List(items.iter().map(Self::from_json).collect()),
+            Value::Object(map) => {
+                if map.len() == 1 {
+                    if let Some(tagged) = Self::tagged_temporal(map) {
+                        return tagged;
+                    }
+                }
+                Self::Dict(OrderedMap(map.iter().map(|(key, value)| (key.clone(), Self::from_json(value))).collect()))
+            }
+        }
+    }
+
+    fn tagged_temporal(map: &Map<String, Value>) -> Option<Self> {
+        let (tag, value) = map.iter().next()?;
+        let text = value.as_str()?;
+        match tag.as_str() {
+            "$date" => parse_iso_date(text).map(Self::Date),
+            "$datetime" => parse_iso_datetime(text).map(Self::DateTime),
+            "$time" => parse_iso_time(text).map(|(time, _)| Self::Time(time)),
+            _ => None,
+        }
+    }
+
+    /// The callback conversion (`literal_to_py`) of an engine argument.
+    pub fn from_literal(value: &LiteralValue) -> Self {
+        match value {
+            LiteralValue::Empty => Self::None,
+            LiteralValue::Boolean(flag) => Self::Bool(*flag),
+            LiteralValue::Int(number) => Self::Int(*number),
+            LiteralValue::Number(number) => Self::Float(*number),
+            LiteralValue::Text(text) => Self::Str(text.clone()),
+            LiteralValue::Date(day) => Self::Date(*day),
+            LiteralValue::DateTime(stamp) => Self::DateTime(*stamp),
+            LiteralValue::Time(clock) => Self::Time(*clock),
+            LiteralValue::Array(rows) => {
+                Self::List(rows.iter().map(|row| Self::List(row.iter().map(Self::from_literal).collect())).collect())
+            }
+            LiteralValue::Error(_) | LiteralValue::Pending | LiteralValue::Duration(_) => Self::Literal(value.clone()),
+        }
+    }
+
+    /// Python's `type(value).__name__`.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::None => "NoneType",
+            Self::Bool(_) => "bool",
+            Self::Int(_) => "int",
+            Self::Float(_) => "float",
+            Self::Str(_) => "str",
+            Self::Date(_) => "date",
+            Self::DateTime(_) => "datetime",
+            Self::Time(_) => "time",
+            Self::List(_) => "list",
+            Self::Dict(_) => "dict",
+            Self::Literal(LiteralValue::Duration(_)) => "timedelta",
+            Self::Literal(_) => "dict",
+        }
+    }
+
+    /// `py_to_literal`.
+    pub fn to_literal(&self) -> Result<LiteralValue, PortError> {
+        Ok(match self {
+            Self::None => LiteralValue::Empty,
+            Self::Bool(flag) => LiteralValue::Boolean(*flag),
+            Self::Int(number) => LiteralValue::Int(*number),
+            Self::Float(number) => LiteralValue::Number(*number),
+            Self::Str(text) => LiteralValue::Text(text.clone()),
+            Self::Date(day) => LiteralValue::Date(*day),
+            Self::DateTime(stamp) => LiteralValue::DateTime(*stamp),
+            Self::Time(clock) => LiteralValue::Time(*clock),
+            Self::Literal(value) => value.clone(),
+            Self::List(items) => {
+                let mut rows = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let Self::List(cells) = item else {
+                        return Err(PortError::Value(format!("Array row {} must be a list", index + 1)));
+                    };
+                    rows.push(cells.iter().map(Self::to_literal).collect::<Result<Vec<_>, _>>()?);
+                }
+                if let Some(first) = rows.first() {
+                    let expected = first.len();
+                    for (index, row) in rows.iter().enumerate() {
+                        if row.len() != expected {
+                            return Err(PortError::Value(format!(
+                                "Array rows must be rectangular (row {} has length {}, expected {expected})",
+                                index + 1,
+                                row.len()
+                            )));
+                        }
+                    }
+                }
+                LiteralValue::Array(rows)
+            }
+            Self::Dict(_) => return Err(PortError::Type("Unsupported value type for LiteralValue".into())),
+        })
+    }
+
+    fn is_blank_text(&self) -> bool {
+        matches!(self, Self::Str(text) if text.is_empty())
+    }
+}
+
+/// Python `==` between two plain values (header membership).
+fn py_equal(left: &WireValue, right: &WireValue) -> bool {
+    use WireValue as W;
+    match (left, right) {
+        (W::Int(a), W::Float(b)) | (W::Float(b), W::Int(a)) => (*a as f64) == *b,
+        (W::Bool(a), W::Int(b)) | (W::Int(b), W::Bool(a)) => i64::from(*a) == *b,
+        (W::Bool(a), W::Float(b)) | (W::Float(b), W::Bool(a)) => f64::from(u8::from(*a)) == *b,
+        _ => left == right,
+    }
+}
+
+/// Python `repr` of a `str`.
+pub fn py_repr(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(quote);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ if ch == quote => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ if (ch as u32) < 0x20 || ch as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", ch as u32)),
+            _ => out.push(ch),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// A failure inside port admission or a port read, by Python exception type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PortError {
+    /// `ValueError`: the request does not satisfy the interface.
+    Value(String),
+    /// `SheetPortConstraintError`.
+    Constraint(String),
+    /// `TypeError` from the native conversion.
+    Type(String),
+    /// Anything else (`KeyError`, engine errors, ...).
+    Other { kind: String, message: String },
+}
+
+impl PortError {
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::Value(_) => "ValueError",
+            Self::Constraint(_) => "SheetPortConstraintError",
+            Self::Type(_) => "TypeError",
+            Self::Other { kind, .. } => kind,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Value(message) | Self::Constraint(message) | Self::Type(message) => message,
+            Self::Other { message, .. } => message,
+        }
+    }
+
+    /// Whether a child call reports it as a routing refusal (`ValueError` or
+    /// `SheetPortConstraintError` in `calculate_child`).
+    pub fn is_admission(&self) -> bool {
+        matches!(self, Self::Value(_) | Self::Constraint(_))
+    }
+
+    fn key(name: &str) -> Self {
+        Self::Other { kind: "KeyError".into(), message: py_repr(name) }
+    }
+
+    /// The error as a request failure (`Type: message`).
+    pub fn into_error(self) -> ModelCallError {
+        ModelCallError::infrastructure(self.kind().to_owned(), self.message().to_owned())
+    }
+}
+
+impl From<SheetPortError> for PortError {
+    fn from(error: SheetPortError) -> Self {
+        match error {
+            SheetPortError::ConstraintViolation { .. } => {
+                Self::Constraint("value did not satisfy manifest constraints".into())
+            }
+            SheetPortError::Engine { source } => {
+                Self::Other { kind: "ExcelEvaluationError".into(), message: source.to_string() }
+            }
+            SheetPortError::Workbook { source: formualizer_workbook::IoError::Engine(source) } => {
+                Self::Other { kind: "ExcelEvaluationError".into(), message: source.to_string() }
+            }
+            SheetPortError::Workbook { source } => {
+                Self::Other { kind: "SheetPortWorkbookError".into(), message: source.to_string() }
+            }
+            SheetPortError::InvalidManifest { .. } => {
+                Self::Other { kind: "SheetPortManifestError".into(), message: "manifest validation failed".into() }
+            }
+            other => Self::Other { kind: "SheetPortError".into(), message: other.to_string() },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alias map and canonical names
+// ---------------------------------------------------------------------------
 
 /// Casefolded accepted spelling -> canonical port name (`spec_port_alias_map`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PortAliasMap(pub Vec<(String, String)>);
 
+impl PortAliasMap {
+    fn insert(&mut self, folded: String, canonical: String) {
+        match self.0.iter_mut().find(|(existing, _)| *existing == folded) {
+            Some(slot) => slot.1 = canonical,
+            None => self.0.push((folded, canonical)),
+        }
+    }
+
+    pub fn get(&self, folded: &str) -> Option<&str> {
+        self.0.iter().find(|(existing, _)| existing == folded).map(|(_, canonical)| canonical.as_str())
+    }
+}
+
+/// `port_alias_map(defaults, spec)`.
+fn port_alias_map(spec: &ModelSpec) -> PortAliasMap {
+    let mut aliases = PortAliasMap::default();
+    for key in spec.defaults.keys() {
+        aliases.insert(casefold(key), key.to_owned());
+    }
+    for (folded, location) in spec.inputs.iter() {
+        aliases.insert(folded.to_owned(), location.key.clone());
+    }
+    aliases
+}
+
 /// `spec_port_alias_map(spec)`.
-pub fn spec_port_alias_map(_spec: &ModelSpec) -> Result<PortAliasMap, ModelCallError> {
-    Err(ModelCallError::NotImplemented("ports::spec_port_alias_map"))
+pub fn spec_port_alias_map(spec: &ModelSpec) -> Result<PortAliasMap, ModelCallError> {
+    Ok(port_alias_map(spec))
+}
+
+/// `canonical_port_inputs` over any value type; `ignored` collects names the
+/// `ignore` policy drops.
+fn canonical_pairs<V: Clone>(
+    inputs: &[(String, V)],
+    aliases: &PortAliasMap,
+    policy: UnknownInputPolicy,
+    mut ignored: Option<&mut Vec<String>>,
+) -> Result<Vec<(String, V)>, PortError> {
+    let mut result: Vec<(String, V)> = Vec::new();
+    for (key, value) in inputs {
+        let Some(canonical) = aliases.get(&casefold(key)) else {
+            if policy == UnknownInputPolicy::Ignore {
+                if let Some(ignored) = ignored.as_deref_mut() {
+                    ignored.push(key.clone());
+                }
+                continue;
+            }
+            return Err(PortError::Value(format!("Undeclared input {}", py_repr(key))));
+        };
+        if result.iter().any(|(existing, _)| existing == canonical) {
+            return Err(PortError::Value(format!("Duplicate input {}", py_repr(canonical))));
+        }
+        result.push((canonical.to_owned(), value.clone()));
+    }
+    Ok(result)
 }
 
 /// `canonical_port_inputs(inputs, aliases, policy)`: canonical name -> value;
 /// a duplicate canonical name is an error; under `Ignore` unmatched names are
 /// dropped, under `Reject` they are an error.
 pub fn canonical_port_inputs(
-    _inputs: &[(String, LiteralValue)],
-    _aliases: &PortAliasMap,
-    _policy: UnknownInputPolicy,
+    inputs: &[(String, LiteralValue)],
+    aliases: &PortAliasMap,
+    policy: UnknownInputPolicy,
 ) -> Result<InputPairs, ModelCallError> {
-    Err(ModelCallError::NotImplemented("ports::canonical_port_inputs"))
+    canonical_pairs(inputs, aliases, policy, None).map_err(PortError::into_error)
 }
 
 /// `callbacks.child_port_updates`: the port updates an `ignore`-policy child
@@ -41,4 +373,1206 @@ pub fn child_port_updates(spec: &ModelSpec, inputs: &[(String, LiteralValue)]) -
     }
     let aliases = spec_port_alias_map(spec).ok()?;
     canonical_port_inputs(inputs, &aliases, UnknownInputPolicy::Ignore).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Python parsers used by wire decoding
+// ---------------------------------------------------------------------------
+
+/// Python `float(text)` (text already stripped by the caller).
+pub fn py_float(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned: String = if trimmed.contains('_') {
+        let chars: Vec<char> = trimmed.chars().collect();
+        for (index, ch) in chars.iter().enumerate() {
+            if *ch == '_' {
+                let before = index.checked_sub(1).and_then(|i| chars.get(i)).is_some_and(char::is_ascii_digit);
+                let after = chars.get(index + 1).is_some_and(char::is_ascii_digit);
+                if !(before && after) {
+                    return None;
+                }
+            }
+        }
+        chars.into_iter().filter(|ch| *ch != '_').collect()
+    } else {
+        trimmed.to_owned()
+    };
+    let lowered = cleaned.to_ascii_lowercase();
+    let unsigned = lowered.trim_start_matches(['+', '-']);
+    if lowered.len() - unsigned.len() > 1 {
+        return None;
+    }
+    let negative = lowered.starts_with('-');
+    let special = match unsigned {
+        "inf" | "infinity" => Some(f64::INFINITY),
+        "nan" => Some(f64::NAN),
+        _ => None,
+    };
+    if let Some(value) = special {
+        return Some(if negative { -value } else { value });
+    }
+    if !unsigned.chars().next().is_some_and(|ch| ch.is_ascii_digit() || ch == '.') {
+        return None;
+    }
+    cleaned.parse::<f64>().ok()
+}
+
+fn digits(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// `date.fromisoformat` (extended `YYYY-MM-DD` or basic `YYYYMMDD`).
+pub fn parse_iso_date(text: &str) -> Option<NaiveDate> {
+    let (year, month, day) = match text.len() {
+        10 if text.as_bytes()[4] == b'-' && text.as_bytes()[7] == b'-' => {
+            (digits(text.get(0..4)?)?, digits(text.get(5..7)?)?, digits(text.get(8..10)?)?)
+        }
+        8 => (digits(text.get(0..4)?)?, digits(text.get(4..6)?)?, digits(text.get(6..8)?)?),
+        _ => return None,
+    };
+    if year == 0 {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)
+}
+
+/// `time.fromisoformat` of a time part (optionally with a UTC offset, which
+/// is validated and returned in seconds).
+pub fn parse_iso_time(text: &str) -> Option<(NaiveTime, Option<i32>)> {
+    let split = text.find(['+', '-', 'Z']);
+    let (clock, offset) = match split {
+        Some(index) => (&text[..index], Some(&text[index..])),
+        None => (text, None),
+    };
+    let offset_seconds = match offset {
+        None => None,
+        Some("Z") => Some(0),
+        Some(zone) => {
+            let sign = if zone.starts_with('-') { -1 } else { 1 };
+            let (time, _) = parse_clock(&zone[1..])?;
+            Some(sign * i32::try_from(time.num_seconds_from_midnight()).ok()?)
+        }
+    };
+    let (time, _) = parse_clock(clock)?;
+    Some((time, offset_seconds))
+}
+
+/// `HH[:MM[:SS[.f+]]]` or `HH[MM[SS[.f+]]]`.
+fn parse_clock(text: &str) -> Option<(NaiveTime, ())> {
+    let (main, fraction) = match text.find(['.', ',']) {
+        Some(index) => (&text[..index], Some(&text[index + 1..])),
+        None => (text, None),
+    };
+    let parts: Vec<&str> = if main.contains(':') {
+        main.split(':').collect()
+    } else {
+        if main.len() % 2 != 0 || main.len() > 6 {
+            return None;
+        }
+        (0..main.len()).step_by(2).map(|i| &main[i..i + 2]).collect()
+    };
+    if parts.is_empty() || parts.len() > 3 || parts.iter().any(|part| part.len() != 2) {
+        return None;
+    }
+    let hour = digits(parts[0])?;
+    let minute = parts.get(1).map_or(Some(0), |part| digits(part))?;
+    let second = parts.get(2).map_or(Some(0), |part| digits(part))?;
+    let micro = match fraction {
+        None => 0,
+        Some(fraction) => {
+            if parts.len() != 3 || fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut padded: String = fraction.chars().take(6).collect();
+            while padded.len() < 6 {
+                padded.push('0');
+            }
+            digits(&padded)?
+        }
+    };
+    NaiveTime::from_hms_micro_opt(hour, minute, second, micro).map(|time| (time, ()))
+}
+
+/// `datetime.fromisoformat(text).replace(tzinfo=None)`.
+pub fn parse_iso_datetime(text: &str) -> Option<NaiveDateTime> {
+    let bytes = text.as_bytes();
+    let (date, rest) = if bytes.len() >= 10 && bytes.get(4) == Some(&b'-') {
+        (parse_iso_date(text.get(0..10)?)?, text.get(10..)?)
+    } else if bytes.len() >= 8 {
+        (parse_iso_date(text.get(0..8)?)?, text.get(8..)?)
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return Some(date.and_time(NaiveTime::MIN));
+    }
+    let mut chars = rest.chars();
+    chars.next()?; // any single separator character
+    let (time, _) = parse_iso_time(chars.as_str())?;
+    Some(date.and_time(time))
+}
+
+fn invalid_isoformat(text: &str) -> PortError {
+    PortError::Value(format!("Invalid isoformat string: {}", py_repr(text)))
+}
+
+/// `PortSession._temporal(value, kind)`.
+fn temporal(value: &WireValue, kind: &str) -> Result<WireValue, PortError> {
+    let WireValue::Str(text) = value else { return Ok(value.clone()) };
+    if text.is_empty() {
+        return Ok(value.clone());
+    }
+    match kind {
+        "datetime" => {
+            let replaced = text.replace('Z', "+00:00");
+            parse_iso_datetime(&replaced).map(WireValue::DateTime).ok_or_else(|| invalid_isoformat(&replaced))
+        }
+        "date" => {
+            let head: String = text.chars().take(10).collect();
+            parse_iso_date(&head).map(WireValue::Date).ok_or_else(|| invalid_isoformat(&head))
+        }
+        "number" | "integer" => {
+            let stripped = text.trim();
+            let number = py_float(stripped).ok_or_else(|| {
+                PortError::Value(format!("could not convert string to float: {}", py_repr(stripped)))
+            })?;
+            if kind == "integer" {
+                if !(number.is_finite() && number.fract() == 0.0) {
+                    return Err(PortError::Value("Input requires an integer".into()));
+                }
+                #[expect(clippy::cast_possible_truncation, reason = "checked integral and in range")]
+                if number.abs() < 9.223_372_036_854_775_807e18 {
+                    return Ok(WireValue::Int(number as i64));
+                }
+                return Err(PortError::Other {
+                    kind: "OverflowError".into(),
+                    message: "Python int too large to convert to C long".into(),
+                });
+            }
+            Ok(WireValue::Float(number))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn iso_date_prefix(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 10
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+// ---------------------------------------------------------------------------
+// CL-097 write record
+// ---------------------------------------------------------------------------
+
+/// CL-097 counters (`PortSession.write_stats`), in Python's key order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteStats {
+    pub writes_skipped: u64,
+    pub formula_restores_skipped: u64,
+    pub defaults_not_restored_overwritten: u64,
+    pub date_writes_skipped: u64,
+}
+
+impl WriteStats {
+    pub fn entries(&self) -> [(&'static str, u64); 4] {
+        [
+            ("writes_skipped", self.writes_skipped),
+            ("formula_restores_skipped", self.formula_restores_skipped),
+            ("defaults_not_restored_overwritten", self.defaults_not_restored_overwritten),
+            ("date_writes_skipped", self.date_writes_skipped),
+        ]
+    }
+}
+
+/// What one loaded workbook's port sessions last wrote (CL-097). A fresh load
+/// has written nothing, so nothing is ever skipped on it; see the module note.
+#[derive(Debug, Clone, Default)]
+pub struct WriteRecord {
+    cleared: u64,
+}
+
+impl WriteRecord {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The record no longer vouches for the workbook (report conditions).
+    pub fn clear(&mut self) {
+        self.cleared += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The port session
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct PortDecl {
+    id: String,
+    shape: String,
+    schema: Value,
+}
+
+/// `PortSession` for a published `ModelSpec` (the only kind the runtime loads).
+pub struct PortSession {
+    bindings: ManifestBindings,
+    ports: Vec<PortDecl>,
+    aliases: PortAliasMap,
+    defaults: Vec<(String, WireValue)>,
+    policy: UnknownInputPolicy,
+    source_loaded: bool,
+    /// Request names the `ignore` policy dropped, per scenario.
+    pub ignored_inputs: Vec<String>,
+    /// Declared inputs left at their defaults, declared spelling, casefold-sorted.
+    pub defaulted_inputs: Vec<String>,
+    pub write_record: Option<WriteRecord>,
+    pub write_stats: Option<WriteStats>,
+}
+
+fn json_manifest(spec: &ModelSpec) -> Result<Manifest, PortError> {
+    let text = serde_json::to_string(&spec.manifest)
+        .map_err(|error| PortError::Other { kind: "TypeError".into(), message: error.to_string() })?;
+    Manifest::from_yaml_str(&text)
+        .map_err(|error| PortError::Other { kind: "SheetPortManifestError".into(), message: error.to_string() })
+}
+
+impl PortSession {
+    /// Bind the spec's manifest to `workbook` (`PortSession(workbook, spec,
+    /// source_loaded=..., write_record=...)`).
+    pub fn new(workbook: &mut Workbook, spec: &ModelSpec, source_loaded: bool, write_record: bool) -> Result<Self, PortError> {
+        let manifest = json_manifest(spec)?;
+        let sheetport = SheetPort::new(workbook, manifest)?;
+        let (_, bindings) = sheetport.into_parts();
+        let ports = spec
+            .manifest
+            .get("ports")
+            .and_then(Value::as_array)
+            .map(|ports| {
+                ports
+                    .iter()
+                    .filter(|port| port.get("dir").and_then(Value::as_str) == Some("in"))
+                    .map(|port| PortDecl {
+                        id: port.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                        shape: port.get("shape").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                        schema: port.get("schema").cloned().unwrap_or(Value::Null),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match spec.descriptor.get("unknown_input_policy").and_then(Value::as_str) {
+            None | Some("reject") | Some("ignore") => {}
+            Some(_) => return Err(PortError::Value("Unsupported unknown input policy".into())),
+        }
+        let defaults = spec.defaults.iter().map(|(key, value)| (key.to_owned(), WireValue::from_json(value))).collect();
+        Ok(Self {
+            bindings,
+            ports,
+            aliases: port_alias_map(spec),
+            defaults,
+            policy: spec.unknown_input_policy(),
+            source_loaded,
+            ignored_inputs: Vec::new(),
+            defaulted_inputs: Vec::new(),
+            write_record: write_record.then(WriteRecord::new),
+            write_stats: None,
+        })
+    }
+
+    fn port(&self, id: &str) -> Result<&PortDecl, PortError> {
+        self.ports.iter().find(|port| port.id == id).ok_or_else(|| PortError::key(id))
+    }
+
+    fn location<'a>(spec: &'a ModelSpec, key: &str) -> Result<&'a PortLocation, PortError> {
+        spec.inputs.get(&casefold(key)).ok_or_else(|| PortError::key(&casefold(key)))
+    }
+
+    /// `write_scenario(inputs, decode_wire=...)`: admit, write natively and
+    /// return the effective inputs (`key -> admitted value`).
+    pub fn write_scenario(
+        &mut self,
+        workbook: &mut Workbook,
+        spec: &ModelSpec,
+        inputs: &[(String, WireValue)],
+        decode_wire: bool,
+    ) -> Result<Vec<(String, WireValue)>, PortError> {
+        if self.write_record.is_some() {
+            self.write_stats = Some(WriteStats::default());
+        }
+        let source_loaded = std::mem::replace(&mut self.source_loaded, false);
+        if !source_loaded {
+            self.restore_all_formula_defaults(workbook, spec)?;
+        }
+        let result = self.admit(spec, inputs, decode_wire).and_then(|(effective, admitted)| {
+            self.write_native(workbook, &admitted)?;
+            let mut returned = Vec::with_capacity(effective.len());
+            for (key, _) in &effective {
+                let port_id = &Self::location(spec, key)?.port_id;
+                let value = admitted.iter().find(|(id, _)| id == port_id).map(|(_, value)| value.clone());
+                returned.push((key.clone(), value.unwrap_or(WireValue::None)));
+            }
+            Ok(returned)
+        });
+        if result.is_err() {
+            if let Some(record) = self.write_record.as_mut() {
+                record.clear();
+            }
+        }
+        result
+    }
+
+    fn restore_all_formula_defaults(&self, workbook: &mut Workbook, spec: &ModelSpec) -> Result<(), PortError> {
+        let Some(entries) = spec.descriptor.get("formula_input_defaults").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        for entries in entries.values().filter_map(Value::as_array) {
+            for entry in entries {
+                let sheet = entry.get("sheet").and_then(Value::as_str).unwrap_or_default();
+                let row = entry.get("row").and_then(Value::as_u64).unwrap_or_default();
+                let col = entry.get("col").and_then(Value::as_u64).unwrap_or_default();
+                let formula = entry.get("formula").and_then(Value::as_str).unwrap_or_default();
+                workbook
+                    .set_formula(
+                        sheet,
+                        u32::try_from(row).unwrap_or(u32::MAX),
+                        u32::try_from(col).unwrap_or(u32::MAX),
+                        formula.trim_start_matches('='),
+                    )
+                    .map_err(|error| PortError::Other { kind: "RuntimeError".into(), message: error.to_string() })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `_admit`: (effective inputs, native update by port id); no engine call.
+    #[expect(clippy::type_complexity, reason = "mirrors the Python tuple")]
+    fn admit(
+        &mut self,
+        spec: &ModelSpec,
+        inputs: &[(String, WireValue)],
+        decode_wire: bool,
+    ) -> Result<(Vec<(String, WireValue)>, Vec<(String, WireValue)>), PortError> {
+        let mut effective = self.defaults.clone();
+        self.ignored_inputs = Vec::new();
+        self.defaulted_inputs = Vec::new();
+        let mut ignored = Vec::new();
+        let updates = canonical_pairs(inputs, &self.aliases, self.policy, Some(&mut ignored));
+        self.ignored_inputs = ignored;
+        let updates = updates?;
+        let supplied: Vec<String> = updates.iter().map(|(key, _)| casefold(key)).collect();
+        let mut defaulted: Vec<String> = spec
+            .inputs
+            .iter()
+            .filter(|(folded, _)| !supplied.iter().any(|name| name == folded))
+            .map(|(_, location)| location.key.clone())
+            .collect();
+        defaulted.sort_by_key(|key| casefold(key));
+        self.defaulted_inputs = defaulted;
+
+        for (key, value) in updates {
+            let location = Self::location(spec, &key)?;
+            let port = self.port(&location.port_id)?.clone();
+            let mut value = value;
+            if let WireValue::List(items) = &value {
+                if port.shape != "scalar" && items.first().is_none_or(|first| matches!(first, WireValue::Dict(_))) {
+                    let headers: Vec<WireValue> =
+                        location.headers.iter().flatten().map(WireValue::from_json).collect();
+                    let mut rows = vec![WireValue::List(headers.clone())];
+                    for item in items {
+                        let WireValue::Dict(row) = item else {
+                            return Err(PortError::Other {
+                                kind: "AttributeError".into(),
+                                message: format!("'{}' object has no attribute 'get'", item.type_name()),
+                            });
+                        };
+                        if row.keys().any(|column| !headers.iter().any(|h| py_equal(&WireValue::Str(column.to_owned()), h))) {
+                            return Err(PortError::Value(format!("{key} has an undeclared column")));
+                        }
+                        rows.push(WireValue::List(
+                            headers
+                                .iter()
+                                .map(|header| match header {
+                                    WireValue::Str(name) => row.get(name).cloned().unwrap_or(WireValue::None),
+                                    _ => WireValue::None,
+                                })
+                                .collect(),
+                        ));
+                    }
+                    value = WireValue::List(rows);
+                }
+            }
+            let slot = match effective.iter().position(|(existing, _)| *existing == key) {
+                Some(position) => position,
+                None => {
+                    effective.push((key.clone(), WireValue::None));
+                    effective.len() - 1
+                }
+            };
+            let had_default = self.defaults.iter().any(|(existing, _)| *existing == key);
+            match port.shape.as_str() {
+                "record" => {
+                    if let WireValue::Dict(update) = &value {
+                        let update = if decode_wire {
+                            self.native_one(spec, &key, &value, true)?
+                        } else {
+                            WireValue::Dict(update.clone())
+                        };
+                        if !had_default {
+                            return Err(PortError::key(&key));
+                        }
+                        let WireValue::Dict(current) = &mut effective[slot].1 else {
+                            return Err(PortError::Other {
+                                kind: "AttributeError".into(),
+                                message: "object has no attribute 'update'".into(),
+                            });
+                        };
+                        if let WireValue::Dict(update) = update {
+                            for (field, cell) in update.0 {
+                                match current.0.iter_mut().find(|(existing, _)| *existing == field) {
+                                    Some(existing) => existing.1 = cell,
+                                    None => current.0.push((field, cell)),
+                                }
+                            }
+                        }
+                    } else {
+                        let rows = as_rows(&value)?;
+                        let formula_fields: Vec<String> = spec
+                            .descriptor
+                            .get("formula_input_defaults")
+                            .and_then(|defaults| defaults.get(&key))
+                            .and_then(Value::as_array)
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter_map(|entry| entry.get("field").and_then(Value::as_str).map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let fields: Vec<String> = port
+                            .schema
+                            .get("fields")
+                            .and_then(Value::as_object)
+                            .map(|fields| fields.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let mut cleared: Vec<(String, WireValue)> = fields
+                            .iter()
+                            .filter(|field| !formula_fields.contains(field))
+                            .map(|field| (field.clone(), WireValue::None))
+                            .collect();
+                        for (r, row) in rows.iter().enumerate() {
+                            let WireValue::List(cells) = row else {
+                                return Err(PortError::Type(format!(
+                                    "'{}' object is not iterable",
+                                    row.type_name()
+                                )));
+                            };
+                            for (c, cell) in cells.iter().enumerate() {
+                                let field = format!("r{r}_c{c}");
+                                if !fields.contains(&field) {
+                                    return Err(PortError::Value(format!("{key} exceeds its declared rectangle")));
+                                }
+                                match cleared.iter_mut().find(|(existing, _)| *existing == field) {
+                                    Some(slot) => slot.1 = cell.clone(),
+                                    None => cleared.push((field, cell.clone())),
+                                }
+                            }
+                        }
+                        let mut cleared = WireValue::Dict(OrderedMap(cleared));
+                        if decode_wire {
+                            cleared = self.native_one(spec, &key, &cleared, true)?;
+                        }
+                        effective[slot].1 = cleared;
+                    }
+                }
+                "range" => {
+                    if !had_default {
+                        return Err(PortError::key(&key));
+                    }
+                    let baseline = match &effective[slot].1 {
+                        WireValue::List(rows) => rows.clone(),
+                        _ => Vec::new(),
+                    };
+                    let WireValue::List(_) = &value else {
+                        return Err(PortError::Value(format!("{key} requires a matrix")));
+                    };
+                    let rows = as_rows(&value)?;
+                    let width = match baseline.first() {
+                        Some(WireValue::List(first)) => first.len(),
+                        _ => 0,
+                    };
+                    let too_wide = rows.iter().any(|row| match row {
+                        WireValue::List(cells) => cells.len() > width,
+                        _ => false,
+                    });
+                    if rows.len() > baseline.len() || too_wide {
+                        return Err(PortError::Value(format!("{key} exceeds its declared rectangle")));
+                    }
+                    let mut cleared: Vec<Vec<WireValue>> = baseline
+                        .iter()
+                        .map(|row| match row {
+                            WireValue::List(cells) => vec![WireValue::None; cells.len()],
+                            _ => Vec::new(),
+                        })
+                        .collect();
+                    let rows = if decode_wire {
+                        match self.native_one(spec, &key, &WireValue::List(rows), true)? {
+                            WireValue::List(rows) => rows,
+                            other => vec![other],
+                        }
+                    } else {
+                        rows
+                    };
+                    for (r, row) in rows.iter().enumerate() {
+                        if let WireValue::List(cells) = row {
+                            for (c, cell) in cells.iter().enumerate() {
+                                if let Some(target) = cleared.get_mut(r).and_then(|row| row.get_mut(c)) {
+                                    *target = cell.clone();
+                                }
+                            }
+                        }
+                    }
+                    effective[slot].1 = WireValue::List(cleared.into_iter().map(WireValue::List).collect());
+                }
+                _ => {
+                    effective[slot].1 = self.native_one(spec, &key, &value, decode_wire)?;
+                }
+            }
+        }
+        let mut admitted = Vec::with_capacity(effective.len());
+        for (key, value) in &effective {
+            admitted.push((Self::location(spec, key)?.port_id.clone(), value.clone()));
+        }
+        Ok((effective, admitted))
+    }
+
+    /// `_native_update({key: value}, decode_wire)[port_id]`.
+    fn native_one(&self, spec: &ModelSpec, key: &str, value: &WireValue, decode_wire: bool) -> Result<WireValue, PortError> {
+        let location = Self::location(spec, key)?;
+        let port = self.port(&location.port_id)?;
+        if !decode_wire {
+            return Ok(value.clone());
+        }
+        let schema = &port.schema;
+        match port.shape.as_str() {
+            "scalar" => {
+                let wire_format = spec
+                    .descriptor
+                    .get("wire_formats")
+                    .and_then(|formats| formats.get(casefold(key)))
+                    .and_then(Value::as_str);
+                match wire_format {
+                    Some("excel-number") => {
+                        if matches!(value, WireValue::None) || value.is_blank_text() {
+                            return Ok(value.clone());
+                        }
+                        if !matches!(value, WireValue::Str(_) | WireValue::Int(_) | WireValue::Float(_)) {
+                            return Err(PortError::Value(
+                                "Excel number wire input requires text, a finite number or blank".into(),
+                            ));
+                        }
+                        // CL-105: non-numeric text binds as text.
+                        let number = temporal(value, "number").unwrap_or_else(|_| value.clone());
+                        let finite = match &number {
+                            WireValue::Str(_) => return Ok(value.clone()),
+                            WireValue::Float(number) => number.is_finite(),
+                            _ => true,
+                        };
+                        if !finite {
+                            return Err(PortError::Value("Excel number wire input requires a finite number".into()));
+                        }
+                        Ok(number)
+                    }
+                    Some("excel-datetime") => {
+                        if !matches!(
+                            value,
+                            WireValue::None
+                                | WireValue::Str(_)
+                                | WireValue::Int(_)
+                                | WireValue::Float(_)
+                                | WireValue::Date(_)
+                                | WireValue::DateTime(_)
+                        ) {
+                            return Err(PortError::Value(
+                                "Excel date wire input requires text or a native date/serial/blank".into(),
+                            ));
+                        }
+                        match temporal(value, "datetime") {
+                            Ok(decoded) => Ok(decoded),
+                            // CL-105: non-ISO-shaped text binds as text.
+                            Err(error) => match value {
+                                WireValue::Str(text) if !iso_date_prefix(text) => Ok(value.clone()),
+                                _ => Err(error),
+                            },
+                        }
+                    }
+                    _ => {
+                        let kind = schema.get("type").and_then(Value::as_str).ok_or_else(|| PortError::key("type"))?;
+                        temporal(value, kind)
+                    }
+                }
+            }
+            "record" => {
+                let WireValue::Dict(cells) = value else {
+                    return Err(PortError::Other {
+                        kind: "AttributeError".into(),
+                        message: format!("'{}' object has no attribute 'items'", value.type_name()),
+                    });
+                };
+                let mut decoded = Vec::with_capacity(cells.len());
+                for (field, cell) in cells.iter() {
+                    let kind = schema
+                        .get("fields")
+                        .and_then(|fields| fields.get(field))
+                        .ok_or_else(|| PortError::key(field))?
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| PortError::key("type"))?;
+                    decoded.push((field.to_owned(), temporal(cell, kind)?));
+                }
+                Ok(WireValue::Dict(OrderedMap(decoded)))
+            }
+            "range" => {
+                let kind = schema.get("cell_type").and_then(Value::as_str).ok_or_else(|| PortError::key("cell_type"))?;
+                let WireValue::List(rows) = value else {
+                    return Err(PortError::Type(format!("'{}' object is not iterable", value.type_name())));
+                };
+                let mut decoded = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let WireValue::List(cells) = row else {
+                        return Err(PortError::Type(format!("'{}' object is not iterable", row.type_name())));
+                    };
+                    decoded.push(WireValue::List(cells.iter().map(|cell| temporal(cell, kind)).collect::<Result<_, _>>()?));
+                }
+                Ok(WireValue::List(decoded))
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+
+    /// `self.native.write_inputs(admitted)` (`py_to_input_update`).
+    fn write_native(&mut self, workbook: &mut Workbook, admitted: &[(String, WireValue)]) -> Result<(), PortError> {
+        let mut update = InputUpdate::default();
+        for (port_id, value) in admitted {
+            let binding = self
+                .bindings
+                .get(port_id)
+                .ok_or_else(|| PortError::Type(format!("unknown port id `{port_id}`")))?;
+            update.insert(port_id.clone(), port_value(&binding.kind, value)?);
+        }
+        let mut sheetport = SheetPort::from_bindings(workbook, self.bindings.clone())?;
+        sheetport.write_inputs(update)?;
+        let (_, bindings) = sheetport.into_parts();
+        self.bindings = bindings;
+        Ok(())
+    }
+
+    fn snapshot_inputs(&mut self, workbook: &mut Workbook) -> Result<BTreeMap<String, SheetValue>, PortError> {
+        let mut sheetport = SheetPort::from_bindings(workbook, self.bindings.clone())?;
+        let values = sheetport.read_inputs()?;
+        let (_, bindings) = sheetport.into_parts();
+        self.bindings = bindings;
+        Ok(values.into_inner())
+    }
+
+    fn snapshot_outputs(&mut self, workbook: &mut Workbook) -> Result<BTreeMap<String, SheetValue>, PortError> {
+        let mut sheetport = SheetPort::from_bindings(workbook, self.bindings.clone())?;
+        let values = sheetport.read_outputs()?;
+        let (_, bindings) = sheetport.into_parts();
+        self.bindings = bindings;
+        Ok(values.into_inner())
+    }
+
+    /// `read_inputs()`: declared key -> value.
+    pub fn read_inputs(&mut self, workbook: &mut Workbook, spec: &ModelSpec) -> Result<OrderedMap<PortValue>, PortError> {
+        let values = self.snapshot_inputs(workbook)?;
+        let mut result = Vec::with_capacity(spec.inputs.len());
+        for (_, location) in spec.inputs.iter() {
+            let value = values.get(&location.port_id).ok_or_else(|| PortError::key(&location.port_id))?;
+            result.push((location.key.clone(), receipt_value(value)));
+        }
+        Ok(OrderedMap(result))
+    }
+
+    /// `read_outputs(trim_trailing_null_rows=...)`: the client projection.
+    pub fn read_outputs(
+        &mut self,
+        workbook: &mut Workbook,
+        spec: &ModelSpec,
+        trim_trailing_null_rows: bool,
+    ) -> Result<OrderedMap<PortValue>, PortError> {
+        let values = self.snapshot_outputs(workbook)?;
+        let contracts = spec.descriptor.get("output_wire_formats");
+        let mut result = Vec::with_capacity(spec.outputs.len());
+        for (key, location) in spec.outputs.iter() {
+            let mut value = receipt_value(values.get(&location.port_id).ok_or_else(|| PortError::key(&location.port_id))?);
+            let contract = contracts.and_then(|contracts| contracts.get(key)).filter(|contract| is_truthy(contract));
+            if let Some(contract) = contract {
+                value = apply_date_contract(value, location, contract)?;
+            }
+            result.push((location.key.clone(), project_output(value, location, trim_trailing_null_rows)?));
+        }
+        Ok(OrderedMap(result))
+    }
+
+    /// `read_typed_outputs()`: records as their row matrix.
+    pub fn read_typed_outputs(&mut self, workbook: &mut Workbook, spec: &ModelSpec) -> Result<OrderedMap<PortValue>, PortError> {
+        let values = self.snapshot_outputs(workbook)?;
+        let mut result = Vec::with_capacity(spec.outputs.len());
+        for (_, location) in spec.outputs.iter() {
+            let value = receipt_value(values.get(&location.port_id).ok_or_else(|| PortError::key(&location.port_id))?);
+            let value = if location.shape == "record" { record_rows(&value, &location.range)? } else { value };
+            result.push((location.key.clone(), value));
+        }
+        Ok(OrderedMap(result))
+    }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Object(map) => !map.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::String(text) => !text.is_empty(),
+        Value::Number(number) => number.as_f64() != Some(0.0),
+    }
+}
+
+/// `rows = value; if rows and not isinstance(rows[0], (list, tuple)): rows = [[v] for v in rows]`.
+fn as_rows(value: &WireValue) -> Result<Vec<WireValue>, PortError> {
+    match value {
+        WireValue::List(items) => {
+            if items.first().is_some_and(|first| !matches!(first, WireValue::List(_))) {
+                Ok(items.iter().map(|item| WireValue::List(vec![item.clone()])).collect())
+            } else {
+                Ok(items.clone())
+            }
+        }
+        other => Err(PortError::Type(format!("'{}' object is not subscriptable", other.type_name()))),
+    }
+}
+
+/// `py_to_port_value(binding, value)`.
+fn port_value(kind: &BoundPort, value: &WireValue) -> Result<SheetValue, PortError> {
+    if matches!(value, WireValue::None) {
+        return Ok(match kind {
+            BoundPort::Scalar(_) => SheetValue::Scalar(LiteralValue::Empty),
+            BoundPort::Record(_) => SheetValue::Record(BTreeMap::new()),
+            BoundPort::Range(_) => SheetValue::Range(Vec::new()),
+            BoundPort::Table(_) => SheetValue::Table(TableValue::default()),
+        });
+    }
+    match kind {
+        BoundPort::Scalar(_) => Ok(SheetValue::Scalar(value.to_literal()?)),
+        BoundPort::Record(record) => {
+            let WireValue::Dict(cells) = value else {
+                return Err(PortError::Type("record inputs must be dictionaries".into()));
+            };
+            let mut map = BTreeMap::new();
+            for (field, cell) in cells.iter() {
+                if !record.fields.contains_key(field) {
+                    return Err(PortError::Type(format!("record update includes unknown field `{field}`")));
+                }
+                map.insert(field.to_owned(), cell.to_literal()?);
+            }
+            Ok(SheetValue::Record(map))
+        }
+        BoundPort::Range(_) => {
+            let WireValue::List(rows) = value else {
+                return Err(PortError::Type("range inputs must be an iterable of rows".into()));
+            };
+            let mut converted: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows.len());
+            let mut width: Option<usize> = None;
+            for (index, row) in rows.iter().enumerate() {
+                let WireValue::List(cells) = row else {
+                    return Err(PortError::Type(format!("range row {} must be iterable", index + 1)));
+                };
+                let cells = cells.iter().map(WireValue::to_literal).collect::<Result<Vec<_>, _>>()?;
+                match width {
+                    Some(expected) if expected != cells.len() => {
+                        return Err(PortError::Type(format!(
+                            "range rows must be rectangular (row {} has {}, expected {})",
+                            index + 1,
+                            cells.len(),
+                            expected
+                        )));
+                    }
+                    Some(_) => {}
+                    None => width = Some(cells.len()),
+                }
+                converted.push(cells);
+            }
+            Ok(SheetValue::Range(converted))
+        }
+        BoundPort::Table(_) => Err(PortError::Type("table inputs must be an iterable of row mappings".into())),
+    }
+}
+
+/// A SheetPort value as the receipt holds it.
+fn receipt_value(value: &SheetValue) -> PortValue {
+    match value {
+        SheetValue::Scalar(value) => PortValue::Scalar(value.clone()),
+        SheetValue::Record(fields) => {
+            PortValue::Record(OrderedMap(fields.iter().map(|(key, value)| (key.clone(), value.clone())).collect()))
+        }
+        SheetValue::Range(rows) => PortValue::Range(rows.clone()),
+        SheetValue::Table(table) => PortValue::Table(
+            table
+                .rows
+                .iter()
+                .map(|row| OrderedMap(row.values.iter().map(|(key, value)| (key.clone(), value.clone())).collect()))
+                .collect(),
+        ),
+    }
+}
+
+/// A record's fields as the rows of its rectangle.
+fn record_rows(value: &PortValue, range: &CellRange) -> Result<PortValue, PortError> {
+    let PortValue::Record(fields) = value else { return Ok(value.clone()) };
+    let mut rows = Vec::with_capacity(range.rows() as usize);
+    for r in 0..range.rows() {
+        let mut row = Vec::with_capacity(range.cols() as usize);
+        for c in 0..range.cols() {
+            let field = format!("r{r}_c{c}");
+            row.push(fields.get(&field).cloned().ok_or_else(|| PortError::key(&field))?);
+        }
+        rows.push(row);
+    }
+    Ok(PortValue::Range(rows))
+}
+
+fn apply_date_contract(value: PortValue, location: &PortLocation, contract: &Value) -> Result<PortValue, PortError> {
+    let cells: Vec<(usize, usize)> = contract
+        .get("cells")
+        .and_then(Value::as_array)
+        .map(|cells| {
+            cells
+                .iter()
+                .filter_map(|cell| {
+                    let cell = cell.as_array()?;
+                    Some((usize::try_from(cell.first()?.as_u64()?).ok()?, usize::try_from(cell.get(1)?.as_u64()?).ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(match (location.shape.as_str(), value) {
+        ("scalar", PortValue::Scalar(value)) => PortValue::Scalar(project_date(&value, contract)?),
+        ("record", PortValue::Record(mut fields)) => {
+            for (row, col) in cells {
+                let field = format!("r{row}_c{col}");
+                let slot = fields.0.iter_mut().find(|(name, _)| *name == field).ok_or_else(|| PortError::key(&field))?;
+                slot.1 = project_date(&slot.1, contract)?;
+            }
+            PortValue::Record(fields)
+        }
+        (_, PortValue::Range(mut rows)) => {
+            for (row, col) in cells {
+                let cell = rows
+                    .get_mut(row)
+                    .and_then(|cells| cells.get_mut(col))
+                    .ok_or_else(|| PortError::Other { kind: "IndexError".into(), message: "list index out of range".into() })?;
+                *cell = project_date(cell, contract)?;
+            }
+            PortValue::Range(rows)
+        }
+        (_, other) => other,
+    })
+}
+
+/// `output_dates.project_date(value, contract)`.
+pub fn project_date(value: &LiteralValue, contract: &Value) -> Result<LiteralValue, PortError> {
+    let number = match value {
+        LiteralValue::Int(number) => *number as f64,
+        LiteralValue::Number(number) => *number,
+        _ => return Ok(value.clone()),
+    };
+    let fail = |message: &str| Err(PortError::Value(message.to_owned()));
+    if !number.is_finite() {
+        return fail("Nonfinite output date serial");
+    }
+    let sentinels = contract.get("sentinels").and_then(Value::as_array);
+    #[expect(clippy::float_cmp, reason = "Python `in` compares exactly")]
+    if sentinels.is_some_and(|sentinels| sentinels.iter().filter_map(Value::as_f64).any(|s| s == number)) {
+        return Ok(value.clone());
+    }
+    let policy = |name: &str| {
+        contract.get("edge_policy").and_then(|policy| policy.get(name)).and_then(Value::as_str).unwrap_or_default()
+    };
+    if number < 0.0 {
+        if policy("negative") == "preserve" {
+            return Ok(value.clone());
+        }
+        return fail("Negative output date serial is not admitted");
+    }
+    let whole = number.floor();
+    #[expect(clippy::float_cmp, reason = "exact integrality test")]
+    if number != whole && policy("fractional") == "reject" {
+        return fail("Fractional output date serial is not admitted");
+    }
+    if number == 0.0 {
+        match policy("zero") {
+            "preserve" => return Ok(value.clone()),
+            "reject" => return fail("Zero output date serial is not admitted"),
+            _ => {}
+        }
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "finite, non-negative, bounded below by calendar check")]
+    let whole = whole.min(1e9) as i64;
+    let (origin, offset) = match contract.get("date_system").and_then(Value::as_i64) {
+        Some(1900) => {
+            if whole == 60 {
+                if policy("serial60") == "preserve" {
+                    return Ok(value.clone());
+                }
+                return fail("Excel fictional 1900 leap day has no ISO date representation");
+            }
+            if whole == 0 {
+                return fail("1900 serial zero requires preserve or reject policy");
+            }
+            (NaiveDate::from_ymd_opt(1899, 12, 31), whole - i64::from(whole > 60))
+        }
+        Some(1904) => (NaiveDate::from_ymd_opt(1904, 1, 1), whole),
+        _ => return fail("Output date contract has an unsupported source epoch"),
+    };
+    let day = origin
+        .and_then(|origin| origin.checked_add_signed(Duration::try_days(offset)?))
+        .filter(|day| (1..=9999).contains(&day.year()));
+    match day {
+        Some(day) => Ok(LiteralValue::Text(day.format("%Y-%m-%d").to_string())),
+        None => fail("Output date serial exceeds ISO calendar bounds"),
+    }
+}
+
+/// openpyxl `get_column_letter`.
+pub fn column_letter(mut col: u32) -> String {
+    let mut letters = Vec::new();
+    while col > 0 {
+        let rem = (col - 1) % 26;
+        letters.push(char::from(b'A' + u8::try_from(rem).unwrap_or(0)));
+        col = (col - 1) / 26;
+    }
+    letters.iter().rev().collect()
+}
+
+/// Python `format(value, '.15g')`.
+pub fn format_g15(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let scientific = format!("{value:.14e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    if (-4..15).contains(&exponent) {
+        let decimals = usize::try_from(14 - exponent).unwrap_or(0);
+        let fixed = format!("{value:.decimals$}");
+        strip_fraction(&fixed)
+    } else {
+        let mantissa = strip_fraction(mantissa);
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
+fn strip_fraction(text: &str) -> String {
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Python `str(datetime)`.
+fn python_datetime_str(stamp: &NaiveDateTime) -> String {
+    let micro = stamp.nanosecond() / 1_000;
+    if micro == 0 {
+        stamp.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        format!("{}.{micro:06}", stamp.format("%Y-%m-%d %H:%M:%S"))
+    }
+}
+
+/// `PortSession._header(cell, col)`.
+fn header(cell: &LiteralValue, col: u32) -> Result<String, PortError> {
+    Ok(match cell {
+        LiteralValue::Empty => format!("Column {}", column_letter(col)),
+        LiteralValue::Boolean(flag) => (if *flag { "TRUE" } else { "FALSE" }).to_owned(),
+        LiteralValue::Number(number) => {
+            if number.is_finite() && number.fract() == 0.0 {
+                let text = format!("{number:.0}");
+                if text == "-0" { "0".to_owned() } else { text }
+            } else {
+                format_g15(*number)
+            }
+        }
+        LiteralValue::Int(number) => number.to_string(),
+        LiteralValue::Text(text) => text.clone(),
+        LiteralValue::Date(day) => day.format("%Y-%m-%d").to_string(),
+        LiteralValue::DateTime(stamp) => python_datetime_str(stamp),
+        _ => {
+            return Err(PortError::Value(
+                "A client table header must be a scalar label, not an error or composite value".into(),
+            ));
+        }
+    })
+}
+
+/// `PortSession._project_output(value, loc, trim_trailing_null_rows)`.
+fn project_output(value: PortValue, location: &PortLocation, trim: bool) -> Result<PortValue, PortError> {
+    if location.shape == "scalar" {
+        return Ok(value);
+    }
+    let value = if location.shape == "record" { record_rows(&value, &location.range)? } else { value };
+    let PortValue::Range(mut rows) = value else { return Ok(value) };
+    if rows.len() == 1 {
+        return Ok(PortValue::Row(rows.remove(0)));
+    }
+    let Some(first) = rows.first() else {
+        return Err(PortError::Other { kind: "IndexError".into(), message: "list index out of range".into() });
+    };
+    let headers = first
+        .iter()
+        .enumerate()
+        .map(|(c, cell)| header(cell, location.range.start_col + u32::try_from(c).unwrap_or(0)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut data: Vec<Vec<LiteralValue>> = rows.drain(1..).collect();
+    while trim && data.last().is_some_and(|row| row.iter().all(|cell| matches!(cell, LiteralValue::Empty))) {
+        data.pop();
+    }
+    let table = data
+        .into_iter()
+        .map(|row| {
+            let mut record: Vec<(String, LiteralValue)> = Vec::with_capacity(headers.len());
+            for (name, cell) in headers.iter().zip(row) {
+                match record.iter_mut().find(|(existing, _)| existing == name) {
+                    Some(slot) => slot.1 = cell,
+                    None => record.push((name.clone(), cell)),
+                }
+            }
+            OrderedMap(record)
+        })
+        .collect();
+    Ok(PortValue::Table(table))
+}
+
+/// `read_typed_matrix(workbook, location)`: native literals, no evaluation.
+pub fn read_typed_matrix(workbook: &Workbook, range: &CellRange) -> Result<ChildMatrix, PortError> {
+    if workbook.engine().sheet_id(&range.sheet).is_none() {
+        return Err(PortError::Value(format!("Unknown sheet: {}", range.sheet)));
+    }
+    Ok((range.start_row..=range.end_row)
+        .map(|row| {
+            (range.start_col..=range.end_col)
+                .map(|col| workbook.engine().get_typed_cell_value(&range.sheet, row, col).unwrap_or(LiteralValue::Empty))
+                .collect()
+        })
+        .collect())
+}
+
+/// `native_matrix(matrix)`: a nonempty rectangle, else `ValueError`.
+pub fn native_matrix(matrix: &ChildMatrix) -> Result<LiteralValue, ModelCallError> {
+    let Some(first) = matrix.first() else {
+        return Err(ModelCallError::infrastructure("ValueError", "Child result must be a nonempty rectangle"));
+    };
+    if first.is_empty() || matrix.iter().any(|row| row.len() != first.len()) {
+        return Err(ModelCallError::infrastructure("ValueError", "Child result must be a nonempty rectangle"));
+    }
+    Ok(LiteralValue::Array(matrix.clone()))
+}
+
+/// The Python value `PortSession` hands back for a written input, as a
+/// receipt value (effective inputs of a failed run).
+pub fn wire_to_port_value(value: &WireValue) -> PortValue {
+    match value {
+        WireValue::Dict(fields) => PortValue::Record(OrderedMap(
+            fields.iter().map(|(key, cell)| (key.to_owned(), cell.to_literal().unwrap_or(LiteralValue::Empty))).collect(),
+        )),
+        WireValue::List(rows) if rows.iter().all(|row| matches!(row, WireValue::List(_))) => PortValue::Range(
+            rows.iter()
+                .map(|row| match row {
+                    WireValue::List(cells) => {
+                        cells.iter().map(|cell| cell.to_literal().unwrap_or(LiteralValue::Empty)).collect()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect(),
+        ),
+        other => PortValue::Scalar(other.to_literal().unwrap_or(LiteralValue::Empty)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_float_and_iso_parsers() {
+        assert_eq!(py_float(" 1_000.5 "), Some(1000.5));
+        assert_eq!(py_float("1__0"), None);
+        assert_eq!(py_float("-Infinity"), Some(f64::NEG_INFINITY));
+        assert!(py_float("abc").is_none());
+        assert!(py_float("1e").is_none());
+        assert_eq!(parse_iso_date("2024-02-29"), NaiveDate::from_ymd_opt(2024, 2, 29));
+        assert_eq!(parse_iso_date("20240229"), NaiveDate::from_ymd_opt(2024, 2, 29));
+        assert!(parse_iso_date("2023-02-29").is_none());
+        let stamp = parse_iso_datetime("2024-01-02T03:04:05.5+01:00").unwrap();
+        assert_eq!(stamp.to_string(), "2024-01-02 03:04:05.500");
+        assert!(parse_iso_datetime("01/02/2024").is_none());
+        assert_eq!(parse_iso_datetime("2024-01-02").unwrap().to_string(), "2024-01-02 00:00:00");
+    }
+
+    #[test]
+    fn repr_and_formatting_match_python() {
+        assert_eq!(py_repr("abc"), "'abc'");
+        assert_eq!(py_repr("it's"), "\"it's\"");
+        assert_eq!(format_g15(0.1 + 0.2), "0.3");
+        assert_eq!(format_g15(1.5e-7), "1.5e-07");
+        assert_eq!(format_g15(1.234_567_890_123_456_7e20), "1.23456789012346e+20");
+        assert_eq!(format_g15(2.5), "2.5");
+        assert_eq!(column_letter(1), "A");
+        assert_eq!(column_letter(28), "AB");
+        assert_eq!(header(&LiteralValue::Number(3.0), 1).unwrap(), "3");
+        assert_eq!(header(&LiteralValue::Empty, 3).unwrap(), "Column C");
+    }
+
+    #[test]
+    fn cl105_number_text_binds_as_text_and_dates_decode() {
+        assert_eq!(temporal(&WireValue::Str("12".into()), "number").unwrap(), WireValue::Float(12.0));
+        assert!(temporal(&WireValue::Str("n/a".into()), "number").is_err());
+        assert_eq!(
+            temporal(&WireValue::Str("2024-03-01".into()), "date").unwrap(),
+            WireValue::Date(NaiveDate::from_ymd_opt(2024, 3, 1).unwrap())
+        );
+        assert!(iso_date_prefix("2024-13-01"));
+        assert!(!iso_date_prefix("March 2024"));
+    }
+
+    #[test]
+    fn project_date_follows_contract() {
+        let contract = serde_json::json!({
+            "format": "excel-date", "date_system": 1900, "sentinels": [0],
+            "edge_policy": {"zero": "preserve", "negative": "reject", "serial60": "reject", "fractional": "floor"},
+            "cells": []
+        });
+        assert_eq!(project_date(&LiteralValue::Number(45292.5), &contract).unwrap(), LiteralValue::Text("2024-01-01".into()));
+        assert_eq!(project_date(&LiteralValue::Int(0), &contract).unwrap(), LiteralValue::Int(0));
+        assert!(project_date(&LiteralValue::Number(-1.0), &contract).is_err());
+        assert!(project_date(&LiteralValue::Number(60.0), &contract).is_err());
+        assert_eq!(project_date(&LiteralValue::Text("x".into()), &contract).unwrap(), LiteralValue::Text("x".into()));
+    }
 }

@@ -1927,6 +1927,19 @@ impl PyRangeAddress {
 
 // Non-Python methods for internal use
 impl PyWorkbook {
+    /// GOD-383 Lane A: a Python view over a workbook another owner holds
+    /// (the model-call session's parent, for report capture). Shares the
+    /// engine state; the compatibility cache and cancel flag are its own.
+    pub(crate) fn from_shared(
+        inner: std::sync::Arc<std::sync::RwLock<formualizer::workbook::Workbook>>,
+    ) -> Self {
+        Self {
+            inner,
+            sheets: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
     fn from_inner_workbook(inner: formualizer::workbook::Workbook) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(inner)),
