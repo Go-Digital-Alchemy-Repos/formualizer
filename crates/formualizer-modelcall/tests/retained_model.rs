@@ -32,9 +32,12 @@ struct Model {
     identity: &'static str,
     cells: Vec<(u32, u32, &'static str)>,
     output: (u32, u32),
-    names: Vec<(&'static str, (u32, u32, u32, u32))>,
+    names: Vec<(&'static str, Rect)>,
     slow: bool,
 }
+
+/// .
+type Rect = (u32, u32, u32, u32);
 
 fn model(identity: &'static str, cells: Vec<(u32, u32, &'static str)>) -> Model {
     Model { identity, cells, output: (2, 1), names: Vec::new(), slow: false }
@@ -299,10 +302,15 @@ fn nested_calls_share_run_state_and_the_repeat_is_memoized() {
     let (source, _) = source(&[&parent, &child, &grandchild, &leaf]);
     let retained =
         RetainedModel::new(package.clone(), context(None, Operation::Client, false), false).with_workbook_source(source);
-    for round in 0..2 {
+    // The second request changes the input: the engine skips an identical
+    // literal write, so an unchanged request would fire nothing at all.
+    for (round, (amount, expected)) in [(3, 8.0), (4, 10.0)].into_iter().enumerate() {
         let mut session = ModelSession::new(package.clone(), context(None, Operation::Client, false)).with_retained(&retained);
-        let result = session.calculate(&inputs(3)).expect("calculates");
-        assert_eq!(number(result.outputs.get("result").unwrap()), 8.0, "round {round}");
+        let result = session.calculate(&inputs(amount)).expect("calculates");
+        assert_eq!(number(result.outputs.get("result").unwrap()), expected, "round {round}");
+        if round == 1 {
+            assert_eq!(result.session_reuse["reused_count"], json!(4));
+        }
         let lengths: Vec<_> = result.invocations.iter().map(|event| event.stack.len()).collect();
         assert_eq!(lengths, [1, 2, 3, 3], "round {round}");
         let statuses: Vec<_> = result.invocations.iter().map(|event| event.status).collect();
