@@ -1725,8 +1725,13 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "formualizer-common",
+ "formualizer-eval",
+ "formualizer-sheetport",
+ "formualizer-workbook",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "sheetport-spec",
  "thiserror 2.0.18",
 ]
 
