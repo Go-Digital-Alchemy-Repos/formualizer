@@ -546,9 +546,8 @@ fn temporal(value: &WireValue, kind: &str) -> Result<WireValue, PortError> {
                 if !(number.is_finite() && number.fract() == 0.0) {
                     return Err(PortError::Value("Input requires an integer".into()));
                 }
-                #[expect(clippy::cast_possible_truncation, reason = "checked integral and in range")]
                 if number.abs() < 9.223_372_036_854_775_807e18 {
-                    return Ok(WireValue::Int(number as i64));
+                    return Ok(WireValue::Int(integral_i64(number)));
                 }
                 return Err(PortError::Other {
                     kind: "OverflowError".into(),
@@ -559,6 +558,12 @@ fn temporal(value: &WireValue, kind: &str) -> Result<WireValue, PortError> {
         }
         _ => Ok(value.clone()),
     }
+}
+
+/// An integral, in-range float as `i64` (`int(number)`).
+fn integral_i64(number: f64) -> i64 {
+    // Checked integral and within i64 by the caller.
+    number as i64
 }
 
 fn iso_date_prefix(text: &str) -> bool {
@@ -616,6 +621,9 @@ impl WriteRecord {
 // ---------------------------------------------------------------------------
 // The port session
 // ---------------------------------------------------------------------------
+
+/// `(effective inputs by key, native update by port id)`.
+type Admitted = (Vec<(String, WireValue)>, Vec<(String, WireValue)>);
 
 #[derive(Debug, Clone)]
 struct PortDecl {
@@ -755,13 +763,7 @@ impl PortSession {
     }
 
     /// `_admit`: (effective inputs, native update by port id); no engine call.
-    #[expect(clippy::type_complexity, reason = "mirrors the Python tuple")]
-    fn admit(
-        &mut self,
-        spec: &ModelSpec,
-        inputs: &[(String, WireValue)],
-        decode_wire: bool,
-    ) -> Result<(Vec<(String, WireValue)>, Vec<(String, WireValue)>), PortError> {
+    fn admit(&mut self, spec: &ModelSpec, inputs: &[(String, WireValue)], decode_wire: bool) -> Result<Admitted, PortError> {
         let mut effective = self.defaults.clone();
         self.ignored_inputs = Vec::new();
         self.defaulted_inputs = Vec::new();
@@ -1301,7 +1303,6 @@ pub fn project_date(value: &LiteralValue, contract: &Value) -> Result<LiteralVal
         return fail("Nonfinite output date serial");
     }
     let sentinels = contract.get("sentinels").and_then(Value::as_array);
-    #[expect(clippy::float_cmp, reason = "Python `in` compares exactly")]
     if sentinels.is_some_and(|sentinels| sentinels.iter().filter_map(Value::as_f64).any(|s| s == number)) {
         return Ok(value.clone());
     }
@@ -1315,7 +1316,6 @@ pub fn project_date(value: &LiteralValue, contract: &Value) -> Result<LiteralVal
         return fail("Negative output date serial is not admitted");
     }
     let whole = number.floor();
-    #[expect(clippy::float_cmp, reason = "exact integrality test")]
     if number != whole && policy("fractional") == "reject" {
         return fail("Fractional output date serial is not admitted");
     }
@@ -1326,8 +1326,7 @@ pub fn project_date(value: &LiteralValue, contract: &Value) -> Result<LiteralVal
             _ => {}
         }
     }
-    #[expect(clippy::cast_possible_truncation, reason = "finite, non-negative, bounded below by calendar check")]
-    let whole = whole.min(1e9) as i64;
+    let whole = integral_i64(whole.min(1e9));
     let (origin, offset) = match contract.get("date_system").and_then(Value::as_i64) {
         Some(1900) => {
             if whole == 60 {

@@ -141,7 +141,7 @@ fn context(deadline_seconds: Option<f64>, max_depth: u32) -> CalculationContext 
     .unwrap()
 }
 
-fn session(package: ModelPackage, context: CalculationContext, models: &[&Model], delays: &[(&str, Duration)]) -> ModelSession {
+fn make_session(package: ModelPackage, context: CalculationContext, models: &[&Model], delays: &[(&str, Duration)]) -> ModelSession {
     let source = MemorySource {
         models: models.iter().map(|model| (model.identity.to_owned(), (*model).clone())).collect(),
         load_delay: delays.iter().map(|(name, delay)| ((*name).to_owned(), *delay)).collect(),
@@ -181,7 +181,7 @@ fn parent_calls_child_and_the_repeat_is_memoized() {
     };
     let child = doubler();
     let package = package(&parent, &[("rates/child", &child)], json!({}));
-    let mut session = session(package, context(None, 32), &[&parent, &child], &[]);
+    let mut session = make_session(package, context(None, 32), &[&parent, &child], &[]);
     let result = session.calculate(&inputs(3)).expect("calculates");
     assert_eq!(number(result.outputs.get("result").unwrap()), 12.0);
     let statuses: Vec<_> = result.invocations.iter().map(|event| event.status).collect();
@@ -221,7 +221,7 @@ fn cycle_depth_and_unknown_routes_return_ref_errors() {
         slow: false,
     };
     let package = package(&parent, &[("rates/child", &looping)], json!({}));
-    let mut session = session(package, context(None, 32), &[&parent, &looping], &[]);
+    let mut session = make_session(package, context(None, 32), &[&parent, &looping], &[]);
     let result = session.calculate(&inputs(3)).expect("routing errors are cell values, not failures");
     let errors: Vec<_> = result
         .invocations
@@ -241,7 +241,7 @@ fn cycle_depth_and_unknown_routes_return_ref_errors() {
         slow: false,
     };
     let package = package_for_depth(&parent, &child);
-    let mut session = session(package, context(None, 1), &[&parent, &child], &[]);
+    let mut session = make_session(package, context(None, 1), &[&parent, &child], &[]);
     let result = session.calculate(&inputs(3)).unwrap();
     assert_eq!(result.invocations[0].error.as_deref(), Some("maximum child depth exceeded"));
 }
@@ -261,7 +261,7 @@ fn a_child_fault_fails_the_run_with_calc_and_evidence() {
     let child = doubler();
     let package = package(&parent, &[("rates/child", &child)], json!({}));
     // The child is not in the source: every load is an infrastructure fault.
-    let mut session = session(package, context(None, 32), &[&parent], &[]);
+    let mut session = make_session(package, context(None, 32), &[&parent], &[]);
     let error = session.calculate(&inputs(3)).unwrap_err();
     assert_eq!(
         error,
@@ -299,7 +299,7 @@ fn deadline_cancel_through_three_nested_evaluations_does_not_deadlock() {
         slow: false,
     };
     let package = package(&parent, &[("rates/child", &child), ("rates/grandchild", &grandchild)], json!({}));
-    let mut session = session(package, context(Some(0.4), 32), &[&parent, &child, &grandchild], &[]);
+    let mut session = make_session(package, context(Some(0.4), 32), &[&parent, &child, &grandchild], &[]);
     let (done, wait) = mpsc::channel();
     let started = Instant::now();
     std::thread::spawn(move || {
@@ -339,7 +339,7 @@ fn deadline_during_a_nested_load_unwinds() {
         slow: false,
     };
     let package = package(&parent, &[("rates/child", &child), ("rates/grandchild", &grandchild)], json!({}));
-    let mut session = session(
+    let mut session = make_session(
         package,
         context(Some(0.3), 32),
         &[&parent, &child, &grandchild],
@@ -366,14 +366,14 @@ fn admission_rejects_undeclared_inputs_and_ignore_policy_records_them() {
     let child = doubler();
     let parent = doubler_named("parent");
     let reject = package(&parent, &[("rates/child", &child)], json!({}));
-    let mut session_reject = session(reject, context(None, 32), &[&parent, &child], &[]);
+    let mut session_reject = make_session(reject, context(None, 32), &[&parent, &child], &[]);
     let mut request = inputs(3);
     request.insert("bogus".into(), json!(1));
     let error = session_reject.calculate(&request).unwrap_err();
     assert_eq!(error, ModelCallError::infrastructure("ValueError", "Undeclared input 'bogus'"));
 
     let ignore = package(&parent, &[("rates/child", &child)], json!({"unknown_input_policy": "ignore"}));
-    let mut session_ignore = session(ignore, context(None, 32), &[&parent, &child], &[]);
+    let mut session_ignore = make_session(ignore, context(None, 32), &[&parent, &child], &[]);
     let result = session_ignore.calculate(&request).unwrap();
     assert_eq!(number(result.outputs.get("result").unwrap()), 6.0);
     assert_eq!(result.diagnostics, ["ignored_input:bogus"]);
@@ -389,7 +389,7 @@ fn ranged_output_projects_a_client_table() {
         slow: false,
     };
     let package = package(&parent, &[], json!({}));
-    let mut session = session(package, context(None, 32), &[&parent], &[]);
+    let mut session = make_session(package, context(None, 32), &[&parent], &[]);
     let result = session.calculate(&inputs(2)).unwrap();
     let PortValue::Table(rows) = result.outputs.get("result").unwrap() else { panic!("table") };
     // The trailing all-blank row 6 is trimmed from the client wire.

@@ -253,10 +253,6 @@ impl RunCore {
         lock(&self.state)
     }
 
-    pub(crate) fn compiled_flag(&self) -> bool {
-        self.context.flags.compiled
-    }
-
     /// Build the sibling prefetcher when the flag, the memo and a plan allow.
     fn init_prefetch(&self, evaluator: Arc<dyn ChildEvaluator>) {
         if !self.context.prefetch_enabled() {
