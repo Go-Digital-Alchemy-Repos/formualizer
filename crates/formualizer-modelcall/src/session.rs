@@ -292,8 +292,14 @@ impl RunCore {
             return;
         }
         if let Ok(Some(plan)) = sibling_plan(&self.package.parent) {
-            *lock(&self.prefetch) =
-                Some(Prefetcher::new(plan, self.package.clone(), self.context.clone(), evaluator));
+            // Lane P: sibling scenarios sharing one child run on one loaded child.
+            *lock(&self.prefetch) = Some(
+                Prefetcher::new(plan, self.package.clone(), self.context.clone(), evaluator)
+                    .with_batch_evaluator(Arc::new(crate::batch_child::BatchChildEvaluator::new(
+                        self.source.clone(),
+                        self.compiled.clone(),
+                    ))),
+            );
         }
     }
 
