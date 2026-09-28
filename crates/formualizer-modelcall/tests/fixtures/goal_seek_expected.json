@@ -1,0 +1,2278 @@
+[
+ {
+  "scenario": "converges",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "ok",
+  "notes": [
+   "xsolve_ran:Goal iterations=31"
+  ],
+  "results": {
+   "Goal": [
+    "0.0",
+    "2.0945514815431476"
+   ]
+  },
+  "records": [
+   {
+    "suffix": "Goal",
+    "root": "2.0945514815431476",
+    "iterations": 31,
+    "status": "converged"
+   }
+  ],
+  "writes": [
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "300.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "5.555679015089224e-05"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "150.00002777839507"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "75.00004166759261"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "37.50004861219138"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "18.750052084490765"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "9.375053820640458"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "4.687554688715305"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.3438051227527277"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "1.4312952101512657"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "1.9854813083606586"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.1646432155566933"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.090181954383024"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094383539349398"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551508449253"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815397823"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815423265"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514949957897"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551488269058"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514849056925"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514832240093"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551482383168"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481962747"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514817525366"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514816474313"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815948787"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481568603"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481555465"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481548896"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815456114"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481543969"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815431476"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815431476"
+   ],
+   [
+    "S",
+    10,
+    9,
+    "number",
+    "2.0945514815431476"
+   ],
+   [
+    "S",
+    11,
+    9,
+    "int",
+    "31"
+   ],
+   [
+    "S",
+    12,
+    9,
+    "number",
+    "9.164224934465892e-12"
+   ]
+  ]
+ },
+ {
+  "scenario": "coarse",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1.0"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "float",
+     "value": "25.0"
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "ok",
+  "notes": [
+   "xsolve_ran:Goal iterations=9"
+  ],
+  "results": {
+   "Goal": [
+    "0.0",
+    "1.4312952101512657"
+   ]
+  },
+  "records": [
+   {
+    "suffix": "Goal",
+    "root": "1.4312952101512657",
+    "iterations": 9,
+    "status": "converged"
+   }
+  ],
+  "writes": [
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "300.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "5.555679015089224e-05"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "150.00002777839507"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "75.00004166759261"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "37.50004861219138"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "18.750052084490765"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "9.375053820640458"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "4.687554688715305"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.3438051227527277"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "1.4312952101512657"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "1.4312952101512657"
+   ],
+   [
+    "S",
+    10,
+    9,
+    "number",
+    "1.4312952101512657"
+   ],
+   [
+    "S",
+    11,
+    9,
+    "int",
+    "9"
+   ],
+   [
+    "S",
+    12,
+    9,
+    "number",
+    "-4.930430495642305"
+   ]
+  ]
+ },
+ {
+  "scenario": "target_value_5",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "int",
+     "value": 5
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "ok",
+  "notes": [
+   "xsolve_ran:Goal iterations=18"
+  ],
+  "results": {
+   "Goal": [
+    "5.0",
+    "2.46204478758741"
+   ]
+  },
+  "records": [
+   {
+    "suffix": "Goal",
+    "root": "2.46204478758741",
+    "iterations": 18,
+    "status": "converged"
+   }
+  ],
+  "writes": [
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "300.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.00011111358030178448"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "150.00005555679016"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "75.00008333518522"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "37.50009722438276"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "18.750104168981533"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "9.375107641280918"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "4.68760937743061"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.343860245505456"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.812208978525281"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.4445236939485837"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.6283663362369323"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.5364450150927578"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.490484354520671"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.4675040242346276"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.462000966951139"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.4620446786038963"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.462044787587419"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.46204478758741"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.46204478758741"
+   ],
+   [
+    "S",
+    10,
+    9,
+    "number",
+    "2.46204478758741"
+   ],
+   [
+    "S",
+    11,
+    9,
+    "int",
+    "18"
+   ],
+   [
+    "S",
+    12,
+    9,
+    "number",
+    "4.9999999999999964"
+   ]
+  ]
+ },
+ {
+  "scenario": "run_off",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "int",
+     "value": 0
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "ok",
+  "notes": [],
+  "results": {},
+  "records": [],
+  "writes": []
+ },
+ {
+  "scenario": "bad_algorithm",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": "Newton"
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "failed",
+  "notes": [
+   "xsolve_skipped:Goal:unsupported_algorithm"
+  ],
+  "records": [
+   {
+    "type": "solver_failure",
+    "status": "failed",
+    "name": "Goal",
+    "reason": "unsupported_algorithm",
+    "category": "xsolve_skipped"
+   }
+  ],
+  "writes": []
+ },
+ {
+  "scenario": "no_bracket",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "10.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "failed",
+  "notes": [
+   "xsolve_failed:Goal:no_bracket"
+  ],
+  "records": [
+   {
+    "type": "solver_failure",
+    "status": "failed",
+    "name": "Goal",
+    "reason": "no_bracket",
+    "category": "xsolve_failed"
+   }
+  ],
+  "writes": [
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "10.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "300.0"
+   ]
+  ]
+ },
+ {
+  "scenario": "max_iterations",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 3
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "failed",
+  "notes": [
+   "xsolve_failed:Goal:max_iterations"
+  ],
+  "records": [
+   {
+    "type": "solver_failure",
+    "status": "failed",
+    "name": "Goal",
+    "reason": "max_iterations",
+    "category": "xsolve_failed"
+   }
+  ],
+  "writes": [
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "300.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "5.555679015089224e-05"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "150.00002777839507"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "75.00004166759261"
+   ]
+  ]
+ },
+ {
+  "scenario": "bad_numeric",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "-1.0"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "failed",
+  "notes": [
+   "xsolve_failed:Goal:bad_numeric_parameter"
+  ],
+  "records": [
+   {
+    "type": "solver_failure",
+    "status": "failed",
+    "name": "Goal",
+    "reason": "bad_numeric_parameter",
+    "category": "xsolve_failed"
+   }
+  ],
+  "writes": []
+ },
+ {
+  "scenario": "bad_target_ref",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Lower bound",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "Upper bound",
+    {
+     "type": "float",
+     "value": "300.0"
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=Nowhere!A1"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "=B2"
+   ]
+  ],
+  "outcome": "failed",
+  "notes": [
+   "xsolve_skipped:Goal:bad_target_cell"
+  ],
+  "records": [
+   {
+    "type": "solver_failure",
+    "status": "failed",
+    "name": "Goal",
+    "reason": "bad_target_cell",
+    "category": "xsolve_skipped"
+   }
+  ],
+  "writes": []
+ },
+ {
+  "scenario": "guess_bounds",
+  "labels": [
+   [
+    "Run if",
+    {
+     "type": "bool",
+     "value": true
+    }
+   ],
+   [
+    "Target cell",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Target value",
+    {
+     "type": "float",
+     "value": "0.0"
+    }
+   ],
+   [
+    "By changing",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve algorithm",
+    {
+     "type": "str",
+     "value": " Brent "
+    }
+   ],
+   [
+    "Max change",
+    {
+     "type": "float",
+     "value": "1e-12"
+    }
+   ],
+   [
+    "Max iterations",
+    {
+     "type": "int",
+     "value": 100
+    }
+   ],
+   [
+    "Solve result",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve  Iteration",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Solve target",
+    {
+     "type": "none"
+    }
+   ],
+   [
+    "Initial guess",
+    {
+     "type": "float",
+     "value": "2.0"
+    }
+   ]
+  ],
+  "names": [
+   {
+    "name": "Xsolve_Goal",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "range",
+    "sheet": "S",
+    "start_row": 1,
+    "start_col": 8,
+    "end_row": 12,
+    "end_col": 9
+   },
+   {
+    "name": "GoalTarget",
+    "scope": "workbook",
+    "scope_sheet": null,
+    "kind": "cell",
+    "sheet": "S",
+    "start_row": 3,
+    "start_col": 2,
+    "end_row": 3,
+    "end_col": 2
+   }
+  ],
+  "formulas": [
+   [
+    "S",
+    2,
+    9,
+    "=GoalTarget"
+   ],
+   [
+    "S",
+    4,
+    9,
+    "= 'S'!$B$2 "
+   ]
+  ],
+  "outcome": "ok",
+  "notes": [
+   "xsolve_ran:Goal iterations=42"
+  ],
+  "results": {
+   "Goal": [
+    "0.0",
+    "2.094551481543159"
+   ]
+  },
+  "records": [
+   {
+    "suffix": "Goal",
+    "root": "2.094551481543159",
+    "iterations": 42,
+    "status": "converged"
+   }
+  ],
+  "writes": [
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "200.0"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "0.00012500625031251563"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "100.00006250312515"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "50.00009375468773"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "25.000109380469024"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "12.500117193359667"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "6.25012109980499"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "3.1251230530276515"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "1.562624029638982"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.3438735413333167"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0116325586166353"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.083670959996957"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0946632610964837"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945507938476076"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514814990522"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815423265"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0946073713194053"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094579426430866"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094565453986596"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094558467764461"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094554974653394"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.09455322809786"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945523548200935"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945519181812102"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945516998617686"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945515907020473"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945515361221867"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945515088322564"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514951872912"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551488364809"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551484953568"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514832479475"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551482395137"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514819687316"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481755529"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481648928"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815956274"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815689767"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815556514"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481548989"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815456576"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.0945514815439923"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481543159"
+   ],
+   [
+    "S",
+    2,
+    2,
+    "number",
+    "2.094551481543159"
+   ],
+   [
+    "S",
+    8,
+    9,
+    "number",
+    "2.094551481543159"
+   ],
+   [
+    "S",
+    9,
+    9,
+    "int",
+    "42"
+   ],
+   [
+    "S",
+    10,
+    9,
+    "number",
+    "9.29389898374211e-12"
+   ]
+  ]
+ }
+]

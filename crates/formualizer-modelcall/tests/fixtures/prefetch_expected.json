@@ -1,0 +1,738 @@
+{
+ "counts": {
+  "xcall_cells": 17,
+  "unresolved_calls": 1,
+  "groups": 4,
+  "rejected_groups": 1,
+  "group_cells": [
+   3,
+   3,
+   4,
+   3
+  ],
+  "override_positions": [
+   2,
+   1,
+   1,
+   0
+  ],
+  "partial_positions": [
+   0,
+   1,
+   1,
+   0
+  ],
+  "extra_positions": [
+   1,
+   0,
+   1,
+   2
+  ]
+ },
+ "groups": [
+  {
+   "target": "Folder/Svc",
+   "output": "Premium",
+   "cells": [
+    "Calc!C2",
+    "Calc!C3",
+    "Calc!C4"
+   ],
+   "positions": [
+    [
+     "term",
+     "override",
+     [
+      {
+       "type": "int",
+       "value": 10
+      },
+      {
+       "type": "int",
+       "value": 20
+      },
+      {
+       "type": "int",
+       "value": 30
+      }
+     ]
+    ],
+    [
+     "rate",
+     "override",
+     [
+      {
+       "type": "float",
+       "value": "0.05"
+      },
+      {
+       "type": "float",
+       "value": "0.05"
+      },
+      {
+       "type": "float",
+       "value": "0.06"
+      }
+     ]
+    ],
+    [
+     "plan",
+     "extra",
+     [
+      {
+       "type": "absent"
+      },
+      {
+       "type": "absent"
+      },
+      {
+       "type": "str",
+       "value": "Gold"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Folder/Svc",
+   "output": "Value",
+   "cells": [
+    "Calc!D2",
+    "Calc!D3",
+    "Calc!D4"
+   ],
+   "positions": [
+    [
+     "age",
+     "partial",
+     [
+      {
+       "type": "dynamic"
+      },
+      {
+       "type": "dynamic"
+      },
+      {
+       "type": "int",
+       "value": 45
+      }
+     ]
+    ],
+    [
+     "band",
+     "override",
+     [
+      {
+       "type": "int",
+       "value": 1
+      },
+      {
+       "type": "int",
+       "value": 2
+      },
+      {
+       "type": "int",
+       "value": 7
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Other/Svc",
+   "output": "Out",
+   "cells": [
+    "Calc!G2",
+    "Calc!G3",
+    "Calc!G4",
+    "Calc!G5"
+   ],
+   "positions": [
+    [
+     "term",
+     "partial",
+     [
+      {
+       "type": "int",
+       "value": -5
+      },
+      {
+       "type": "float",
+       "value": "5.5"
+      },
+      {
+       "type": "dynamic"
+      },
+      {
+       "type": "dynamic"
+      }
+     ]
+    ],
+    [
+     "flag",
+     "override",
+     [
+      {
+       "type": "bool",
+       "value": true
+      },
+      {
+       "type": "bool",
+       "value": false
+      },
+      {
+       "type": "bool",
+       "value": true
+      },
+      {
+       "type": "bool",
+       "value": false
+      }
+     ]
+    ],
+    [
+     "note",
+     "extra",
+     [
+      {
+       "type": "absent"
+      },
+      {
+       "type": "absent"
+      },
+      {
+       "type": "absent"
+      },
+      {
+       "type": "str",
+       "value": "x\"y"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Extra/Svc",
+   "output": "Out",
+   "cells": [
+    "Calc!J2",
+    "Calc!J3",
+    "Calc!J4"
+   ],
+   "positions": [
+    [
+     "tier",
+     "extra",
+     [
+      {
+       "type": "str",
+       "value": "Gold"
+      },
+      {
+       "type": "str",
+       "value": "Silver"
+      },
+      {
+       "type": "absent"
+      }
+     ]
+    ],
+    [
+     "smoker",
+     "extra",
+     [
+      {
+       "type": "absent"
+      },
+      {
+       "type": "bool",
+       "value": true
+      },
+      {
+       "type": "absent"
+      }
+     ]
+    ]
+   ]
+  }
+ ],
+ "vectors": [
+  {
+   "target": "Folder/Svc",
+   "output": "Premium",
+   "inputs": [
+    [
+     "term",
+     {
+      "type": "float",
+      "value": "10.0"
+     }
+    ],
+    [
+     "rate",
+     {
+      "type": "float",
+      "value": "0.05"
+     }
+    ]
+   ],
+   "vectors": [
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "20.0"
+      }
+     ],
+     [
+      "rate",
+      {
+       "type": "float",
+       "value": "0.05"
+      }
+     ]
+    ],
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "30.0"
+      }
+     ],
+     [
+      "rate",
+      {
+       "type": "float",
+       "value": "0.06"
+      }
+     ],
+     [
+      "plan",
+      {
+       "type": "str",
+       "value": "Gold"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Folder/Svc",
+   "output": "Premium",
+   "inputs": [
+    [
+     "term",
+     {
+      "type": "int",
+      "value": 20
+     }
+    ],
+    [
+     "rate",
+     {
+      "type": "float",
+      "value": "0.05"
+     }
+    ]
+   ],
+   "vectors": [
+    [
+     [
+      "term",
+      {
+       "type": "int",
+       "value": 10
+      }
+     ],
+     [
+      "rate",
+      {
+       "type": "float",
+       "value": "0.05"
+      }
+     ]
+    ],
+    [
+     [
+      "term",
+      {
+       "type": "int",
+       "value": 30
+      }
+     ],
+     [
+      "rate",
+      {
+       "type": "float",
+       "value": "0.06"
+      }
+     ],
+     [
+      "plan",
+      {
+       "type": "str",
+       "value": "Gold"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Folder/Svc",
+   "output": "Premium",
+   "inputs": [
+    [
+     "term",
+     {
+      "type": "float",
+      "value": "30.0"
+     }
+    ],
+    [
+     "rate",
+     {
+      "type": "float",
+      "value": "0.06"
+     }
+    ],
+    [
+     "plan",
+     {
+      "type": "str",
+      "value": "Gold"
+     }
+    ]
+   ],
+   "vectors": []
+  },
+  {
+   "target": "Folder/Svc",
+   "output": "Value",
+   "inputs": [
+    [
+     "age",
+     {
+      "type": "float",
+      "value": "33.0"
+     }
+    ],
+    [
+     "band",
+     {
+      "type": "float",
+      "value": "1.0"
+     }
+    ]
+   ],
+   "vectors": [
+    [
+     [
+      "age",
+      {
+       "type": "float",
+       "value": "33.0"
+      }
+     ],
+     [
+      "band",
+      {
+       "type": "float",
+       "value": "2.0"
+      }
+     ]
+    ],
+    [
+     [
+      "age",
+      {
+       "type": "float",
+       "value": "45.0"
+      }
+     ],
+     [
+      "band",
+      {
+       "type": "float",
+       "value": "7.0"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Folder/Svc",
+   "output": "Value",
+   "inputs": [
+    [
+     "age",
+     {
+      "type": "float",
+      "value": "45.0"
+     }
+    ],
+    [
+     "band",
+     {
+      "type": "float",
+      "value": "7.0"
+     }
+    ]
+   ],
+   "vectors": []
+  },
+  {
+   "target": "Other/Svc",
+   "output": "Out",
+   "inputs": [
+    [
+     "term",
+     {
+      "type": "float",
+      "value": "-5.0"
+     }
+    ],
+    [
+     "flag",
+     {
+      "type": "bool",
+      "value": true
+     }
+    ]
+   ],
+   "vectors": [
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "5.5"
+      }
+     ],
+     [
+      "flag",
+      {
+       "type": "bool",
+       "value": false
+      }
+     ]
+    ],
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "-5.0"
+      }
+     ],
+     [
+      "flag",
+      {
+       "type": "bool",
+       "value": true
+      }
+     ]
+    ],
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "-5.0"
+      }
+     ],
+     [
+      "flag",
+      {
+       "type": "bool",
+       "value": false
+      }
+     ],
+     [
+      "note",
+      {
+       "type": "str",
+       "value": "x\"y"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Other/Svc",
+   "output": "Out",
+   "inputs": [
+    [
+     "term",
+     {
+      "type": "float",
+      "value": "12.0"
+     }
+    ],
+    [
+     "flag",
+     {
+      "type": "bool",
+      "value": true
+     }
+    ]
+   ],
+   "vectors": [
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "-5.0"
+      }
+     ],
+     [
+      "flag",
+      {
+       "type": "bool",
+       "value": true
+      }
+     ]
+    ],
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "5.5"
+      }
+     ],
+     [
+      "flag",
+      {
+       "type": "bool",
+       "value": false
+      }
+     ]
+    ],
+    [
+     [
+      "term",
+      {
+       "type": "float",
+       "value": "12.0"
+      }
+     ],
+     [
+      "flag",
+      {
+       "type": "bool",
+       "value": false
+      }
+     ],
+     [
+      "note",
+      {
+       "type": "str",
+       "value": "x\"y"
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Extra/Svc",
+   "output": "Out",
+   "inputs": [
+    [
+     "tier",
+     {
+      "type": "str",
+      "value": "Gold"
+     }
+    ]
+   ],
+   "vectors": [
+    [
+     [
+      "tier",
+      {
+       "type": "str",
+       "value": "Silver"
+      }
+     ],
+     [
+      "smoker",
+      {
+       "type": "bool",
+       "value": true
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Extra/Svc",
+   "output": "Out",
+   "inputs": [
+    [
+     "tier",
+     {
+      "type": "str",
+      "value": "Silver"
+     }
+    ],
+    [
+     "smoker",
+     {
+      "type": "bool",
+      "value": true
+     }
+    ]
+   ],
+   "vectors": []
+  },
+  {
+   "target": "Extra/Svc",
+   "output": "Out",
+   "inputs": [],
+   "vectors": [
+    [
+     [
+      "tier",
+      {
+       "type": "str",
+       "value": "Gold"
+      }
+     ]
+    ],
+    [
+     [
+      "tier",
+      {
+       "type": "str",
+       "value": "Silver"
+      }
+     ],
+     [
+      "smoker",
+      {
+       "type": "bool",
+       "value": true
+      }
+     ]
+    ]
+   ]
+  },
+  {
+   "target": "Nope/Svc",
+   "output": "Out",
+   "inputs": [
+    [
+     "term",
+     {
+      "type": "float",
+      "value": "1.0"
+     }
+    ]
+   ],
+   "vectors": []
+  }
+ ]
+}
