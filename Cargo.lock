@@ -1726,6 +1726,7 @@ dependencies = [
  "chrono",
  "formualizer-common",
  "formualizer-eval",
+ "formualizer-parse",
  "formualizer-sheetport",
  "formualizer-workbook",
  "serde",
