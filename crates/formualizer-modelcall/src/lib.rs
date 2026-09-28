@@ -41,6 +41,7 @@ pub mod session;
 // Lane B.
 pub mod goal_seek;
 pub mod prefetch;
+pub mod batch_child;
 
 pub use context::{CalculationContext, CalculationFlags, Operation};
 pub use error::ModelCallError;
