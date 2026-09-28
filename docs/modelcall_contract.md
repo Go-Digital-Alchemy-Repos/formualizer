@@ -172,3 +172,38 @@ A change to a Lane 0 file after this commit is a contract change: make it in
 one small commit, say so in the lane handoff, and keep it additive where possible.
 Lanes may add crate dependencies (A: `formualizer-workbook`, `formualizer-sheetport`;
 B: `formualizer-parse`) in `crates/formualizer-modelcall/Cargo.toml`, appending only.
+
+## Lane A additions (contract changes, additive)
+
+- `receipt::PortValue` gains `Row` (a single-row ranged client output) and
+  `Table` (header -> value per data row), the two shapes
+  `PortSession._project_output` produces.
+- Package defaults (`ModelSpec.defaults`) that are native temporal values
+  travel as one-key objects `{"$date": "YYYY-MM-DD"}`, `{"$datetime": ISO}`,
+  `{"$time": ISO}`; every other default is plain JSON as Python's `json` reads it.
+- Python: `ModelSession(package_json, context, *, compiled_child=None)`;
+  `calculate(inputs, *, report_prepare=None, report_capture=None)` (inputs a
+  dict, request order kept). A failed run raises `ModelCalculationError`
+  (`RuntimeError`) with `error_type` (the runtime's Python exception name:
+  `TimeoutError`, `CallbackInfrastructureError`, `ValueError`,
+  `RequiredSolverFailure`, `ExcelEvaluationError`, ...), `error_message` and
+  `evidence` (result dict of the failed run; diagnostics end with
+  `Type: message`, as `runtime.calculate` seals them).
+- Report capture (operation `report`): `report_prepare(workbook)` runs after
+  admission and before evaluation (`prepare_report_conditions`),
+  `report_capture(workbook, outputs)` after the outputs are read
+  (`capture_report`); `workbook` is a `formualizer.Workbook` over the
+  session's own parent. The capture's return is kept as `ModelSession.report`;
+  its `diagnostics` join the run's. `ModelSession.workbook()` returns the
+  evaluated parent after `calculate` (inspection for `diagnostic`, which the
+  Rust session does not capture itself).
+- Compiled child: `compiled_child.attempt(identity, workbook_sha256, inputs,
+  output_location, stack, xcall)` returns `None` or `(matrix_or_None,
+  route_or_None)`; `xcall(target, block, output, *tail)` routes the compiled
+  child's own calls with the child's stack; `compiled_child.report()` gives
+  `{calls, routes}`.
+- Not in the Rust session this round: the session pool / warm
+  (`session_reuse` empty, no held or inherited events), engine identity
+  verification, `diagnostic` inspection capture, and the CL-097 skip logic on
+  re-entered workbooks (only fresh loads exist here; the four counters are
+  reported as zeros when `skip_unchanged_writes` is on).
