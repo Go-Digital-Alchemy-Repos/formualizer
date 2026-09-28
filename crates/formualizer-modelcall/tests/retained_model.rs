@@ -565,9 +565,9 @@ fn compiled_context() -> CalculationContext {
 fn warm_consults_the_compiled_child_and_inherited_events_carry_route() {
     let (parent, child) = parent_and_child();
     let package = package(&parent, &[("rates/child", &child)]);
-    let (source, _) = source(&[&parent, &child]);
+    let (memory, _) = source(&[&parent, &child]);
     let hook = DoublingHook::new(None, false);
-    let mut retained = RetainedModel::new(package.clone(), compiled_context(), false).with_workbook_source(source);
+    let mut retained = RetainedModel::new(package.clone(), compiled_context(), false).with_workbook_source(memory);
     retained.set_compiled_child(Some(hook.clone()));
     let report = retained.warm(&[], true).expect("warms");
     assert_eq!(report.warmed(), ["child:sha-child", "parent:sha-parent"]);
@@ -587,8 +587,8 @@ fn warm_consults_the_compiled_child_and_inherited_events_carry_route() {
     assert_eq!(result.invocations[0].route, Some(json!("compiled")));
 
     // Without a hook the warm evaluates on the engine and records no route.
-    let (source, _) = source(&[&parent, &child]);
-    let plain = RetainedModel::new(package, compiled_context(), false).with_workbook_source(source);
+    let (memory, _) = source(&[&parent, &child]);
+    let plain = RetainedModel::new(package, compiled_context(), false).with_workbook_source(memory);
     let report = plain.warm(&[], true).expect("warms");
     assert_eq!(report.models[1].invocations[0].route, None);
 }
@@ -602,9 +602,9 @@ fn nested_fault_during_compiled_attempt_fails_without_engine_fallback() {
     let leaf = model("leaf", vec![(2, 1, "=A1+1")]);
     let package = package(&parent, &[("rates/child", &child), ("rates/leaf", &leaf)]);
     // The leaf is declared but cannot load: its call is an infrastructure fault.
-    let (source, loads) = source(&[&parent, &child]);
+    let (memory, loads) = source(&[&parent, &child]);
     let hook = DoublingHook::new(Some("rates/leaf"), true);
-    let mut session = ModelSession::new(package, compiled_context()).with_workbook_source(source);
+    let mut session = ModelSession::new(package, compiled_context()).with_workbook_source(memory);
     session.set_compiled_child(Some(hook.clone()));
     let error = session.calculate(&inputs(3)).expect_err("the nested fault fails the run");
     match &error {
