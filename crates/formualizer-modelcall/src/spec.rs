@@ -307,6 +307,14 @@ mod tests {
     }
 
     #[test]
+    fn ordered_map_keeps_document_order_and_refuses_duplicates() {
+        let map: OrderedMap<i32> = serde_json::from_str(r#"{"zeta": 1, "alpha": 2, "mid": 3}"#).unwrap();
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["zeta", "alpha", "mid"]);
+        assert_eq!(serde_json::to_string(&map).unwrap(), r#"{"zeta":1,"alpha":2,"mid":3}"#);
+        assert!(serde_json::from_str::<OrderedMap<i32>>(r#"{"a": 1, "a": 2}"#).is_err());
+    }
+
+    #[test]
     fn package_json_keeps_key_order_and_accepts_python_names() {
         let package: ModelPackage = serde_json::from_value(json!({
             "package_id": "p",
@@ -316,8 +324,8 @@ mod tests {
             "engine_identity": {}
         }))
         .unwrap();
-        let keys: Vec<_> = package.parent.inputs.keys().collect();
-        assert_eq!(keys, ["zeta", "alpha"]);
+        // `json!` sorts object keys, so order is checked on text below.
+        assert_eq!(package.parent.inputs.len(), 2);
         assert_eq!(package.parent.goal_seek[0].suffix(), "Rate");
         assert_eq!(package.parent.unknown_input_policy(), UnknownInputPolicy::Ignore);
         assert_eq!(package.parent.date_system(), Some(1900));
