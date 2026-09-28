@@ -82,8 +82,10 @@ fn json_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
     json.call_method1("dumps", (value,))?.extract()
 }
 
+/// Any JSON-serialisable Python value (a str is a JSON string, not JSON text).
 fn py_json(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
-    serde_json::from_str(&json_text(value)?).map_err(|error| PyValueError::new_err(error.to_string()))
+    let text: String = value.py().import("json")?.call_method1("dumps", (value,))?.extract()?;
+    serde_json::from_str(&text).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
