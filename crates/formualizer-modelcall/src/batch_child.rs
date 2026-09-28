@@ -53,7 +53,7 @@ use crate::ports::{PortError, WireValue, py_repr, read_typed_matrix};
 use crate::prefetch::ChildBatchEvaluator;
 use crate::receipt::timing_keys;
 use crate::router::{ModelCallRouter, with_nested_router};
-use crate::session::{Loaded, RunCore, RunState, WorkbookSource};
+use crate::session::{Loaded, RunCore, RunState, SharedWorkbook, WorkbookSource};
 use crate::spec::{CellRange, ModelSpec};
 
 /// One loaded child per group of sibling scenarios.
@@ -165,6 +165,7 @@ impl BatchChildEvaluator {
             context.clone(),
             self.source.clone(),
             compiled.clone(),
+            None,
             token.clone(),
         ));
         let fresh_timings = core.state().timings.clone();
@@ -197,7 +198,7 @@ impl BatchChildEvaluator {
             watchdog.stop();
         }
         if let Some(loaded) = loaded.take() {
-            core.release(loaded.id, &loaded.flag);
+            core.release_loaded(loaded);
         }
         core.closed.store(true, Ordering::SeqCst);
         outcomes
@@ -247,7 +248,7 @@ impl Scenario<'_> {
         let mut current = match loaded.take() {
             Some(current) => {
                 if let Err(error) = self.core.check_deadline() {
-                    self.core.release(current.id, &current.flag);
+                    self.core.release_loaded(current);
                     return Err(error);
                 }
                 current
@@ -256,10 +257,10 @@ impl Scenario<'_> {
         };
         let mut pinned = PinnedCells::new();
         let result = self.evaluate(&mut current, &mut pinned, &location.range);
-        if result.is_ok() && restore(&mut current.workbook, &pinned).is_ok() {
+        if result.is_ok() && restore(&mut write(&current.workbook), &pinned).is_ok() {
             *loaded = Some(current);
         } else {
-            self.core.release(current.id, &current.flag);
+            self.core.release_loaded(current);
         }
         if result.is_ok() {
             self.add_seconds("child_seconds", started);
@@ -272,7 +273,9 @@ impl Scenario<'_> {
         let admission_started = Instant::now();
         let wire: Vec<(String, WireValue)> =
             request.inputs.iter().map(|(name, value)| (name.clone(), WireValue::from_literal(value))).collect();
-        let admitted = current.ports.write_scenario(&mut current.workbook, spec, &wire, false);
+        let mut guard = write(&current.workbook);
+        let workbook: &mut Workbook = &mut guard;
+        let admitted = current.ports.write_scenario(workbook, spec, &wire, false);
         self.add_seconds("admission_seconds", admission_started);
         if let Some(stats) = current.ports.write_stats {
             let mut state = self.core.state();
@@ -291,10 +294,10 @@ impl Scenario<'_> {
                 error.into_error()
             }
         })?;
-        self.core.evaluate(&mut current.workbook, &current.flag).map_err(|error| self.deadline_or(error))?;
+        self.core.evaluate(workbook, &current.flag).map_err(|error| self.deadline_or(error))?;
         let caller = request.stack.last().map(String::as_str).unwrap_or_default();
-        self.solve(current, pinned, caller)?;
-        let matrix = read_typed_matrix(&current.workbook, range).map_err(PortError::into_error)?;
+        self.solve(workbook, &current.flag, pinned, caller)?;
+        let matrix = read_typed_matrix(workbook, range).map_err(PortError::into_error)?;
         if matrix.iter().flatten().any(|value| matches!(value, LiteralValue::Pending)) {
             return Err(ModelCallError::infrastructure("RuntimeError", "child evaluation returned Pending"));
         }
@@ -333,10 +336,15 @@ impl Scenario<'_> {
     }
 
     /// `RunCore::solve`, pinning every cell goal seek writes.
-    fn solve(&self, current: &mut Loaded, pinned: &mut PinnedCells, identity: &str) -> Result<(), ModelCallError> {
+    fn solve(
+        &self,
+        workbook: &mut Workbook,
+        flag: &Arc<AtomicBool>,
+        pinned: &mut PinnedCells,
+        identity: &str,
+    ) -> Result<(), ModelCallError> {
         let started = Instant::now();
-        let mut model =
-            RecordingSolveModel { workbook: &mut current.workbook, flag: current.flag.clone(), cancelled: None, pinned };
+        let mut model = RecordingSolveModel { workbook, flag: flag.clone(), cancelled: None, pinned };
         let has_blocks = match model.defined_ranges() {
             Ok(ranges) => ranges
                 .iter()
@@ -383,6 +391,10 @@ impl Scenario<'_> {
 fn with_workbook(mut record: Map<String, Value>, identity: &str) -> Map<String, Value> {
     record.insert("workbook".into(), Value::String(identity.to_owned()));
     record
+}
+
+fn write(workbook: &SharedWorkbook) -> std::sync::RwLockWriteGuard<'_, Workbook> {
+    workbook.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Put back what the loaded bytes held in every cell goal seek wrote.
