@@ -166,13 +166,18 @@ pub struct PrefetchReport {
 }
 
 /// One port value as the runtime reads it: a scalar, a range (rows) or a
-/// record (field -> value), per the port's declared shape.
+/// record (field -> value), per the port's declared shape. A client output
+/// (`PortSession._project_output`) can also be one row (a single-row range)
+/// or a table (header -> value per data row). (Lane A: `Row` and `Table`
+/// added, additive contract change.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PortValue {
     Scalar(LiteralValue),
     Range(Vec<Vec<LiteralValue>>),
     Record(OrderedMap<LiteralValue>),
+    Row(Vec<LiteralValue>),
+    Table(Vec<OrderedMap<LiteralValue>>),
 }
 
 /// The result of one `calculate`. On failure the session still exposes the

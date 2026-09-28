@@ -14,3 +14,9 @@ chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Lane A: the session evaluates real workbooks through SheetPort.
+formualizer-eval = { path = "../formualizer-eval", default-features = false, features = ["system-clock"] }
+formualizer-workbook = { path = "../formualizer-workbook", default-features = false, features = ["calamine", "system-clock"] }
+formualizer-sheetport = { path = "../formualizer-sheetport", default-features = false, features = ["system-clock"] }
+sheetport-spec = { path = "../sheetport-spec" }
+sha2 = "0.10"
