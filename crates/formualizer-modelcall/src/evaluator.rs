@@ -179,6 +179,18 @@ pub trait SolveModel {
     fn set_value(&mut self, sheet: &str, row: u32, col: u32, value: LiteralValue) -> Result<(), ModelCallError>;
     fn evaluate_all(&mut self) -> Result<(), ModelCallError>;
     fn defined_ranges(&self) -> Result<Vec<DefinedRange>, ModelCallError>;
+
+    /// The cell's formula text as the workbook spells it (`Workbook.get_formula`),
+    /// `None` for a cell without a formula. Goal seek reads its `Target cell`
+    /// and `By changing` parameters this way (`_resolve_solve_reference`).
+    ///
+    /// Lane B addition (additive, default provided so existing implementors
+    /// compile): the default fails, which makes every block that needs it an
+    /// `engine_error` failure, so an implementor over a real workbook must
+    /// override it.
+    fn get_formula(&self, _sheet: &str, _row: u32, _col: u32) -> Result<Option<String>, ModelCallError> {
+        Err(ModelCallError::NotImplemented("SolveModel::get_formula"))
+    }
 }
 
 #[cfg(test)]
