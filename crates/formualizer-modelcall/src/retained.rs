@@ -519,6 +519,10 @@ pub(crate) struct ReuseState {
 }
 
 impl ReuseState {
+    pub(crate) fn new(pooled: bool) -> Self {
+        Self { pooled, ..Self::default() }
+    }
+
     pub(crate) fn note_fresh(&mut self, identity: String) {
         self.fresh.push(identity);
     }

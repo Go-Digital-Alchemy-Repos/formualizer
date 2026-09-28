@@ -265,7 +265,7 @@ impl RunCore {
             None
         };
         let memo = context.flags.call_memo.then(ModelCallMemo::new);
-        let reuse = ReuseState { pooled: pool.is_some(), ..ReuseState::default() };
+        let reuse = ReuseState::new(pool.is_some());
         Self {
             package,
             context,
