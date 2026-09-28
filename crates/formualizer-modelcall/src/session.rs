@@ -505,10 +505,10 @@ impl RunCore {
             let attempt = with_nested_router(nested, || hook.attempt(spec, inputs, location, stack));
             self.add_seconds(timing_keys::COMPILED_SECONDS, attempt_started);
             let attempt = attempt?;
-            if let (Some(index), Some(route)) = (router_event, attempt.route) {
-                if let Some(event) = self.state().invocations.get_mut(index) {
-                    event.route = Some(route);
-                }
+            if let (Some(index), Some(route)) = (router_event, attempt.route)
+                && let Some(event) = self.state().invocations.get_mut(index)
+            {
+                event.route = Some(route);
             }
             if let Some(matrix) = attempt.matrix {
                 self.add_seconds("child_seconds", started);

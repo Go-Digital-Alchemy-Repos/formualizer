@@ -146,10 +146,10 @@ impl ModelCallRouter {
                 LiteralValue::Error(returned)
             }
         };
-        if missed.is_some() {
-            if let Some(memo) = self.core.state().memo.as_mut() {
-                memo.not_stored();
-            }
+        if missed.is_some()
+            && let Some(memo) = self.core.state().memo.as_mut()
+        {
+            memo.not_stored();
         }
         if dispatched {
             let mut prefetch = self.core.prefetch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -197,12 +197,12 @@ impl ModelCallRouter {
                 let memo = state.memo.as_mut().ok_or_else(|| ModelCallError::infrastructure("RuntimeError", "memo"))?;
                 let key = memo.key(&self.stack, &identity, arguments.output, &inputs, Some(child));
                 let found = key.as_ref().and_then(|key| memo.lookup(key));
-                if let Some(entry) = &found {
-                    if let Some(event) = state.invocations.get_mut(index) {
-                        event.status = CallStatus::Memoized;
-                        event.memo_of = Some(entry.source_index);
-                        event.matrix = Some(entry.matrix.clone());
-                    }
+                if let Some(entry) = &found
+                    && let Some(event) = state.invocations.get_mut(index)
+                {
+                    event.status = CallStatus::Memoized;
+                    event.memo_of = Some(entry.source_index);
+                    event.matrix = Some(entry.matrix.clone());
                 }
                 (key, found)
             };
@@ -249,10 +249,10 @@ impl ModelCallRouter {
             event.matrix = Some(matrix.clone());
         });
         let native = native_matrix(&matrix)?;
-        if let Some(key) = missed.take() {
-            if let Some(memo) = core.state().memo.as_mut() {
-                memo.store(key, index, &matrix);
-            }
+        if let Some(key) = missed.take()
+            && let Some(memo) = core.state().memo.as_mut()
+        {
+            memo.store(key, index, &matrix);
         }
         Ok(native)
     }

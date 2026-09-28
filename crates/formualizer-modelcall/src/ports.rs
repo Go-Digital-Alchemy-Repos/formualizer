@@ -81,10 +81,10 @@ impl WireValue {
             Value::String(text) => Self::Str(text.clone()),
             Value::Array(items) => Self::List(items.iter().map(Self::from_json).collect()),
             Value::Object(map) => {
-                if map.len() == 1 {
-                    if let Some(tagged) = Self::tagged_temporal(map) {
-                        return tagged;
-                    }
+                if map.len() == 1
+                    && let Some(tagged) = Self::tagged_temporal(map)
+                {
+                    return tagged;
                 }
                 Self::Dict(OrderedMap(map.iter().map(|(key, value)| (key.clone(), Self::from_json(value))).collect()))
             }
@@ -546,7 +546,7 @@ fn temporal(value: &WireValue, kind: &str) -> Result<WireValue, PortError> {
                 if !(number.is_finite() && number.fract() == 0.0) {
                     return Err(PortError::Value("Input requires an integer".into()));
                 }
-                if number.abs() < 9.223_372_036_854_775_807e18 {
+                if number.abs() < 9_223_372_036_854_775_808.0 {
                     return Ok(WireValue::Int(integral_i64(number)));
                 }
                 return Err(PortError::Other {
@@ -731,10 +731,10 @@ impl PortSession {
             }
             Ok(returned)
         });
-        if result.is_err() {
-            if let Some(record) = self.write_record.as_mut() {
-                record.clear();
-            }
+        if result.is_err()
+            && let Some(record) = self.write_record.as_mut()
+        {
+            record.clear();
         }
         result
     }
@@ -785,33 +785,34 @@ impl PortSession {
             let location = Self::location(spec, &key)?;
             let port = self.port(&location.port_id)?.clone();
             let mut value = value;
-            if let WireValue::List(items) = &value {
-                if port.shape != "scalar" && items.first().is_none_or(|first| matches!(first, WireValue::Dict(_))) {
-                    let headers: Vec<WireValue> =
-                        location.headers.iter().flatten().map(WireValue::from_json).collect();
-                    let mut rows = vec![WireValue::List(headers.clone())];
-                    for item in items {
-                        let WireValue::Dict(row) = item else {
-                            return Err(PortError::Other {
-                                kind: "AttributeError".into(),
-                                message: format!("'{}' object has no attribute 'get'", item.type_name()),
-                            });
-                        };
-                        if row.keys().any(|column| !headers.iter().any(|h| py_equal(&WireValue::Str(column.to_owned()), h))) {
-                            return Err(PortError::Value(format!("{key} has an undeclared column")));
-                        }
-                        rows.push(WireValue::List(
-                            headers
-                                .iter()
-                                .map(|header| match header {
-                                    WireValue::Str(name) => row.get(name).cloned().unwrap_or(WireValue::None),
-                                    _ => WireValue::None,
-                                })
-                                .collect(),
-                        ));
+            if let WireValue::List(items) = &value
+                && port.shape != "scalar"
+                && items.first().is_none_or(|first| matches!(first, WireValue::Dict(_)))
+            {
+                let headers: Vec<WireValue> =
+                    location.headers.iter().flatten().map(WireValue::from_json).collect();
+                let mut rows = vec![WireValue::List(headers.clone())];
+                for item in items {
+                    let WireValue::Dict(row) = item else {
+                        return Err(PortError::Other {
+                            kind: "AttributeError".into(),
+                            message: format!("'{}' object has no attribute 'get'", item.type_name()),
+                        });
+                    };
+                    if row.keys().any(|column| !headers.iter().any(|h| py_equal(&WireValue::Str(column.to_owned()), h))) {
+                        return Err(PortError::Value(format!("{key} has an undeclared column")));
                     }
-                    value = WireValue::List(rows);
+                    rows.push(WireValue::List(
+                        headers
+                            .iter()
+                            .map(|header| match header {
+                                WireValue::Str(name) => row.get(name).cloned().unwrap_or(WireValue::None),
+                                _ => WireValue::None,
+                            })
+                            .collect(),
+                    ));
                 }
+                value = WireValue::List(rows);
             }
             let slot = match effective.iter().position(|(existing, _)| *existing == key) {
                 Some(position) => position,
