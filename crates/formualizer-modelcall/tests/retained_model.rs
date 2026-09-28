@@ -614,7 +614,8 @@ fn nested_fault_during_compiled_attempt_fails_without_engine_fallback() {
         }
         other => panic!("unexpected error {other:?}"),
     }
-    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    // The child's attempt, and the nested leaf call's (declined, then its load faulted); no second child attempt.
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
     assert_eq!(loads.load(Ordering::SeqCst), 1, "only the parent loaded: the child never ran on the engine");
     let evidence = session.partial_result();
     let child_event = evidence
