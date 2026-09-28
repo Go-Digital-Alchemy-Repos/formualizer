@@ -107,6 +107,9 @@ impl ModelCallEvent {
     }
 }
 
+/// Non-normative (debugging, in-crate tests): values use the derived,
+/// externally tagged `LiteralValue` serde. The receipt form is
+/// `receipt::plain_value` per value (see `docs/modelcall_contract.md`).
 impl Serialize for ModelCallEvent {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

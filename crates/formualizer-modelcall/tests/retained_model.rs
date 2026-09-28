@@ -36,7 +36,7 @@ struct Model {
     slow: bool,
 }
 
-/// .
+/// (row, col, end_row, end_col)
 type Rect = (u32, u32, u32, u32);
 
 fn model(identity: &'static str, cells: Vec<(u32, u32, &'static str)>) -> Model {

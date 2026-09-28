@@ -41,6 +41,24 @@ today; the right-hand column is the sealed name.
 | `session_reuse` | `session_reuse` | empty without a pool; dropped when empty |
 | `xcall_memo` | `xcall_memo` | memo counters; empty when off/unused; dropped when empty |
 | `compiled` | `compiled` | `{calls, routes}` only when the compiled flag is on |
+| `report_cells`, `conditional_results`, `formula_counts` | same | Lane I: only when `report_capture` returned them |
+| `inspection` | `inspection` | Lane I: only when `inspect` returned something |
+
+**Value form (normative, Lane I, CP1 finding 3).** Every value in the result
+dict is `snapshot._plain(value.to_python())` of what the Python runtime held:
+int, float, str, bool, None; `{"type": "date" | "datetime" | "time", "value":
+isoformat}`; an engine error as the dict `LiteralValue.to_python()` builds
+(`{"type": "Error", "kind": "Ref", "message": ...[, "row", "col", "sheet",
+"origin_row", "origin_col", "extra"]}`; this is what `_plain` does with a
+`LiteralValue` error, not the `{"type": "error", "kind", "display"}` branch,
+which only objects with a `.kind` attribute reach); arrays and tuples as lists
+(`stack` is a list). Rust: `receipt::plain_value` / `plain_port_value`; the
+binding converts with the same rules. **The derived serde of `LiteralValue`,
+`ExcelError`, `PortValue` and `ModelCallEvent` (externally tagged,
+`{"Int": 1}`, `{"Text": "a/b"}`, `"Empty"`) is non-normative**: it is for
+debugging and in-crate tests only and is never a receipt. The hooks receive
+native values (`report_capture(workbook, outputs)` gets `literal_to_py`
+outputs, as `capture_report` did).
 
 Consumers that must keep working unchanged: `pdf_export/job.py` reads
 `sealed["timings"]` (re-emitted as `runtime_<key>`), `sealed.get("session_reuse", {})`,
@@ -64,8 +82,9 @@ not_stored_error, port_keyed}` plus `prefetch: {dispatched, stored, not_stored,
 hits[, on_slot]}` when something was dispatched. Empty unless
 hits + misses + bypassed > 0.
 
-**`session_reuse`** (pool only): `{pool: true, fresh, reused, warmed,
-fresh_count, reused_count, warmed_count}`.
+**`session_reuse`** (session on a `RetainedModel` only): `{pool: true, fresh,
+reused, warmed, fresh_count, reused_count, warmed_count}` (identities as
+`identity:sha256`, in acquisition order).
 
 **`diagnostics`**: `ignored_input:<name>`; `defaulted_input:<name>` (report
 operation only); goal-seek notes (`xsolve_ran:<name> iterations=<n>`,
@@ -146,6 +165,52 @@ is kept.
    `volatile = false` (the opposite two for an injected workbook factory).
 5. The memo belongs to one request and never crosses a request boundary.
 
+## Run-state seam (Lane I, CP1 finding 2)
+
+An in-line child call runs on the **same request core** as its caller
+(`session::RunCore`, the Rust `CalculationSession`): one invocation list, one
+memo keyed by caller stack, one fault list, one timings dict, shared through
+`Mutex<RunState>`; the caller stack grows by the child's identity. A prefetch
+flight is the other seam (`ChildEvaluator`, its own sub-request). Rule
+(binding): **no run-state lock (run state, prefetch, pool) is held across
+`evaluate`, `calculate_child`, a load, or a hook call**; each lock is taken for
+one bookkeeping step and dropped. The only lock held across an evaluation is
+the evaluated workbook's own `RwLock`, and a handler never touches that
+workbook. Lock order where two nest: run state, then pool. Probe:
+`tests/retained_model.rs` (parent -> child -> grandchild -> leaf, leaf called
+twice: four events, stack lengths 1, 2, 3, 3, the repeat `memoized` with
+`memo_of`; a 0.5 s deadline cancelling mid-leaf returns without a hang).
+
+## Retained model (Lane I, CP1 finding 1)
+
+`formualizer.RetainedModel(package_json, context_json, *,
+retain_scenarios=False)` is `sessions.SessionPool` for one package: every model
+(parent and children) is loaded once, on first use or by `warm`, keyed by
+`(identity, sha256, random_seed)`, and lent to one request at a time (a second
+concurrent acquire raises `RuntimeError: retained workbook session is already
+acquired: <identity>`). Each entry keeps its call binding (a run only rebinds
+the router), its pinned goal-seek cells (`solver_written_cells`: the
+`Xsolve_` blocks' rectangles and `By changing` cells, restored before every
+re-entry), its port session and CL-097 `WriteRecord`, and the events a later
+request may inherit (`warm_invocations`, `warmed`, `retained_scenario`).
+
+- `warm(inputs=None)`: `SessionPool.warm`, children first then the parent
+  (parent gets `inputs`, children their defaults), each evaluated once with a
+  router of its own, no goal seek, no deadline; returns `{warmed,
+  warm_timings, warm_invocations, warm_session_timings, invocations}`.
+- `close()` (`discard_all`), `forget_scenarios()`, `stats()`, `len()`.
+- `retain_scenarios=True` is the persistent worker (`WORKBOOK_SESSION_PERSIST`):
+  a completed request re-points the entries it entered at its sealed events.
+- `ModelSession(package_json, context_json, retained=model)`: loads go through
+  the pool (`_reuse`: cancel reset, clock, router rebound, pinned cells
+  restored, port session re-entered so formula defaults are restored and
+  unchanged writes skipped); fresh loads are admitted. Invocations are sealed
+  as `runtime.sealed_invocations` (executed, held with `held_from: reuse`,
+  inherited with `inherited_from: warm`, renumbered), also in the failure
+  evidence. The caller (Python pool) decides `forget_scenarios` / `close`
+  after a failure; the session releases every entry it acquired.
+- Prefetch flights never use the pool (fresh loads), as before.
+
 ## Seams between lanes
 
 - `evaluator::ChildEvaluator` (A implements on its session, B's prefetch calls
@@ -166,6 +231,8 @@ is kept.
 | 0 (done) | `crates/formualizer-modelcall/{Cargo.toml, src/lib.rs, context.rs, error.rs, evaluator.rs, event.rs, import_boundary.rs, key.rs, receipt.rs, spec.rs}`, workspace `Cargo.toml`, `docs/modelcall_contract.md`; parity `workbook_runtime/{import_boundary,mdl_env}.py` |
 | A | `crates/formualizer-modelcall/src/{session,router,memo,ports}.rs`, `bindings/python/src/{modelcall,lib}.rs`, `bindings/python/Cargo.toml` |
 | B | `crates/formualizer-modelcall/src/{prefetch,goal_seek}.rs` |
+| I | `crates/formualizer-modelcall/src/{session,router,ports,receipt,event,evaluator,spec,context,error,lib,retained}.rs`, `bindings/python/src/{modelcall,lib,workbook}.rs`, this document, `tests/retained_model.rs` |
+| P | `crates/formualizer-modelcall/src/{prefetch,memo,batch_child}.rs` |
 | C | parity repository only (`workbook_runtime/*`, `pdf_export/*`, `replayer/xcall.py` rename, tests) |
 
 A change to a Lane 0 file after this commit is a contract change: make it in
@@ -202,8 +269,27 @@ B: `formualizer-parse`) in `crates/formualizer-modelcall/Cargo.toml`, appending 
   route_or_None)`; `xcall(target, block, output, *tail)` routes the compiled
   child's own calls with the child's stack; `compiled_child.report()` gives
   `{calls, routes}`.
-- Not in the Rust session this round: the session pool / warm
-  (`session_reuse` empty, no held or inherited events), engine identity
-  verification, `diagnostic` inspection capture, and the CL-097 skip logic on
-  re-entered workbooks (only fresh loads exist here; the four counters are
-  reported as zeros when `skip_unchanged_writes` is on).
+- (Superseded by Lane I: the session pool / warm, held and inherited events,
+  `inspect`, and the CL-097 skip logic on re-entered workbooks are now in
+  Rust; see "Retained model".) Still not in Rust: engine identity
+  verification, prefetch slot pools.
+
+## Lane I additions (contract changes)
+
+- Python: `ModelSession(package_json, context_json, retained=None, *,
+  compiled_child=None)`; `calculate(inputs, report_prepare=None,
+  report_capture=None, inspect=None)`; `set_compiled_child(hook)`;
+  `workbook()`, `cancel()`, `partial_result()`, `report`.
+  `RetainedModel` as above.
+- Result values are in the normative plain form (above); `typed_outputs`,
+  event `matrix`, `target`, `output`, `inputs` and `returned_error` are no
+  longer `LiteralValue` objects.
+- `ReportHook` gains `inspect(workbook)` (operation `diagnostic`, after
+  capture, timed as `inspection_seconds`, then the deadline is checked).
+- `SolveModel::get_formula` is implemented over the workbook, so goal seek
+  resolves `Target cell` / `By changing` references.
+- `goal_seek::goal_seek_written_cells` (additive) and goal-seek diagnostic
+  cell values in plain form.
+- `CalculationFlags` unchanged; `skip_unchanged_writes` now also skips on
+  re-entered workbooks (`writes_skipped`, `formula_restores_skipped`,
+  `defaults_not_restored_overwritten`, `date_writes_skipped`).
