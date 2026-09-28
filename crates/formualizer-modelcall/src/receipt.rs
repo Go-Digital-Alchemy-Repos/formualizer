@@ -10,8 +10,153 @@ use formualizer_common::LiteralValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+
 use crate::event::ModelCallEvent;
 use crate::spec::OrderedMap;
+
+// ---------------------------------------------------------------------------
+// Receipt values (CP1 finding 3)
+// ---------------------------------------------------------------------------
+//
+// Normative receipt form: `snapshot._plain(value.to_python())`. The derived
+// serde of `LiteralValue` / `ExcelError` (externally tagged: `{"Int": 1}`,
+// `{"Text": "a"}`, `"Empty"`) is NOT the receipt form; anything that leaves
+// this crate as a receipt value goes through [`plain_value`].
+
+/// `date.isoformat()`.
+pub fn py_date_iso(day: &NaiveDate) -> String {
+    day.format("%Y-%m-%d").to_string()
+}
+
+/// `time.isoformat()` of the microsecond time `literal_to_py` builds.
+pub fn py_time_iso(clock: &NaiveTime) -> String {
+    let micros = clock.nanosecond() / 1_000;
+    if micros == 0 {
+        clock.format("%H:%M:%S").to_string()
+    } else {
+        format!("{}.{micros:06}", clock.format("%H:%M:%S"))
+    }
+}
+
+/// `datetime.isoformat()` (naive, microseconds only when nonzero).
+pub fn py_datetime_iso(stamp: &NaiveDateTime) -> String {
+    format!("{}T{}", py_date_iso(&stamp.date()), py_time_iso(&stamp.time()))
+}
+
+/// `_plain(literal.to_python())` as JSON: int, float, str, bool, None;
+/// `{"type": "date"|"datetime"|"time", "value": iso}`; an error as the dict
+/// `to_python` builds (`{"type": "Error", "kind", "message"?, ...}`); an
+/// array as nested lists; Pending as `{"type": "Pending"}`. A non-finite
+/// number has no JSON form and becomes null (Python's seal refuses it); a
+/// duration becomes `{"type": "timedelta", "value": seconds}` (Python's seal
+/// refuses a timedelta).
+pub fn plain_value(value: &LiteralValue) -> Value {
+    let tagged = |kind: &str, text: String| {
+        let mut map = Map::new();
+        map.insert("type".into(), Value::String(kind.into()));
+        map.insert("value".into(), Value::String(text));
+        Value::Object(map)
+    };
+    match value {
+        LiteralValue::Int(number) => Value::from(*number),
+        LiteralValue::Number(number) => serde_json::Number::from_f64(*number).map_or(Value::Null, Value::Number),
+        LiteralValue::Boolean(flag) => Value::Bool(*flag),
+        LiteralValue::Text(text) => Value::String(text.clone()),
+        LiteralValue::Empty => Value::Null,
+        LiteralValue::Date(day) => tagged("date", py_date_iso(day)),
+        LiteralValue::Time(clock) => tagged("time", py_time_iso(clock)),
+        LiteralValue::DateTime(stamp) => tagged("datetime", py_datetime_iso(stamp)),
+        LiteralValue::Duration(duration) => {
+            let mut map = Map::new();
+            map.insert("type".into(), Value::String("timedelta".into()));
+            #[expect(clippy::cast_precision_loss, reason = "timedelta.total_seconds()")]
+            let seconds = duration.num_microseconds().map_or(f64::NAN, |micros| micros as f64 / 1e6);
+            map.insert("value".into(), serde_json::Number::from_f64(seconds).map_or(Value::Null, Value::Number));
+            Value::Object(map)
+        }
+        LiteralValue::Array(rows) => {
+            Value::Array(rows.iter().map(|row| Value::Array(row.iter().map(plain_value).collect())).collect())
+        }
+        LiteralValue::Error(error) => plain_error(error),
+        LiteralValue::Pending => {
+            let mut map = Map::new();
+            map.insert("type".into(), Value::String("Pending".into()));
+            Value::Object(map)
+        }
+    }
+}
+
+/// The dict `literal_to_py` builds for an error value.
+pub fn plain_error(error: &formualizer_common::ExcelError) -> Value {
+    let mut map = Map::new();
+    map.insert("type".into(), Value::String("Error".into()));
+    map.insert("kind".into(), Value::String(error.kind.kind_name().into()));
+    if let Some(message) = &error.message {
+        map.insert("message".into(), Value::String(message.clone()));
+    }
+    if let Some(context) = &error.context {
+        if let Some(row) = context.row {
+            map.insert("row".into(), Value::from(row));
+        }
+        if let Some(col) = context.col {
+            map.insert("col".into(), Value::from(col));
+        }
+        if let Some(sheet) = &context.origin_sheet {
+            map.insert("sheet".into(), Value::String(sheet.clone()));
+        }
+        if let Some(row) = context.origin_row {
+            map.insert("origin_row".into(), Value::from(row));
+        }
+        if let Some(col) = context.origin_col {
+            map.insert("origin_col".into(), Value::from(col));
+        }
+    }
+    if error.extra != formualizer_common::error::ExcelErrorExtra::None
+        && let Ok(extra) = serde_json::to_value(&error.extra)
+    {
+        map.insert("extra".into(), extra);
+    }
+    Value::Object(map)
+}
+
+/// A port value in receipt form.
+pub fn plain_port_value(value: &PortValue) -> Value {
+    let row = |cells: &[LiteralValue]| Value::Array(cells.iter().map(plain_value).collect());
+    let record = |fields: &OrderedMap<LiteralValue>| {
+        Value::Object(fields.iter().map(|(key, value)| (key.to_owned(), plain_value(value))).collect())
+    };
+    match value {
+        PortValue::Scalar(value) => plain_value(value),
+        PortValue::Range(rows) => Value::Array(rows.iter().map(|cells| row(cells)).collect()),
+        PortValue::Record(fields) => record(fields),
+        PortValue::Row(cells) => row(cells),
+        PortValue::Table(rows) => Value::Array(rows.iter().map(record).collect()),
+    }
+}
+
+/// `json.dumps(value, sort_keys=True, separators=(',', ':'))`-style text
+/// (keys sorted at every level, whatever `serde_json`'s map order is).
+pub fn canonical_json(value: &Value) -> String {
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = Map::new();
+                for key in keys {
+                    out.insert(key.clone(), sorted(&map[key]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    // serde_json writes a Map in its own order; with `preserve_order` that is
+    // insertion order, which `sorted` made ascending.
+    serde_json::to_string(&sorted(value)).unwrap_or_default()
+}
 
 /// Keys of the dict `ModelSession.calculate` returns to Python.
 pub mod result_keys {
@@ -35,6 +180,15 @@ pub mod result_keys {
         OUTPUTS, TYPED_OUTPUTS, EFFECTIVE_INPUTS, INVOCATIONS, TIMINGS, FAULTS, SOLVERS,
         DIAGNOSTICS, SESSION_REUSE, CALL_MEMO, COMPILED,
     ];
+
+    /// Lane I (CP1 finding 4): present only when the report or inspection
+    /// hook returned them (`RunSnapshot.report_cells`, `conditional_results`,
+    /// `formula_counts`, `inspection`).
+    pub const REPORT_CELLS: &str = "report_cells";
+    pub const CONDITIONAL_RESULTS: &str = "conditional_results";
+    pub const FORMULA_COUNTS: &str = "formula_counts";
+    pub const INSPECTION: &str = "inspection";
+    pub const HOOK_KEYS: [&str; 4] = [REPORT_CELLS, CONDITIONAL_RESULTS, FORMULA_COUNTS, INSPECTION];
 }
 
 /// `timings` keys, in the order `CalculationSession` creates them.
@@ -182,6 +336,12 @@ pub enum PortValue {
 
 /// The result of one `calculate`. On failure the session still exposes the
 /// same fields (evidence for `CalculationFailure`), with empty outputs.
+///
+/// Values here are engine literals; the receipt form of every one is
+/// [`plain_value`] / [`plain_port_value`] (the binding converts with the same
+/// rules). `session_reuse` is filled when the session runs on a
+/// `RetainedModel`; `invocations` is then the sealed list (executed, held,
+/// inherited).
 #[derive(Debug, Clone, Default)]
 pub struct CalculationResult {
     /// Client-facing outputs (`ports.read_outputs`, trailing null rows
@@ -200,7 +360,7 @@ pub struct CalculationResult {
     pub solvers: Vec<Map<String, Value>>,
     /// `ignored_input:`, `defaulted_input:`, goal-seek notes, report notes.
     pub diagnostics: Vec<String>,
-    /// Empty without a session pool (`CalculationSession.session_reuse`).
+    /// Empty without a retained model (`CalculationSession.session_reuse`).
     pub session_reuse: Map<String, Value>,
     /// `None` seals as the empty dict (key dropped from the receipt).
     pub call_memo: Option<MemoReport>,
@@ -232,5 +392,26 @@ mod tests {
         keys.sort();
         assert_eq!(keys, ["bypassed", "enabled", "hits", "misses", "not_stored_error", "port_keyed", "stores"]);
         assert_eq!(result_keys::CALL_MEMO, "xcall_memo");
+    }
+
+    #[test]
+    fn plain_values_follow_python_plain_not_derived_serde() {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        assert_eq!(plain_value(&LiteralValue::Int(1)), serde_json::json!(1));
+        assert_eq!(plain_value(&LiteralValue::Text("a/b".into())), serde_json::json!("a/b"));
+        assert_eq!(plain_value(&LiteralValue::Empty), Value::Null);
+        let day = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        assert_eq!(plain_value(&LiteralValue::Date(day)), serde_json::json!({"type": "date", "value": "2026-09-28"}));
+        let stamp = day.and_hms_micro_opt(1, 2, 3, 4).unwrap();
+        assert_eq!(
+            plain_value(&LiteralValue::DateTime(stamp)),
+            serde_json::json!({"type": "datetime", "value": "2026-09-28T01:02:03.000004"})
+        );
+        let error = ExcelError::new(ExcelErrorKind::Ref).with_message("child target must be text".to_owned());
+        assert_eq!(
+            plain_value(&LiteralValue::Error(error)),
+            serde_json::json!({"type": "Error", "kind": "Ref", "message": "child target must be text"})
+        );
+        assert_eq!(canonical_json(&serde_json::json!({"b": 1, "a": [2]})), r#"{"a":[2],"b":1}"#);
     }
 }

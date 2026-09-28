@@ -42,6 +42,9 @@ pub mod session;
 pub mod goal_seek;
 pub mod prefetch;
 
+// Lane I: retained workbooks (pool, warm, sealing).
+pub mod retained;
+
 pub use context::{CalculationContext, CalculationFlags, Operation};
 pub use error::ModelCallError;
 pub use evaluator::{ChildEvaluator, ChildMatrix, ChildRequest, CompiledChildHook, SolveModel};
@@ -51,5 +54,7 @@ pub use key::{
     InputPairs, KeyForm, MemoKey, MemoToken, Unmemoisable, callback_inputs, casefold,
     matrix_is_finished, matrix_is_memoisable, memo_token,
 };
-pub use receipt::CalculationResult;
+pub use receipt::{CalculationResult, plain_port_value, plain_value};
+pub use retained::{RetainedModel, RetainedPool, WarmReport};
+pub use session::ModelSession;
 pub use spec::{CellRange, GoalSeekSpec, ModelPackage, ModelSpec, PortLocation, UnknownInputPolicy};

@@ -18,11 +18,13 @@
 //! `{"$time": "..."}` (ISO text); every other JSON value is read as Python's
 //! `json` module reads it.
 //!
-//! Not ported (this port evaluates a fresh load per call, never a re-entered
-//! pool entry): the formula-default restore on re-entry and the CL-097
-//! skip-unchanged logic. On a fresh load both are no-ops in Python too; the
-//! write record here only reports the four CL-097 counters (all zero), so the
-//! timings keys match.
+//! CL-097 (Lane I). A workbook re-entered from a `RetainedModel` keeps its
+//! `PortSession` and with it its [`WriteRecord`]; `write_scenario` then skips
+//! port writes whose cells still hold exactly what the record last wrote and
+//! formula-default restores that are still in place, as `ports.py`
+//! (`_restore_formula_defaults`, `_unchanged`, `_write_changed`,
+//! `_read_back_dates`) does. A fresh load has written nothing, so nothing is
+//! skipped on it.
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use formualizer_common::LiteralValue;
@@ -32,7 +34,7 @@ use formualizer_sheetport::{
 use formualizer_workbook::Workbook;
 use serde_json::{Map, Value};
 use sheetport_spec::Manifest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::evaluator::ChildMatrix;
 use crate::key::{InputPairs, casefold};
@@ -600,11 +602,126 @@ impl WriteStats {
     }
 }
 
-/// What one loaded workbook's port sessions last wrote (CL-097). A fresh load
-/// has written nothing, so nothing is ever skipped on it; see the module note.
-#[derive(Debug, Clone, Default)]
+/// One cell `(sheet, row, col)`, 1-based.
+pub type CellKey = (String, u32, u32);
+
+/// `written_token(value)`: exact type plus value (`repr`). `1`, `1.0` and
+/// `True` differ; `-0.0` differs from `0.0` (bits); NaN, time and every other
+/// type have none.
+#[derive(Debug, Clone, PartialEq)]
+enum WrittenToken {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+    Str(String),
+    Date(NaiveDate),
+    DateTime(NaiveDateTime),
+}
+
+fn written_token(value: &WireValue) -> Option<WrittenToken> {
+    Some(match value {
+        WireValue::None => WrittenToken::None,
+        WireValue::Bool(flag) => WrittenToken::Bool(*flag),
+        WireValue::Int(number) => WrittenToken::Int(*number),
+        WireValue::Float(number) if number.is_nan() => return None,
+        WireValue::Float(number) => WrittenToken::Float(number.to_bits()),
+        WireValue::Str(text) => WrittenToken::Str(text.clone()),
+        WireValue::Date(day) => WrittenToken::Date(*day),
+        WireValue::DateTime(stamp) => WrittenToken::DateTime(*stamp),
+        _ => return None,
+    })
+}
+
+/// `_incoming_literal` / `_stored_literal`: the comparable stored literal.
+#[derive(Debug, Clone, PartialEq)]
+enum StoredKey {
+    Empty,
+    Boolean(bool),
+    Number(u64),
+    Text(String),
+    DateTime(NaiveDateTime),
+    Date(NaiveDate),
+    Time(NaiveTime),
+}
+
+fn number_key(number: f64) -> Option<StoredKey> {
+    (!number.is_nan()).then(|| StoredKey::Number(number.to_bits()))
+}
+
+fn incoming_key(value: &WireValue) -> Option<StoredKey> {
+    match value {
+        WireValue::None => Some(StoredKey::Empty),
+        WireValue::Bool(flag) => Some(StoredKey::Boolean(*flag)),
+        #[expect(clippy::cast_precision_loss, reason = "Python float(int), round-to-nearest")]
+        WireValue::Int(number) => number_key(*number as f64),
+        WireValue::Float(number) => number_key(*number),
+        WireValue::Str(text) => Some(StoredKey::Text(text.clone())),
+        WireValue::DateTime(stamp) => Some(StoredKey::DateTime(truncate_micros(*stamp))),
+        WireValue::Date(day) => Some(StoredKey::Date(*day)),
+        WireValue::Time(clock) => Some(StoredKey::Time(*clock)),
+        _ => None,
+    }
+}
+
+fn truncate_micros(stamp: NaiveDateTime) -> NaiveDateTime {
+    stamp.with_nanosecond(stamp.nanosecond() / 1_000 * 1_000).unwrap_or(stamp)
+}
+
+/// `stored_literal_key(literal)`.
+fn stored_key(literal: &LiteralValue) -> Option<StoredKey> {
+    match literal {
+        LiteralValue::Empty => Some(StoredKey::Empty),
+        LiteralValue::Boolean(flag) => Some(StoredKey::Boolean(*flag)),
+        #[expect(clippy::cast_precision_loss, reason = "Python float(int), round-to-nearest")]
+        LiteralValue::Int(number) => number_key(*number as f64),
+        LiteralValue::Number(number) => number_key(*number),
+        LiteralValue::Text(text) => Some(StoredKey::Text(text.clone())),
+        LiteralValue::DateTime(stamp) => Some(StoredKey::DateTime(truncate_micros(*stamp))),
+        LiteralValue::Date(day) => Some(StoredKey::Date(*day)),
+        LiteralValue::Time(clock) => {
+            Some(StoredKey::Time(clock.with_nanosecond(clock.nanosecond() / 1_000 * 1_000).unwrap_or(*clock)))
+        }
+        _ => None,
+    }
+}
+
+/// `stored_literal_equal(value, literal)`.
+fn stored_literal_equal(value: &WireValue, literal: &LiteralValue) -> bool {
+    match (incoming_key(value), stored_key(literal)) {
+        (Some(incoming), Some(stored)) => incoming == stored,
+        _ => false,
+    }
+}
+
+/// `_is_temporal`: a date or datetime (not a time).
+fn is_temporal(value: &WireValue) -> bool {
+    matches!(value, WireValue::Date(_) | WireValue::DateTime(_))
+}
+
+/// What one loaded workbook's port sessions last wrote, per cell (CL-097,
+/// `ports.WriteRecord`). A record that could be stale is dropped: on an error
+/// inside `write_scenario`, when another write path touches cells
+/// (`invalidate`), on a scenario reset (`clear`) and in a forked process.
+#[derive(Debug, Clone)]
 pub struct WriteRecord {
-    cleared: u64,
+    pid: u32,
+    cells: HashMap<CellKey, WrittenToken>,
+    formulas: HashMap<CellKey, String>,
+    overridden: HashSet<CellKey>,
+    readback: HashMap<CellKey, StoredKey>,
+}
+
+impl Default for WriteRecord {
+    fn default() -> Self {
+        Self {
+            pid: std::process::id(),
+            cells: HashMap::new(),
+            formulas: HashMap::new(),
+            overridden: HashSet::new(),
+            readback: HashMap::new(),
+        }
+    }
 }
 
 impl WriteRecord {
@@ -612,10 +729,96 @@ impl WriteRecord {
         Self::default()
     }
 
-    /// The record no longer vouches for the workbook (report conditions).
-    pub fn clear(&mut self) {
-        self.cleared += 1;
+    /// A forked process drops what its parent recorded.
+    pub fn check_process(&mut self) {
+        let pid = std::process::id();
+        if pid != self.pid {
+            self.clear();
+            self.pid = pid;
+        }
     }
+
+    /// The record no longer vouches for the workbook (report conditions,
+    /// `forget_scenarios`).
+    pub fn clear(&mut self) {
+        self.cells.clear();
+        self.formulas.clear();
+        self.overridden.clear();
+        self.readback.clear();
+    }
+
+    /// Drop what the record knows of one cell's last port write.
+    pub fn forget(&mut self, cell: &CellKey) {
+        self.cells.remove(cell);
+        self.readback.remove(cell);
+    }
+
+    /// Another write path touched these cells.
+    pub fn invalidate<'a>(&mut self, cells: impl IntoIterator<Item = &'a CellKey>) {
+        for cell in cells {
+            self.forget(cell);
+            self.formulas.remove(cell);
+        }
+    }
+
+    /// Number of cells with a recorded port write (tests, stats).
+    pub fn recorded_cells(&self) -> usize {
+        self.cells.len()
+    }
+}
+
+/// `_port_cells(loc, shape, value)`: `(cell, field, value)` per cell of one
+/// native port update, or `None` for a geometry the record cannot follow.
+fn port_cells(location: &PortLocation, shape: &str, value: &WireValue) -> Option<Vec<(CellKey, Option<String>, WireValue)>> {
+    let range = &location.range;
+    let sheet = &range.sheet;
+    let (height, width) = (range.rows(), range.cols());
+    match shape {
+        "scalar" => Some(vec![((sheet.clone(), range.start_row, range.start_col), None, value.clone())]),
+        "record" => {
+            let WireValue::Dict(fields) = value else { return None };
+            let mut cells = Vec::with_capacity(fields.len());
+            for (field, cell) in fields.iter() {
+                let rest = field.strip_prefix('r')?;
+                let (row, col) = rest.split_once("_c")?;
+                let (row, col) = (py_int(row)?, py_int(col)?);
+                if row < 0 || col < 0 || row >= i64::from(height) || col >= i64::from(width) {
+                    return None;
+                }
+                let (row, col) = (u32::try_from(row).ok()?, u32::try_from(col).ok()?);
+                cells.push(((sheet.clone(), range.start_row + row, range.start_col + col), Some(field.to_owned()), cell.clone()));
+            }
+            Some(cells)
+        }
+        _ => {
+            let WireValue::List(rows) = value else { return None };
+            if rows.len() > height as usize {
+                return None;
+            }
+            let mut cells = Vec::new();
+            for (r, row) in rows.iter().enumerate() {
+                let WireValue::List(row) = row else { return None };
+                if row.len() > width as usize {
+                    return None;
+                }
+                for (c, cell) in row.iter().enumerate() {
+                    let (r, c) = (u32::try_from(r).ok()?, u32::try_from(c).ok()?);
+                    cells.push(((sheet.clone(), range.start_row + r, range.start_col + c), None, cell.clone()));
+                }
+            }
+            Some(cells)
+        }
+    }
+}
+
+/// Python `int(text)` for the `r{r}_c{c}` field parts.
+fn py_int(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit() || ch == '_') || digits.starts_with('_') {
+        return None;
+    }
+    trimmed.replace('_', "").parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +908,12 @@ impl PortSession {
         spec.inputs.get(&casefold(key)).ok_or_else(|| PortError::key(&casefold(key)))
     }
 
+    /// Re-enter this session on its retained workbook (`RetainedSession`
+    /// reuse): the next scenario restores formula defaults.
+    pub fn reenter(&mut self) {
+        self.source_loaded = false;
+    }
+
     /// `write_scenario(inputs, decode_wire=...)`: admit, write natively and
     /// return the effective inputs (`key -> admitted value`).
     pub fn write_scenario(
@@ -714,50 +923,304 @@ impl PortSession {
         inputs: &[(String, WireValue)],
         decode_wire: bool,
     ) -> Result<Vec<(String, WireValue)>, PortError> {
-        if self.write_record.is_some() {
-            self.write_stats = Some(WriteStats::default());
-        }
-        let source_loaded = std::mem::replace(&mut self.source_loaded, false);
-        if !source_loaded {
-            self.restore_all_formula_defaults(workbook, spec)?;
-        }
-        let result = self.admit(spec, inputs, decode_wire).and_then(|(effective, admitted)| {
-            self.write_native(workbook, &admitted)?;
-            let mut returned = Vec::with_capacity(effective.len());
-            for (key, _) in &effective {
-                let port_id = &Self::location(spec, key)?.port_id;
-                let value = admitted.iter().find(|(id, _)| id == port_id).map(|(_, value)| value.clone());
-                returned.push((key.clone(), value.unwrap_or(WireValue::None)));
-            }
-            Ok(returned)
-        });
-        if result.is_err()
-            && let Some(record) = self.write_record.as_mut()
-        {
+        let Some(mut record) = self.write_record.take() else {
+            return self.write_scenario_with(workbook, spec, inputs, decode_wire, None);
+        };
+        record.check_process();
+        self.write_stats = Some(WriteStats::default());
+        let result = self.write_scenario_with(workbook, spec, inputs, decode_wire, Some(&mut record));
+        if result.is_err() {
+            // A write that did not finish leaves cells nobody can account for.
             record.clear();
+        }
+        self.write_record = Some(record);
+        result
+    }
+
+    fn write_scenario_with(
+        &mut self,
+        workbook: &mut Workbook,
+        spec: &ModelSpec,
+        inputs: &[(String, WireValue)],
+        decode_wire: bool,
+        record: Option<&mut WriteRecord>,
+    ) -> Result<Vec<(String, WireValue)>, PortError> {
+        let source_loaded = std::mem::replace(&mut self.source_loaded, false);
+        let restore = !source_loaded;
+        let (effective, admitted) = match record {
+            None => {
+                if restore {
+                    self.restore_all_formula_defaults(workbook, spec)?;
+                }
+                let (effective, admitted) = self.admit(spec, inputs, decode_wire)?;
+                self.write_native(workbook, &admitted)?;
+                (effective, admitted)
+            }
+            Some(record) => {
+                let (effective, admitted) = match self.admit(spec, inputs, decode_wire) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        if restore {
+                            self.restore_all_formula_defaults(workbook, spec)?;
+                        }
+                        return Err(error);
+                    }
+                };
+                if restore {
+                    let overwritten = self.overwritten_cells(spec, &admitted);
+                    self.restore_formula_defaults(workbook, spec, record, &overwritten)?;
+                }
+                self.write_changed(workbook, spec, &admitted, record)?;
+                (effective, admitted)
+            }
+        };
+        let mut returned = Vec::with_capacity(effective.len());
+        for (key, _) in &effective {
+            let port_id = &Self::location(spec, key)?.port_id;
+            let value = admitted.iter().find(|(id, _)| id == port_id).map(|(_, value)| value.clone());
+            returned.push((key.clone(), value.unwrap_or(WireValue::None)));
+        }
+        Ok(returned)
+    }
+
+    fn formula_default_entries(spec: &ModelSpec) -> Vec<(CellKey, String)> {
+        let Some(entries) = spec.descriptor.get("formula_input_defaults").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        entries
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .map(|entry| {
+                let sheet = entry.get("sheet").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let number = |key: &str| {
+                    entry.get(key).and_then(Value::as_u64).and_then(|value| u32::try_from(value).ok()).unwrap_or(u32::MAX)
+                };
+                let formula = entry.get("formula").and_then(Value::as_str).unwrap_or_default();
+                ((sheet, number("row"), number("col")), formula.trim_start_matches('=').to_owned())
+            })
+            .collect()
+    }
+
+    /// `_overwritten_cells(admitted)`.
+    fn overwritten_cells(&self, spec: &ModelSpec, admitted: &[(String, WireValue)]) -> HashSet<CellKey> {
+        let mut covered = HashSet::new();
+        for (port_id, value) in admitted {
+            let Some(location) = spec.inputs.iter().map(|(_, location)| location).find(|location| &location.port_id == port_id)
+            else {
+                continue;
+            };
+            let Ok(port) = self.port(port_id) else { continue };
+            if let Some(cells) = port_cells(location, &port.shape, value) {
+                covered.extend(cells.into_iter().map(|(cell, _, _)| cell));
+            }
+        }
+        covered
+    }
+
+    /// `_restore_formula_defaults(record, overwritten)`.
+    fn restore_formula_defaults(
+        &mut self,
+        workbook: &mut Workbook,
+        spec: &ModelSpec,
+        record: &mut WriteRecord,
+        overwritten: &HashSet<CellKey>,
+    ) -> Result<(), PortError> {
+        let mut entries = Vec::new();
+        for (cell, formula) in Self::formula_default_entries(spec) {
+            if overwritten.contains(&cell) {
+                record.formulas.remove(&cell);
+                record.overridden.insert(cell);
+                if let Some(stats) = self.write_stats.as_mut() {
+                    stats.defaults_not_restored_overwritten += 1;
+                }
+            } else {
+                entries.push((cell, formula));
+            }
+        }
+        let in_place = entries.iter().all(|(cell, _)| {
+            !record.overridden.contains(cell)
+                && record.formulas.get(cell).is_some_and(|text| workbook.get_formula(&cell.0, cell.1, cell.2).as_ref() == Some(text))
+        });
+        if in_place {
+            if let Some(stats) = self.write_stats.as_mut() {
+                stats.formula_restores_skipped += entries.len() as u64;
+            }
+            return Ok(());
+        }
+        for (cell, formula) in &entries {
+            record.forget(cell);
+            record.formulas.remove(cell);
+            workbook
+                .set_formula(&cell.0, cell.1, cell.2, formula)
+                .map_err(|error| PortError::Other { kind: "RuntimeError".into(), message: error.to_string() })?;
+        }
+        for (cell, _) in &entries {
+            record.overridden.remove(cell);
+            if let Some(text) = workbook.get_formula(&cell.0, cell.1, cell.2) {
+                record.formulas.insert(cell.clone(), text);
+            }
+        }
+        Ok(())
+    }
+
+    /// `_unchanged(record, loc, cells, whole)`.
+    fn unchanged(
+        workbook: &Workbook,
+        record: &WriteRecord,
+        location: &PortLocation,
+        cells: &[(CellKey, Option<String>, WireValue)],
+        whole: bool,
+    ) -> Vec<bool> {
+        let matches: Vec<bool> = cells
+            .iter()
+            .map(|(cell, _, value)| match (record.cells.get(cell), written_token(value)) {
+                (Some(recorded), Some(token)) => *recorded == token,
+                _ => false,
+            })
+            .collect();
+        if !matches.iter().any(|same| *same) || (whole && !matches.iter().all(|same| *same)) {
+            return vec![false; cells.len()];
+        }
+        let Ok(grid) = read_typed_matrix(workbook, &location.range) else { return vec![false; cells.len()] };
+        let range = &location.range;
+        matches
+            .iter()
+            .zip(cells)
+            .map(|(same, (cell, _, value))| {
+                if !same {
+                    return false;
+                }
+                let literal = grid
+                    .get((cell.1 - range.start_row) as usize)
+                    .and_then(|row| row.get((cell.2 - range.start_col) as usize));
+                match literal {
+                    None => false,
+                    Some(literal) if is_temporal(value) => {
+                        record.readback.get(cell).is_some_and(|expected| stored_key(literal).as_ref() == Some(expected))
+                    }
+                    Some(literal) => stored_literal_equal(value, literal),
+                }
+            })
+            .collect()
+    }
+
+    /// `_write_changed(admitted, record)`: the one native write, less the
+    /// ports and record fields that are unchanged.
+    fn write_changed(
+        &mut self,
+        workbook: &mut Workbook,
+        spec: &ModelSpec,
+        admitted: &[(String, WireValue)],
+        record: &mut WriteRecord,
+    ) -> Result<(), PortError> {
+        let formula_cells: HashSet<CellKey> =
+            Self::formula_default_entries(spec).into_iter().map(|(cell, _)| cell).collect();
+        let mut update: Vec<(String, WireValue)> = Vec::new();
+        let mut written: Vec<(CellKey, WireValue)> = Vec::new();
+        let (mut skipped, mut dates_skipped) = (0u64, 0u64);
+        for (port_id, value) in admitted {
+            let location = spec.inputs.iter().map(|(_, location)| location).find(|location| &location.port_id == port_id);
+            let shape = self.port(port_id)?.shape.clone();
+            let cells = location.and_then(|location| port_cells(location, &shape, value));
+            let (Some(location), Some(cells)) = (location, cells) else {
+                update.push((port_id.clone(), value.clone()));
+                if let Some(location) = location {
+                    let range = &location.range;
+                    let all: Vec<CellKey> = (range.start_row..=range.end_row)
+                        .flat_map(|row| (range.start_col..=range.end_col).map(move |col| (range.sheet.clone(), row, col)))
+                        .collect();
+                    record.invalidate(&all);
+                }
+                continue;
+            };
+            let unchanged = Self::unchanged(workbook, record, location, &cells, shape != "record");
+            if shape == "record" {
+                let mut kept = Vec::new();
+                for ((cell, field, cell_value), same) in cells.iter().zip(&unchanged) {
+                    if *same {
+                        skipped += 1;
+                        if is_temporal(cell_value) {
+                            dates_skipped += 1;
+                        }
+                    } else {
+                        kept.push((field.clone().unwrap_or_default(), cell_value.clone()));
+                        written.push((cell.clone(), cell_value.clone()));
+                    }
+                }
+                if !kept.is_empty() {
+                    update.push((port_id.clone(), WireValue::Dict(OrderedMap(kept))));
+                }
+            } else if unchanged.iter().all(|same| *same) {
+                skipped += cells.len() as u64;
+                dates_skipped += cells.iter().filter(|(_, _, cell_value)| is_temporal(cell_value)).count() as u64;
+            } else {
+                update.push((port_id.clone(), value.clone()));
+                written.extend(cells.into_iter().map(|(cell, _, cell_value)| (cell, cell_value)));
+            }
+        }
+        if !update.is_empty() {
+            self.write_native(workbook, &update)?;
+        }
+        let readback = Self::read_back_dates(workbook, spec, &written);
+        for (cell, value) in written {
+            let token = written_token(&value);
+            record.forget(&cell);
+            if let Some(token) = token {
+                if let Some(key) = readback.get(&cell) {
+                    record.readback.insert(cell.clone(), key.clone());
+                }
+                record.cells.insert(cell.clone(), token);
+            }
+            if formula_cells.contains(&cell) {
+                record.overridden.insert(cell);
+            }
+        }
+        if let Some(stats) = self.write_stats.as_mut() {
+            stats.writes_skipped += skipped;
+            stats.date_writes_skipped += dates_skipped;
+        }
+        Ok(())
+    }
+
+    /// `_read_back_dates(written)`: cell -> stored literal right after a date write.
+    fn read_back_dates(workbook: &Workbook, spec: &ModelSpec, written: &[(CellKey, WireValue)]) -> HashMap<CellKey, StoredKey> {
+        let mut wanted: Vec<&CellKey> =
+            written.iter().filter(|(_, value)| is_temporal(value)).map(|(cell, _)| cell).collect();
+        let mut result = HashMap::new();
+        if wanted.is_empty() {
+            return result;
+        }
+        for (_, location) in spec.inputs.iter() {
+            let range = &location.range;
+            let (inside, rest): (Vec<&CellKey>, Vec<&CellKey>) = wanted.into_iter().partition(|cell| {
+                cell.0 == range.sheet
+                    && (range.start_row..=range.end_row).contains(&cell.1)
+                    && (range.start_col..=range.end_col).contains(&cell.2)
+            });
+            wanted = rest;
+            if inside.is_empty() {
+                continue;
+            }
+            let Ok(grid) = read_typed_matrix(workbook, range) else { continue };
+            for cell in inside {
+                let key = grid
+                    .get((cell.1 - range.start_row) as usize)
+                    .and_then(|row| row.get((cell.2 - range.start_col) as usize))
+                    .and_then(stored_key);
+                if let Some(key) = key {
+                    result.insert(cell.clone(), key);
+                }
+            }
         }
         result
     }
 
     fn restore_all_formula_defaults(&self, workbook: &mut Workbook, spec: &ModelSpec) -> Result<(), PortError> {
-        let Some(entries) = spec.descriptor.get("formula_input_defaults").and_then(Value::as_object) else {
-            return Ok(());
-        };
-        for entries in entries.values().filter_map(Value::as_array) {
-            for entry in entries {
-                let sheet = entry.get("sheet").and_then(Value::as_str).unwrap_or_default();
-                let row = entry.get("row").and_then(Value::as_u64).unwrap_or_default();
-                let col = entry.get("col").and_then(Value::as_u64).unwrap_or_default();
-                let formula = entry.get("formula").and_then(Value::as_str).unwrap_or_default();
-                workbook
-                    .set_formula(
-                        sheet,
-                        u32::try_from(row).unwrap_or(u32::MAX),
-                        u32::try_from(col).unwrap_or(u32::MAX),
-                        formula.trim_start_matches('='),
-                    )
-                    .map_err(|error| PortError::Other { kind: "RuntimeError".into(), message: error.to_string() })?;
-            }
+        for ((sheet, row, col), formula) in Self::formula_default_entries(spec) {
+            workbook
+                .set_formula(&sheet, row, col, &formula)
+                .map_err(|error| PortError::Other { kind: "RuntimeError".into(), message: error.to_string() })?;
         }
         Ok(())
     }

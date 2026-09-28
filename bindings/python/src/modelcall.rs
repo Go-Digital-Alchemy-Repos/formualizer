@@ -1,31 +1,45 @@
 //! Python surface of the child-model call path (GOD-383).
 //!
-//! `ModelSession(package_json, context, *, compiled_child=None)` wraps
-//! `formualizer_modelcall::session::ModelSession`. `calculate(inputs, *,
-//! report_prepare=None, report_capture=None)` evaluates one scenario with the
-//! GIL released and returns a dict with the keys in
+//! `RetainedModel(package_json, context_json, *, retain_scenarios=False)`
+//! holds one package's retained workbooks (parent and children, loaded on
+//! first use or by `warm`), their pinned goal-seek cells and CL-097 write
+//! records; the Python pool leases it to one request at a time.
+//! `warm(inputs=None)`, `close()`, `stats()`, `forget_scenarios()`.
+//!
+//! `ModelSession(package_json, context_json, retained=None, *,
+//! compiled_child=None)` is one request (deadline measured from
+//! construction). `calculate(inputs, report_prepare=None,
+//! report_capture=None, inspect=None)` evaluates one scenario with the GIL
+//! released and returns a dict with the keys in
 //! `formualizer_modelcall::receipt::result_keys` (memo counters under the
-//! receipt key `xcall_memo` this round). Values are converted exactly as the
-//! Python runtime produced them: port reads through `literal_to_py`, typed
-//! outputs and child matrices as `LiteralValue` objects.
+//! receipt key `xcall_memo` this round), plus `report_cells`,
+//! `conditional_results`, `formula_counts` when `report_capture` returned them
+//! and `inspection` when `inspect` returned something.
+//!
+//! Every value in the dict is in receipt form, `snapshot._plain` of what the
+//! Python runtime held: int / float / str / bool / None, `{"type": "date" |
+//! "datetime" | "time", "value": iso}`, errors as the dict
+//! `LiteralValue.to_python()` gives, lists for tuples. (The hooks receive
+//! native values: `report_capture(workbook, outputs)` gets outputs as
+//! `literal_to_py` builds them.)
 //!
 //! A failed run raises `ModelCalculationError` (a `RuntimeError`) with
 //! `error_type` (the Python exception name the runtime raised, e.g.
 //! `TimeoutError`), `error_message`, and `evidence` (the same dict shape,
 //! outputs empty, diagnostics ending with `Type: message`).
 //!
-//! Report capture (`operation = 'report'`): `report_prepare(workbook)` runs
-//! after admission and before evaluation, `report_capture(workbook, outputs)`
-//! after the outputs are read; `workbook` is a `Workbook` over the session's
-//! own parent. The capture's return value is kept as `ModelSession.report`
-//! and its `diagnostics` join the run's. `ModelSession.workbook()` returns
-//! the parent after `calculate` (inspection, later report work).
+//! Hooks: `report_prepare(workbook)` runs after admission and before
+//! evaluation (operation `report`; the write record is cleared after it),
+//! `report_capture(workbook, outputs)` after goal seek and the output reads,
+//! `inspect(workbook)` after capture (operation `diagnostic`, timed as
+//! `inspection_seconds`); `workbook` is a `Workbook` over the session's own
+//! parent. `ModelSession.workbook()` returns the parent after `calculate`.
 //!
-//! Compiled child (`flags.compiled`): `compiled_child` is an object with
-//! `attempt(identity, workbook_sha256, inputs, output, stack, xcall)` and
-//! `report()`. `attempt` returns `(matrix_or_None, route_or_None)`; `xcall`
-//! is a callable routing the compiled child's own calls
-//! (`xcall(target, block, output, *tail)`).
+//! Compiled child (`flags.compiled`): `compiled_child` (constructor keyword or
+//! `set_compiled_child(hook)`) is an object with `attempt(identity,
+//! workbook_sha256, inputs, output, stack, xcall)` and `report()`. `attempt`
+//! returns `(matrix_or_None, route_or_None)`; `xcall` is a callable routing
+//! the compiled child's own calls (`xcall(target, block, output, *tail)`).
 //!
 //! `register_import_aliases(workbook, callback)` binds a Python callable
 //! under `MDL.CALLMODEL` and every imported name in
@@ -36,7 +50,10 @@ use formualizer_modelcall::context::CalculationContextSpec;
 use formualizer_modelcall::evaluator::{CompiledAttempt, CompiledChildHook};
 use formualizer_modelcall::event::ModelCallEvent;
 use formualizer_modelcall::ports::WireValue;
-use formualizer_modelcall::receipt::{CalculationResult, PortValue, TimingValue, result_keys};
+use formualizer_modelcall::receipt::{
+    CalculationResult, PortValue, TimingValue, py_date_iso, py_datetime_iso, py_time_iso, result_keys,
+};
+use formualizer_modelcall::retained::RetainedModel;
 use formualizer_modelcall::router::{ModelCallRouter, current_nested_router};
 use formualizer_modelcall::session::{ModelSession, ReportHook, SharedWorkbook, failure_kind};
 use formualizer_modelcall::spec::{ModelSpec, OrderedMap, PortLocation};
@@ -191,8 +208,26 @@ fn rows_to_py(
     Ok(outer.into_any().unbind())
 }
 
-fn plain(py: Python<'_>, value: &LiteralValue) -> PyResult<Py<PyAny>> {
+/// Native Python value (`literal_to_py`), what the hooks receive.
+fn native(py: Python<'_>, value: &LiteralValue) -> PyResult<Py<PyAny>> {
     literal_to_py(py, value)
+}
+
+/// Receipt form: `snapshot._plain(literal.to_python())`.
+fn plain(py: Python<'_>, value: &LiteralValue) -> PyResult<Py<PyAny>> {
+    let tagged = |kind: &str, text: String| -> PyResult<Py<PyAny>> {
+        let dict = PyDict::new(py);
+        dict.set_item("type", kind)?;
+        dict.set_item("value", text)?;
+        Ok(dict.into_any().unbind())
+    };
+    match value {
+        LiteralValue::Date(day) => tagged("date", py_date_iso(day)),
+        LiteralValue::DateTime(stamp) => tagged("datetime", py_datetime_iso(stamp)),
+        LiteralValue::Time(clock) => tagged("time", py_time_iso(clock)),
+        LiteralValue::Array(rows) => rows_to_py(py, rows, plain),
+        other => literal_to_py(py, other),
+    }
 }
 
 fn port_value_to_py(
@@ -247,9 +282,9 @@ fn event_to_py(py: Python<'_>, event: &ModelCallEvent) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("index", event.index)?;
     dict.set_item("parent", &event.parent)?;
-    dict.set_item("target", literal_to_py(py, &event.target)?)?;
-    dict.set_item("output", literal_to_py(py, &event.output)?)?;
-    dict.set_item("stack", PyTuple::new(py, &event.stack)?)?;
+    dict.set_item("target", plain(py, &event.target)?)?;
+    dict.set_item("output", plain(py, &event.output)?)?;
+    dict.set_item("stack", PyList::new(py, &event.stack)?)?;
     dict.set_item("status", event.status.as_str())?;
     if let Some(child) = &event.child {
         dict.set_item("child", child)?;
@@ -257,7 +292,7 @@ fn event_to_py(py: Python<'_>, event: &ModelCallEvent) -> PyResult<Py<PyAny>> {
     if let Some(inputs) = &event.inputs {
         let map = PyDict::new(py);
         for (name, value) in inputs {
-            map.set_item(name, literal_to_py(py, value)?)?;
+            map.set_item(name, plain(py, value)?)?;
         }
         dict.set_item("inputs", map)?;
     }
@@ -265,13 +300,13 @@ fn event_to_py(py: Python<'_>, event: &ModelCallEvent) -> PyResult<Py<PyAny>> {
         dict.set_item("memo_of", source)?;
     }
     if let Some(matrix) = &event.matrix {
-        dict.set_item("matrix", rows_to_py(py, matrix, typed)?)?;
+        dict.set_item("matrix", rows_to_py(py, matrix, plain)?)?;
     }
     if let Some(error) = &event.error {
         dict.set_item("error", error)?;
     }
     if let Some(returned) = &event.returned_error {
-        dict.set_item("returned_error", typed(py, &LiteralValue::Error(returned.clone()))?)?;
+        dict.set_item("returned_error", plain(py, &LiteralValue::Error(returned.clone()))?)?;
     }
     if event.prefetch {
         dict.set_item("prefetch", true)?;
@@ -303,7 +338,7 @@ fn map_to_py(py: Python<'_>, map: &serde_json::Map<String, serde_json::Value>) -
 fn result_dict<'py>(py: Python<'py>, result: &CalculationResult) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item(result_keys::OUTPUTS, ports_to_py(py, &result.outputs, plain)?)?;
-    dict.set_item(result_keys::TYPED_OUTPUTS, ports_to_py(py, &result.typed_outputs, typed)?)?;
+    dict.set_item(result_keys::TYPED_OUTPUTS, ports_to_py(py, &result.typed_outputs, plain)?)?;
     dict.set_item(result_keys::EFFECTIVE_INPUTS, ports_to_py(py, &result.effective_inputs, plain)?)?;
     dict.set_item(result_keys::INVOCATIONS, events_to_py(py, &result.invocations)?)?;
     let timings = PyDict::new(py);
@@ -335,10 +370,18 @@ fn result_dict<'py>(py: Python<'py>, result: &CalculationResult) -> PyResult<Bou
 // Hooks backed by Python callables
 // ---------------------------------------------------------------------------
 
+/// What the hooks returned in the last `calculate`.
+#[derive(Default)]
+struct HookResults {
+    report: Option<Py<PyAny>>,
+    inspection: Option<Py<PyAny>>,
+}
+
 struct PyReportHook {
     prepare: Option<Py<PyAny>>,
     capture: Option<Py<PyAny>>,
-    report: Arc<Mutex<Option<Py<PyAny>>>>,
+    inspect: Option<Py<PyAny>>,
+    results: Arc<Mutex<HookResults>>,
 }
 
 fn shared_workbook(py: Python<'_>, workbook: &SharedWorkbook) -> PyResult<Py<PyWorkbook>> {
@@ -360,7 +403,7 @@ impl ReportHook for PyReportHook {
         Python::attach(|py| {
             let run = || -> PyResult<Vec<String>> {
                 let workbook = shared_workbook(py, workbook)?;
-                let outputs = ports_to_py(py, outputs, plain)?;
+                let outputs = ports_to_py(py, outputs, native)?;
                 let report = capture.call1(py, (workbook, outputs))?;
                 let bound = report.bind(py);
                 let mut notes = Vec::new();
@@ -371,14 +414,50 @@ impl ReportHook for PyReportHook {
                         }
                     }
                 }
-                if let Ok(mut slot) = self.report.lock() {
-                    *slot = Some(report);
+                if let Ok(mut results) = self.results.lock() {
+                    results.report = Some(report);
                 }
                 Ok(notes)
             };
             run().map_err(|error| from_py_err(py, &error))
         })
     }
+
+    fn inspect(&self, workbook: &SharedWorkbook) -> Result<(), ModelCallError> {
+        let Some(inspect) = &self.inspect else { return Ok(()) };
+        Python::attach(|py| {
+            let run = || -> PyResult<()> {
+                let workbook = shared_workbook(py, workbook)?;
+                let inspection = inspect.call1(py, (workbook,))?;
+                if let Ok(mut results) = self.results.lock() {
+                    results.inspection = (!inspection.is_none(py)).then_some(inspection);
+                }
+                Ok(())
+            };
+            run().map_err(|error| from_py_err(py, &error))
+        })
+    }
+
+    fn inspects(&self) -> bool {
+        self.inspect.is_some()
+    }
+}
+
+/// Add the hook keys the hooks produced to a result dict.
+fn add_hook_results(py: Python<'_>, dict: &Bound<'_, PyDict>, results: &HookResults) -> PyResult<()> {
+    if let Some(report) = &results.report
+        && let Ok(report) = report.bind(py).cast::<PyDict>()
+    {
+        for key in [result_keys::REPORT_CELLS, result_keys::CONDITIONAL_RESULTS, result_keys::FORMULA_COUNTS] {
+            if let Some(value) = report.get_item(key)? {
+                dict.set_item(key, value)?;
+            }
+        }
+    }
+    if let Some(inspection) = &results.inspection {
+        dict.set_item(result_keys::INSPECTION, inspection.clone_ref(py))?;
+    }
+    Ok(())
 }
 
 struct PyCompiledHook {
@@ -403,7 +482,7 @@ impl CompiledChildHook for PyCompiledHook {
             let run = || -> PyResult<CompiledAttempt> {
                 let map = PyDict::new(py);
                 for (name, value) in inputs {
-                    map.set_item(name, literal_to_py(py, value)?)?;
+                    map.set_item(name, native(py, value)?)?;
                 }
                 let xcall: Py<PyAny> = match &router {
                     Some(router) => Py::new(py, PyNestedCall { router: router.clone() })?.into_any(),
@@ -482,68 +561,193 @@ impl PyNestedCall {
 // ModelSession
 // ---------------------------------------------------------------------------
 
+fn parse_package(package_json: &str) -> PyResult<ModelPackage> {
+    ModelPackage::from_json(package_json).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+fn parse_context(context: &Bound<'_, PyAny>) -> PyResult<CalculationContext> {
+    let spec: CalculationContextSpec =
+        serde_json::from_str(&json_text(context)?).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    CalculationContext::from_spec(&spec).map_err(to_py_err)
+}
+
+fn calculation_error(py: Python<'_>, error: &ModelCallError, evidence: Bound<'_, PyDict>) -> PyResult<PyErr> {
+    let exception = ModelCalculationError::new_err(error.to_string());
+    let value = exception.value(py);
+    value.setattr("error_type", failure_kind(error))?;
+    let message = match error {
+        ModelCallError::Infrastructure { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
+    value.setattr("error_message", message)?;
+    value.setattr("evidence", evidence)?;
+    Ok(exception)
+}
+
+/// One package's retained workbooks (`sessions.SessionPool` for one package).
+#[pyclass(name = "RetainedModel", module = "formualizer.formualizer_py")]
+pub struct PyRetainedModel {
+    model: RetainedModel,
+}
+
+#[pymethods]
+impl PyRetainedModel {
+    /// `package_json`: the package JSON. `context_json`: a dict or JSON text
+    /// (`now`, `random_seed`, `flags`; the warm clock and seed, and the
+    /// flags every load uses, e.g. `skip_unchanged_writes`).
+    /// `retain_scenarios`: a persistent worker (`WORKBOOK_SESSION_PERSIST`):
+    /// each completed request's scenario is what the next one inherits.
+    #[new]
+    #[pyo3(signature = (package_json, context_json, *, retain_scenarios = false))]
+    fn new(package_json: &str, context_json: &Bound<'_, PyAny>, retain_scenarios: bool) -> PyResult<Self> {
+        let package = parse_package(package_json)?;
+        let context = parse_context(context_json)?;
+        Ok(Self { model: RetainedModel::new(Arc::new(package), context, retain_scenarios) })
+    }
+
+    /// Load and evaluate every model not yet retained (children first, then
+    /// the parent with `inputs`, default scenario when None). Returns
+    /// `{warmed, warm_timings, warm_invocations, warm_session_timings,
+    /// invocations}` (`invocations`: identity -> the warm run's events).
+    #[pyo3(signature = (inputs = None))]
+    fn warm<'py>(&self, py: Python<'py>, inputs: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyDict>> {
+        let inputs = match inputs {
+            Some(inputs) if !inputs.is_none() => request_inputs(inputs)?,
+            _ => Vec::new(),
+        };
+        let model = &self.model;
+        let report = py.detach(|| model.warm(&inputs, true)).map_err(|error| {
+            let evidence = PyDict::new(py);
+            calculation_error(py, &error, evidence).unwrap_or_else(|failure| failure)
+        })?;
+        let dict = PyDict::new(py);
+        dict.set_item("warmed", PyList::new(py, report.warmed())?)?;
+        let seconds = PyDict::new(py);
+        let counts = PyDict::new(py);
+        let timings = PyDict::new(py);
+        let events = PyDict::new(py);
+        for model in &report.models {
+            seconds.set_item(&model.identity, model.seconds)?;
+            counts.set_item(&model.identity, model.invocations.len())?;
+            timings.set_item(&model.identity, timings_to_py(py, &model.timings)?)?;
+            events.set_item(&model.identity, events_to_py(py, &model.invocations)?)?;
+        }
+        dict.set_item("warm_timings", seconds)?;
+        dict.set_item("warm_invocations", counts)?;
+        dict.set_item("warm_session_timings", timings)?;
+        dict.set_item("invocations", events)?;
+        Ok(dict)
+    }
+
+    /// Forget every retained workbook; returns how many there were.
+    fn close(&self) -> usize {
+        self.model.close()
+    }
+
+    /// Keep the workbooks, inherit nothing from what ran (after a failure).
+    fn forget_scenarios(&self) {
+        self.model.pool().forget_scenarios();
+    }
+
+    /// Entries, flags and warm timings (plain JSON).
+    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_to_py(py, &self.model.stats())
+    }
+
+    fn __len__(&self) -> usize {
+        self.model.pool().len()
+    }
+}
+
+fn timings_to_py(py: Python<'_>, timings: &formualizer_modelcall::receipt::Timings) -> PyResult<Bound<'_, PyDict>> {
+    let dict = PyDict::new(py);
+    for (key, value) in timings.0.iter() {
+        match value {
+            TimingValue::Count(count) => dict.set_item(key, *count)?,
+            TimingValue::Seconds(seconds) => dict.set_item(key, *seconds)?,
+        }
+    }
+    Ok(dict)
+}
+
 /// One calculation request over a pinned model package.
 #[pyclass(name = "ModelSession", module = "formualizer.formualizer_py")]
 pub struct PyModelSession {
     session: ModelSession,
-    report: Arc<Mutex<Option<Py<PyAny>>>>,
+    results: Arc<Mutex<HookResults>>,
+    /// Keeps the retained model alive while this request runs on it.
+    _retained: Option<Py<PyRetainedModel>>,
 }
 
 #[pymethods]
 impl PyModelSession {
-    /// `package_json`: the package JSON (`package.py`). `context`: a dict or
-    /// JSON text with `now` (timezone-aware ISO 8601), `operation`,
-    /// `random_seed`, `deadline_seconds`, `max_depth` and `flags`.
+    /// `package_json`: the package JSON (`package.py`). `context_json`: a dict
+    /// or JSON text with `now` (timezone-aware ISO 8601), `operation`,
+    /// `random_seed`, `deadline_seconds` (from construction), `max_depth` and
+    /// `flags`. `retained`: the `RetainedModel` this request leases.
     #[new]
-    #[pyo3(signature = (package_json, context, *, compiled_child = None))]
-    fn new(package_json: &str, context: &Bound<'_, PyAny>, compiled_child: Option<Py<PyAny>>) -> PyResult<Self> {
-        let package = ModelPackage::from_json(package_json).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let spec: CalculationContextSpec = serde_json::from_str(&json_text(context)?)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let context = CalculationContext::from_spec(&spec).map_err(to_py_err)?;
+    #[pyo3(signature = (package_json, context_json, retained = None, *, compiled_child = None))]
+    fn new(
+        py: Python<'_>,
+        package_json: &str,
+        context_json: &Bound<'_, PyAny>,
+        retained: Option<Py<PyRetainedModel>>,
+        compiled_child: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let package = parse_package(package_json)?;
+        let context = parse_context(context_json)?;
         let mut session = ModelSession::new(Arc::new(package), context);
+        if let Some(retained) = &retained {
+            session.set_retained(Some(&retained.borrow(py).model));
+        }
         if let Some(target) = compiled_child {
             session.set_compiled_child(Some(Arc::new(PyCompiledHook { target })));
         }
-        Ok(Self { session, report: Arc::new(Mutex::new(None)) })
+        Ok(Self { session, results: Arc::new(Mutex::new(HookResults::default())), _retained: retained })
     }
 
     /// Calculate one scenario; returns the result dict or raises
     /// `ModelCalculationError` carrying `evidence`.
-    #[pyo3(signature = (inputs, *, report_prepare = None, report_capture = None))]
+    #[pyo3(signature = (inputs, report_prepare = None, report_capture = None, inspect = None))]
     fn calculate<'py>(
         &mut self,
         py: Python<'py>,
         inputs: &Bound<'py, PyAny>,
         report_prepare: Option<Py<PyAny>>,
         report_capture: Option<Py<PyAny>>,
+        inspect: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let inputs = request_inputs(inputs)?;
-        if let Ok(mut slot) = self.report.lock() {
-            *slot = None;
+        if let Ok(mut results) = self.results.lock() {
+            *results = HookResults::default();
         }
-        let hook: Option<Arc<dyn ReportHook>> = if report_prepare.is_some() || report_capture.is_some() {
-            Some(Arc::new(PyReportHook { prepare: report_prepare, capture: report_capture, report: self.report.clone() }))
-        } else {
-            None
-        };
+        let hook: Option<Arc<dyn ReportHook>> =
+            if report_prepare.is_some() || report_capture.is_some() || inspect.is_some() {
+                Some(Arc::new(PyReportHook {
+                    prepare: report_prepare,
+                    capture: report_capture,
+                    inspect,
+                    results: self.results.clone(),
+                }))
+            } else {
+                None
+            };
         self.session.set_report_hook(hook);
         let session = &mut self.session;
         let outcome = py.detach(|| session.calculate_wire(&inputs));
+        // The hooks' Python objects must not outlive this call through the session.
+        self.session.set_report_hook(None);
         match outcome {
-            Ok(result) => result_dict(py, &result),
+            Ok(result) => {
+                let dict = result_dict(py, &result)?;
+                if let Ok(results) = self.results.lock() {
+                    add_hook_results(py, &dict, &results)?;
+                }
+                Ok(dict)
+            }
             Err(error) => {
                 let evidence = result_dict(py, &self.session.partial_result())?;
-                let exception = ModelCalculationError::new_err(error.to_string());
-                let value = exception.value(py);
-                value.setattr("error_type", failure_kind(&error))?;
-                let message = match &error {
-                    ModelCallError::Infrastructure { message, .. } => message.clone(),
-                    other => other.to_string(),
-                };
-                value.setattr("error_message", message)?;
-                value.setattr("evidence", evidence)?;
-                Err(exception)
+                Err(calculation_error(py, &error, evidence)?)
             }
         }
     }
@@ -561,7 +765,13 @@ impl PyModelSession {
     /// What `report_capture` returned in the last `calculate`, or None.
     #[getter]
     fn report(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-        self.report.lock().ok().and_then(|slot| slot.as_ref().map(|report| report.clone_ref(py)))
+        self.results.lock().ok().and_then(|results| results.report.as_ref().map(|report| report.clone_ref(py)))
+    }
+
+    /// The compiled-child hook (`attempt`/`report`), or None to clear it.
+    fn set_compiled_child(&mut self, hook: Option<Py<PyAny>>) {
+        self.session
+            .set_compiled_child(hook.map(|target| Arc::new(PyCompiledHook { target }) as Arc<dyn CompiledChildHook>));
     }
 
     /// Cancel every workbook this request has open (thread-safe).
@@ -601,6 +811,7 @@ fn call_model_function_names() -> Vec<&'static str> {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModelSession>()?;
+    m.add_class::<PyRetainedModel>()?;
     m.add_class::<PyNestedCall>()?;
     m.add("ModelCalculationError", m.py().get_type::<ModelCalculationError>())?;
     m.add_function(wrap_pyfunction!(register_import_aliases, m)?)?;

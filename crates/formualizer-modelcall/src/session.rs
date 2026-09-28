@@ -8,10 +8,17 @@
 //! an evaluation does to a workbook is set its cancel flag (the deadline
 //! watchdog, a fault in a child call, `ModelSession::cancel`).
 //!
-//! Not ported here (they stay in Python this round): the session pool and
-//! warm (`session_reuse` is always empty and sealing adds no held or inherited
-//! events), engine identity verification, and the `diagnostic` operation's
-//! inspection capture (Python reads it from `ModelSession.workbook()`).
+//! Lane I: a session built `with_retained(model)` loads through the
+//! model's pool (`sessions.SessionPool`): a retained workbook is re-entered
+//! (`_reuse`: cancel reset, clock, router rebound, pinned goal-seek cells
+//! restored, port session re-entered so CL-097 skips unchanged writes), a
+//! fresh load is admitted, `session_reuse` is reported and invocations are
+//! sealed with held and inherited events (`runtime.sealed_invocations`).
+//! Hooks: `report_prepare` / `report_capture` (operation `report`) and
+//! `inspect` (operation `diagnostic`) run on the parent through [`ReportHook`].
+//!
+//! Not ported here (they stay in Python this round): engine identity
+//! verification, prefetch slot pools (flights always load fresh).
 
 use chrono::Utc;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
@@ -38,7 +45,8 @@ use crate::memo::ModelCallMemo;
 use crate::ports::{PortError, PortSession, WireValue, py_repr, read_typed_matrix, wire_to_port_value};
 use crate::prefetch::{Prefetcher, sibling_plan};
 use crate::receipt::{CalculationResult, MemoReport, PortValue, TimingValue, Timings, timing_keys};
-use crate::router::{ModelCallRouter, register_call_handler, with_nested_router};
+use crate::retained::{Acquired, Admission, RetainedModel, RetainedPool, ReuseState, restore_pinned_cells, solver_written_cells};
+use crate::router::{ModelCallRouter, RouterSlot, register_call_handler, with_nested_router};
 use crate::spec::{CellRange, ModelPackage, ModelSpec, OrderedMap};
 use crate::{CalculationContext, ModelCallError, Operation};
 
@@ -141,6 +149,16 @@ pub trait ReportHook: Send + Sync {
         workbook: &SharedWorkbook,
         outputs: &OrderedMap<PortValue>,
     ) -> Result<Vec<String>, ModelCallError>;
+    /// `capture_inspection(workbook, spec)` for operation `diagnostic`, after
+    /// the report capture; timed as `inspection_seconds`. The hook keeps what
+    /// it captured (the binding returns it as `inspection`).
+    fn inspect(&self, _workbook: &SharedWorkbook) -> Result<(), ModelCallError> {
+        Ok(())
+    }
+    /// Whether `inspect` does anything (no timing otherwise).
+    fn inspects(&self) -> bool {
+        false
+    }
 }
 
 fn engine_error(error: IoError) -> ModelCallError {
@@ -164,6 +182,8 @@ pub(crate) struct RunState {
     pub(crate) diagnostics: Vec<String>,
     pub(crate) timings: Timings,
     pub(crate) memo: Option<ModelCallMemo>,
+    /// Lane I: what this request did with the retained pool.
+    pub(crate) reuse: ReuseState,
 }
 
 impl RunState {
@@ -185,6 +205,8 @@ pub(crate) struct RunCore {
     pub(crate) context: CalculationContext,
     source: Arc<dyn WorkbookSource>,
     compiled: Option<Arc<dyn CompiledChildHook>>,
+    /// Lane I: the retained model's pool, when the session runs on one.
+    pool: Option<Arc<RetainedPool>>,
     state: Mutex<RunState>,
     pub(crate) prefetch: Mutex<Option<Prefetcher>>,
     active: Mutex<Vec<(u64, Arc<AtomicBool>)>>,
@@ -194,12 +216,20 @@ pub(crate) struct RunCore {
     cancel: CancelToken,
 }
 
-/// A loaded, tracked workbook and its port session.
+/// A loaded (or re-entered), tracked workbook and its port session.
 pub(crate) struct Loaded {
-    pub(crate) workbook: Workbook,
+    pub(crate) workbook: SharedWorkbook,
     pub(crate) ports: PortSession,
     pub(crate) flag: Arc<AtomicBool>,
     pub(crate) id: u64,
+    /// The call binding registered on the workbook.
+    pub(crate) slot: Arc<RouterSlot>,
+    /// The pool entry, when the workbook is retained.
+    pub(crate) entry: Option<u64>,
+}
+
+fn write(workbook: &SharedWorkbook) -> std::sync::RwLockWriteGuard<'_, Workbook> {
+    workbook.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct Watchdog {
@@ -224,6 +254,7 @@ impl RunCore {
         context: CalculationContext,
         source: Arc<dyn WorkbookSource>,
         compiled: Option<Arc<dyn CompiledChildHook>>,
+        pool: Option<Arc<RetainedPool>>,
         cancel: CancelToken,
     ) -> Self {
         let mut timings = Timings::base();
@@ -234,12 +265,14 @@ impl RunCore {
             None
         };
         let memo = context.flags.call_memo.then(ModelCallMemo::new);
+        let reuse = ReuseState { pooled: pool.is_some(), ..ReuseState::default() };
         Self {
             package,
             context,
             source,
             compiled,
-            state: Mutex::new(RunState { timings, memo, ..RunState::default() }),
+            pool,
+            state: Mutex::new(RunState { timings, memo, reuse, ..RunState::default() }),
             prefetch: Mutex::new(None),
             active: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(0),
@@ -339,11 +372,70 @@ impl RunCore {
         Ok((version.clone(), spec))
     }
 
-    /// `load(spec, stack)`: a fresh load with the call function registered
-    /// for this caller stack, tracked for cancellation, graph prepared.
+    /// `load(spec, stack)`: re-enter a retained workbook, or load fresh with
+    /// the call function registered for this caller stack, tracked for
+    /// cancellation, graph prepared (and admitted when a pool is present).
     pub(crate) fn load(self: &Arc<Self>, spec: &ModelSpec, stack: &[String]) -> Result<Loaded, ModelCallError> {
         self.check_deadline()?;
         let started = Instant::now();
+        if let Some(pool) = &self.pool
+            && let Some(acquired) = pool.acquire(spec, self.context.random_seed)?
+        {
+            let serial = acquired.serial;
+            self.state().reuse.note_reused(&acquired);
+            match self.reenter(acquired, spec, stack) {
+                Ok(loaded) => {
+                    self.add_seconds("load_seconds", started);
+                    return Ok(loaded);
+                }
+                Err(error) => {
+                    self.state().reuse.note_released(serial);
+                    pool.discard(serial);
+                    return Err(error);
+                }
+            }
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let (workbook, ports, slot) = self.open_fresh(spec, Some(stack), &flag)?;
+        let id = self.track(&flag);
+        let shared: SharedWorkbook = Arc::new(RwLock::new(workbook));
+        let mut entry = None;
+        if let Some(pool) = &self.pool {
+            let admitted = (|| {
+                let restore = {
+                    let mut guard = write(&shared);
+                    let model = WorkbookSolveModel { workbook: &mut guard, flag: flag.clone(), cancelled: None };
+                    solver_written_cells(&model)?
+                };
+                let admission = Admission { workbook: shared.clone(), slot: slot.clone(), flag: flag.clone(), restore };
+                pool.admit(spec, self.context.random_seed, admission)
+            })();
+            match admitted {
+                Ok(serial) => {
+                    self.state().reuse.note_admitted(serial, &spec.model_identity());
+                    entry = Some(serial);
+                }
+                Err(error) => {
+                    self.release(id, &flag);
+                    slot.unbind();
+                    return Err(error);
+                }
+            }
+        }
+        self.state().reuse.note_fresh(spec.model_identity());
+        self.add_seconds("load_seconds", started);
+        Ok(Loaded { workbook: shared, ports, flag, id, slot, entry })
+    }
+
+    /// The fresh-load steps (`sessions.load_workbook_session`): source load,
+    /// clock, call binding (bound to this core for `stack` when given),
+    /// `prepare_graph`, port session with a write record when asked for.
+    pub(crate) fn open_fresh(
+        self: &Arc<Self>,
+        spec: &ModelSpec,
+        stack: Option<&[String]>,
+        flag: &Arc<AtomicBool>,
+    ) -> Result<(Workbook, PortSession, Arc<RouterSlot>), ModelCallError> {
         let mut workbook = self.source.load(spec, &self.context)?;
         workbook
             .set_deterministic_mode(DeterministicMode::Enabled {
@@ -351,11 +443,12 @@ impl RunCore {
                 timezone: TimeZoneSpec::FixedOffsetSeconds(0),
             })
             .map_err(engine_error)?;
-        let flag = Arc::new(AtomicBool::new(false));
-        let router = ModelCallRouter::bound(Arc::clone(self), stack.to_vec(), flag.clone());
-        register_call_handler(&mut workbook, router)?;
-        let id = self.track(&flag);
+        let slot = RouterSlot::new();
+        if let Some(stack) = stack {
+            slot.bind(ModelCallRouter::bound(Arc::clone(self), stack.to_vec(), flag.clone()));
+        }
         let prepared = (|| {
+            register_call_handler(&mut workbook, slot.clone())?;
             let preparation_started = Instant::now();
             workbook.prepare_graph_all().map_err(engine_error)?;
             self.add_seconds("preparation_seconds", preparation_started);
@@ -363,14 +456,59 @@ impl RunCore {
                 .map_err(PortError::into_error)
         })();
         match prepared {
-            Ok(ports) => {
-                self.add_seconds("load_seconds", started);
-                Ok(Loaded { workbook, ports, flag, id })
-            }
+            Ok(ports) => Ok((workbook, ports, slot)),
             Err(error) => {
-                self.release(id, &flag);
+                // CL-095: nobody receives this workbook.
+                slot.unbind();
                 Err(error)
             }
+        }
+    }
+
+    /// `_reuse(entry, spec, stack)`: re-enter a retained workbook as this
+    /// run's own scenario. No second prepare and no second registration.
+    fn reenter(self: &Arc<Self>, acquired: Acquired, spec: &ModelSpec, stack: &[String]) -> Result<Loaded, ModelCallError> {
+        let Acquired { serial, workbook, slot, flag, restore, ports, .. } = acquired;
+        let id = self.track(&flag);
+        flag.store(false, Ordering::SeqCst);
+        let result = (|| {
+            let mut guard = write(&workbook);
+            guard
+                .set_deterministic_mode(DeterministicMode::Enabled {
+                    timestamp_utc: self.context.now.with_timezone(&Utc),
+                    timezone: TimeZoneSpec::FixedOffsetSeconds(0),
+                })
+                .map_err(engine_error)?;
+            slot.bind(ModelCallRouter::bound(Arc::clone(self), stack.to_vec(), flag.clone()));
+            let mut ports = match ports {
+                Some(ports) => ports,
+                // Lent back without its port session (a failed run): rebuild.
+                None => PortSession::new(&mut guard, spec, false, self.context.flags.skip_unchanged_writes)
+                    .map_err(PortError::into_error)?,
+            };
+            restore_pinned_cells(&mut guard, &restore, Some(&mut ports))?;
+            ports.reenter();
+            Ok(ports)
+        })();
+        match result {
+            Ok(ports) => Ok(Loaded { workbook, ports, flag, id, slot, entry: Some(serial) }),
+            Err(error) => {
+                self.release(id, &flag);
+                slot.unbind();
+                Err(error)
+            }
+        }
+    }
+
+    /// `_release(workbook)`: stop watching it; a pool entry is unbound and
+    /// lent back with its port session, a request-owned load is dropped.
+    pub(crate) fn release_loaded(&self, loaded: Loaded) {
+        let Loaded { ports, flag, id, slot, entry, .. } = loaded;
+        self.release(id, &flag);
+        slot.unbind();
+        if let (Some(serial), Some(pool)) = (entry, &self.pool) {
+            self.state().reuse.note_released(serial);
+            pool.release(serial, Some(ports));
         }
     }
 
@@ -517,10 +655,11 @@ impl RunCore {
         }
         let mut loaded = self.load(spec, stack)?;
         let result = (|| {
+            let mut workbook = write(&loaded.workbook);
             let admission_started = Instant::now();
             let wire: Vec<(String, WireValue)> =
                 inputs.iter().map(|(name, value)| (name.clone(), WireValue::from_literal(value))).collect();
-            let admitted = loaded.ports.write_scenario(&mut loaded.workbook, spec, &wire, false);
+            let admitted = loaded.ports.write_scenario(&mut workbook, spec, &wire, false);
             self.add_seconds("admission_seconds", admission_started);
             self.count_writes(&loaded.ports);
             admitted.map_err(|error| {
@@ -534,17 +673,23 @@ impl RunCore {
                     error.into_error()
                 }
             })?;
-            self.evaluate(&mut loaded.workbook, &loaded.flag)?;
+            let evaluation_start = self.state().invocations.len();
+            self.evaluate(&mut workbook, &loaded.flag)?;
             let caller = stack.last().map(String::as_str).unwrap_or_default();
-            self.solve(&mut loaded.workbook, &loaded.flag, caller)?;
-            let matrix = read_typed_matrix(&loaded.workbook, &location.range).map_err(PortError::into_error)?;
+            self.solve(&mut workbook, &loaded.flag, caller)?;
+            let matrix = read_typed_matrix(&workbook, &location.range).map_err(PortError::into_error)?;
             if matrix.iter().flatten().any(|value| matches!(value, LiteralValue::Pending)) {
                 return Err(ModelCallError::infrastructure("RuntimeError", "child evaluation returned Pending"));
             }
+            if let Some(serial) = loaded.entry {
+                let mut state = self.state();
+                let state = &mut *state;
+                state.reuse.record_evaluation(serial, &state.invocations, stack, evaluation_start);
+            }
             Ok(matrix)
         })();
-        self.release(loaded.id, &loaded.flag);
-        drop(loaded);
+        // This child is no longer evaluating; the watchdog stops watching it.
+        self.release_loaded(loaded);
         if result.is_ok() {
             self.add_seconds("child_seconds", started);
         }
@@ -591,6 +736,24 @@ impl RunCore {
         }
         self.closed.store(true, Ordering::SeqCst);
         self.release_all();
+        // `_release_sessions()`: anything still lent out goes back (without a
+        // port session, which the next acquire rebuilds).
+        if let Some(pool) = &self.pool {
+            let acquired = std::mem::take(&mut self.state().reuse.acquired);
+            for serial in acquired {
+                pool.release(serial, None);
+            }
+        }
+    }
+
+    /// The sealed invocation list (`sealed_invocations`).
+    pub(crate) fn sealed_invocations(&self) -> Vec<ModelCallEvent> {
+        let state = self.state();
+        state.reuse.seal(&state.invocations)
+    }
+
+    pub(crate) fn session_reuse(&self) -> Map<String, Value> {
+        self.state().reuse.report()
     }
 }
 
@@ -631,6 +794,10 @@ impl SolveModel for WorkbookSolveModel<'_> {
             }
             Err(other) => Err(ModelCallError::infrastructure("RuntimeError", other.to_string())),
         }
+    }
+
+    fn get_formula(&self, sheet: &str, row: u32, col: u32) -> Result<Option<String>, ModelCallError> {
+        Ok(self.workbook.get_formula(sheet, row, col))
     }
 
     fn defined_ranges(&self) -> Result<Vec<DefinedRange>, ModelCallError> {
@@ -696,6 +863,7 @@ impl ChildEvaluator for SubRequestEvaluator {
             context,
             self.source.clone(),
             self.compiled.clone(),
+            None,
             request.cancel.clone(),
         ));
         let watchdog = core.start_watchdog();
@@ -727,6 +895,7 @@ pub struct ModelSession {
     compiled_child: Option<Arc<dyn CompiledChildHook>>,
     cancel: CancelToken,
     source: Arc<dyn WorkbookSource>,
+    pool: Option<Arc<RetainedPool>>,
     report_hook: Option<Arc<dyn ReportHook>>,
     core: Option<Arc<RunCore>>,
     workbook: Option<SharedWorkbook>,
@@ -742,6 +911,7 @@ impl ModelSession {
             compiled_child: None,
             cancel: CancelToken::new(),
             source: Arc::new(PathWorkbookSource),
+            pool: None,
             report_hook: None,
             core: None,
             workbook: None,
@@ -762,7 +932,25 @@ impl ModelSession {
         self
     }
 
-    /// Report capture for `operation = report`.
+    /// Run on a retained model's workbooks (the Python pool's lease): loads
+    /// go through its pool and use its loader.
+    pub fn with_retained(mut self, retained: &RetainedModel) -> Self {
+        self.set_retained(Some(retained));
+        self
+    }
+
+    pub fn set_retained(&mut self, retained: Option<&RetainedModel>) {
+        match retained {
+            Some(retained) => {
+                self.pool = Some(retained.pool.clone());
+                self.source = retained.source.clone();
+            }
+            None => self.pool = None,
+        }
+    }
+
+    /// Report capture for `operation = report` (and inspection for
+    /// `operation = diagnostic`).
     pub fn with_report_hook(mut self, hook: Arc<dyn ReportHook>) -> Self {
         self.report_hook = Some(hook);
         self
@@ -789,7 +977,8 @@ impl ModelSession {
     }
 
     /// The parent workbook of the last `calculate` (evaluated state), for
-    /// report capture and inspection after the run.
+    /// report capture and inspection after the run. With a retained model
+    /// this is the pool's workbook: read it before the next request.
     pub fn workbook(&self) -> Option<&SharedWorkbook> {
         self.workbook.as_ref()
     }
@@ -824,6 +1013,7 @@ impl ModelSession {
             self.context.clone(),
             self.source.clone(),
             self.compiled_child.clone(),
+            self.pool.clone(),
             self.cancel.clone(),
         ));
         core.init_prefetch(self.evaluator());
@@ -832,9 +1022,13 @@ impl ModelSession {
         self.effective_inputs = OrderedMap::default();
         self.failure = None;
         let watchdog = core.start_watchdog();
-        let result = self.run(&core, inputs);
+        let mut parent: Option<Loaded> = None;
+        let result = self.run(&core, inputs, &mut parent);
         if let Some(watchdog) = watchdog {
             watchdog.stop();
+        }
+        if let Some(parent) = parent.take() {
+            core.release_loaded(parent);
         }
         core.close();
         if let Err(error) = &result {
@@ -852,21 +1046,26 @@ impl ModelSession {
         }
     }
 
-    fn run(&mut self, core: &Arc<RunCore>, inputs: &[(String, WireValue)]) -> Result<CalculationResult, ModelCallError> {
+    fn run(
+        &mut self,
+        core: &Arc<RunCore>,
+        inputs: &[(String, WireValue)],
+        parent: &mut Option<Loaded>,
+    ) -> Result<CalculationResult, ModelCallError> {
         let started = Instant::now();
         let package = self.package.clone();
         let spec = &package.parent;
         let identity = spec.model_identity();
         let stack = vec![identity.clone()];
-        let Loaded { workbook, mut ports, flag, .. } = core.load(spec, &stack)?;
-        let shared: SharedWorkbook = Arc::new(RwLock::new(workbook));
+        let loaded = parent.insert(core.load(spec, &stack)?);
+        let shared = loaded.workbook.clone();
+        let flag = loaded.flag.clone();
         self.workbook = Some(shared.clone());
-        let write_guard = || shared.write().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let admission_started = Instant::now();
-        let effective = ports.write_scenario(&mut write_guard(), spec, inputs, true);
+        let effective = loaded.ports.write_scenario(&mut write(&shared), spec, inputs, true);
         core.add_seconds("admission_seconds", admission_started);
-        core.count_writes(&ports);
+        core.count_writes(&loaded.ports);
         let effective = effective.map_err(PortError::into_error)?;
         self.effective_inputs =
             OrderedMap(effective.iter().map(|(key, value)| (key.clone(), wire_to_port_value(value))).collect());
@@ -874,16 +1073,19 @@ impl ModelSession {
         let report = (self.context.operation == Operation::Report).then(|| self.report_hook.clone()).flatten();
         if let Some(hook) = &report {
             hook.prepare(&shared)?;
-            if let Some(record) = ports.write_record.as_mut() {
+            if let Some(record) = loaded.ports.write_record.as_mut() {
+                // Report condition formulas are written outside the port
+                // surface; the record no longer vouches for this workbook.
                 record.clear();
             }
         }
-        core.evaluate(&mut write_guard(), &flag)?;
-        core.solve(&mut write_guard(), &flag, &identity)?;
+        core.evaluate(&mut write(&shared), &flag)?;
+        core.solve(&mut write(&shared), &flag, &identity)?;
 
         let capture_started = Instant::now();
         let (effective_inputs, typed_outputs, outputs) = {
-            let mut workbook = write_guard();
+            let mut workbook = write(&shared);
+            let ports = &mut loaded.ports;
             let effective = ports.read_inputs(&mut workbook, spec).map_err(PortError::into_error)?;
             let typed = ports.read_typed_outputs(&mut workbook, spec).map_err(PortError::into_error)?;
             let outputs = ports
@@ -894,9 +1096,9 @@ impl ModelSession {
         self.effective_inputs = effective_inputs.clone();
         {
             let mut state = core.state();
-            state.diagnostics.extend(ports.ignored_inputs.iter().map(|name| format!("ignored_input:{name}")));
+            state.diagnostics.extend(loaded.ports.ignored_inputs.iter().map(|name| format!("ignored_input:{name}")));
             if self.context.operation == Operation::Report {
-                state.diagnostics.extend(ports.defaulted_inputs.iter().map(|name| format!("defaulted_input:{name}")));
+                state.diagnostics.extend(loaded.ports.defaulted_inputs.iter().map(|name| format!("defaulted_input:{name}")));
             }
         }
         if let Some(hook) = &report {
@@ -904,18 +1106,32 @@ impl ModelSession {
             core.state().diagnostics.extend(notes);
         }
         core.add_seconds("capture_seconds", capture_started);
-        let mut state = core.state();
-        state.timings.set(timing_keys::TOTAL_SECONDS, TimingValue::Seconds(started.elapsed().as_secs_f64()));
+        if self.context.operation == Operation::Diagnostic
+            && let Some(hook) = self.report_hook.clone().filter(|hook| hook.inspects())
+        {
+            let inspection_started = Instant::now();
+            hook.inspect(&shared)?;
+            core.add_seconds("inspection_seconds", inspection_started);
+            core.check_deadline()?;
+        }
+        core.state().timings.set(timing_keys::TOTAL_SECONDS, TimingValue::Seconds(started.elapsed().as_secs_f64()));
+        let invocations = core.sealed_invocations();
+        if let Some(pool) = &self.pool
+            && pool.retain_scenarios()
+        {
+            core.state().reuse.retain_scenario(pool, &invocations);
+        }
+        let state = core.state();
         let result = CalculationResult {
             outputs,
             typed_outputs,
             effective_inputs,
-            invocations: state.invocations.clone(),
+            invocations,
             faults: state.faults(),
             timings: state.timings.clone(),
             solvers: state.solvers.clone(),
             diagnostics: state.diagnostics.clone(),
-            session_reuse: Map::new(),
+            session_reuse: state.reuse.report(),
             call_memo: None,
             compiled: Map::new(),
         };
@@ -924,20 +1140,15 @@ impl ModelSession {
     }
 
     /// Evidence for a failed run (`runtime.calculate`'s except branch): the
-    /// effective inputs so far, the invocations, goal-seek records, timings,
-    /// memo and compiled reports, and the diagnostics with the failure line
-    /// (`Type: message`) appended.
+    /// effective inputs so far, the sealed invocations, goal-seek records,
+    /// timings, session reuse, memo and compiled reports, and the diagnostics
+    /// with the failure line (`Type: message`) appended.
     pub fn partial_result(&self) -> CalculationResult {
         let Some(core) = &self.core else { return CalculationResult::default() };
-        let (invocations, faults, timings, solvers, mut diagnostics) = {
+        let invocations = core.sealed_invocations();
+        let (faults, timings, solvers, mut diagnostics, session_reuse) = {
             let state = core.state();
-            (
-                state.invocations.clone(),
-                state.faults(),
-                state.timings.clone(),
-                state.solvers.clone(),
-                state.diagnostics.clone(),
-            )
+            (state.faults(), state.timings.clone(), state.solvers.clone(), state.diagnostics.clone(), state.reuse.report())
         };
         if let Some(failure) = &self.failure {
             diagnostics.push(failure_line(failure));
@@ -951,11 +1162,87 @@ impl ModelSession {
             timings,
             solvers,
             diagnostics,
-            session_reuse: Map::new(),
+            session_reuse,
             call_memo: core.memo_report(),
             compiled: core.compiled_report(),
         }
     }
+}
+
+/// One model of a `RetainedModel::warm` (the loop body of
+/// `SessionPool.warm`): fresh load, admit, bind a warm run of its own, write
+/// the default scenario, evaluate, unbind, release. Returns the warm run's
+/// events and timings.
+pub(crate) fn warm_model(
+    retained: &RetainedModel,
+    spec: &ModelSpec,
+    inputs: &[(String, WireValue)],
+) -> Result<(Vec<ModelCallEvent>, Timings), ModelCallError> {
+    let mut context = retained.context.clone();
+    context.operation = Operation::Client;
+    context.flags.prefetch = false;
+    context.deadline = None;
+    let core = Arc::new(RunCore::new(
+        retained.package.clone(),
+        context,
+        retained.source.clone(),
+        None,
+        Some(retained.pool.clone()),
+        CancelToken::new(),
+    ));
+    let flag = Arc::new(AtomicBool::new(false));
+    let (workbook, mut ports, slot) = core.open_fresh(spec, None, &flag)?;
+    let shared: SharedWorkbook = Arc::new(RwLock::new(workbook));
+    let restore = {
+        let mut guard = write(&shared);
+        let model = WorkbookSolveModel { workbook: &mut guard, flag: flag.clone(), cancelled: None };
+        solver_written_cells(&model)
+    };
+    let restore = match restore {
+        Ok(restore) => restore,
+        Err(error) => {
+            slot.unbind();
+            return Err(error);
+        }
+    };
+    let admission = Admission { workbook: shared.clone(), slot: slot.clone(), flag: flag.clone(), restore };
+    let serial = match retained.pool.admit(spec, retained.context.random_seed, admission) {
+        Ok(serial) => serial,
+        Err(error) => {
+            slot.unbind();
+            return Err(error);
+        }
+    };
+    slot.bind(ModelCallRouter::bound(Arc::clone(&core), vec![spec.model_identity()], flag.clone()));
+    let outcome = (|| {
+        let mut guard = write(&shared);
+        ports.write_scenario(&mut guard, spec, inputs, true).map_err(PortError::into_error)?;
+        flag.store(false, Ordering::SeqCst);
+        match guard.evaluate_all_cancellable(EngineCancel::from_flag(flag.clone())) {
+            Ok(_) => {}
+            Err(error) => return Err(engine_error(error)),
+        }
+        if let Some(first) = core.state().first_fault_error() {
+            return Err(ModelCallError::infrastructure(
+                "RuntimeError",
+                format!("child callback infrastructure fault while warming: {first}"),
+            ));
+        }
+        Ok(())
+    })();
+    // The warm owns no workbook once it ends: the binding stays registered,
+    // pointing at nothing, until a request binds it.
+    slot.unbind();
+    core.close();
+    if let Err(error) = outcome {
+        retained.pool.discard(serial);
+        return Err(error);
+    }
+    retained.pool.release(serial, Some(ports));
+    let state = core.state();
+    let events = state.invocations.clone();
+    retained.pool.set_warm_invocations(serial, events.clone(), false);
+    Ok((events, state.timings.clone()))
 }
 
 /// `type(exc).__name__ + ': ' + str(exc)` for a request failure.

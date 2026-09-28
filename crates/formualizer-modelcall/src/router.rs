@@ -7,12 +7,20 @@
 //! Reentrancy: the handler holds only the request core and the cancel flag of
 //! the workbook it is registered on. It never reads, writes or evaluates that
 //! workbook; after a fault it sets the flag, the one permitted action.
+//!
+//! Run-state seam (CP1 finding 2): an in-line child is evaluated on the SAME
+//! request core (`RunCore`: invocations, memo, faults, timings shared through
+//! `Mutex<RunState>`), with the caller stack extended by the child. Rule: no
+//! run-state lock (state, prefetch, pool) is held across `evaluate`,
+//! `calculate_child` or a hook call; each lock is taken for one bookkeeping
+//! step and dropped. The only lock held across an evaluation is the evaluated
+//! workbook's own `RwLock`, and a handler never touches that workbook.
 
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_workbook::{CustomFnHandler, CustomFnOptions, Workbook};
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{INFRASTRUCTURE_ERROR_MESSAGE, UNBOUND_ERROR_MESSAGE};
@@ -258,22 +266,66 @@ impl ModelCallRouter {
     }
 }
 
-/// The registered handler: one router per loaded workbook.
+/// The call function's binding on one loaded workbook (`RouterBinding`): the
+/// registration outlives every run; a run only swaps the router behind it.
+/// Unbound, a call answers `#CALC!` (`child router unbound`).
+#[derive(Default)]
+pub struct RouterSlot(Mutex<Option<ModelCallRouter>>);
+
+impl std::fmt::Debug for RouterSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RouterSlot").field("bound", &self.is_bound()).finish()
+    }
+}
+
+impl RouterSlot {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, Option<ModelCallRouter>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `RouterBinding.bind(runtime, stack)`.
+    pub(crate) fn bind(&self, router: ModelCallRouter) {
+        *self.guard() = Some(router);
+    }
+
+    /// `RouterBinding.unbind()`: also breaks the workbook -> router -> run cycle.
+    pub fn unbind(&self) {
+        *self.guard() = None;
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.guard().is_some()
+    }
+
+    /// The bound router, cloned out so no lock is held across the call.
+    fn router(&self) -> Option<ModelCallRouter> {
+        self.guard().clone()
+    }
+}
+
+/// The registered handler: one binding per loaded workbook.
 struct CallHandler {
-    router: ModelCallRouter,
+    slot: Arc<RouterSlot>,
 }
 
 impl CustomFnHandler for CallHandler {
     fn call(&self, args: &[LiteralValue]) -> Result<LiteralValue, ExcelError> {
-        Ok(self.router.call(args))
+        Ok(match self.slot.router() {
+            Some(router) => router.call(args),
+            None => error_value(ExcelErrorKind::Calc, UNBOUND_ERROR_MESSAGE),
+        })
     }
 }
 
 /// Register the call function under `MDL.CALLMODEL` and every imported alias
 /// (`RouterBinding.register`): `min_args = 3`, no maximum, not volatile,
 /// deterministic, not thread-safe. An occupied name is unregistered first.
-pub(crate) fn register_call_handler(workbook: &mut Workbook, router: ModelCallRouter) -> Result<(), ModelCallError> {
-    let handler: Arc<dyn CustomFnHandler> = Arc::new(CallHandler { router });
+pub(crate) fn register_call_handler(workbook: &mut Workbook, slot: Arc<RouterSlot>) -> Result<(), ModelCallError> {
+    let handler: Arc<dyn CustomFnHandler> = Arc::new(CallHandler { slot });
     for name in call_function_names() {
         let _ = workbook.unregister_custom_function(name);
         let options = CustomFnOptions {

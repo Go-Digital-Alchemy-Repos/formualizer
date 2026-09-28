@@ -516,7 +516,8 @@ fn failure(
 }
 
 fn literal_json(value: &LiteralValue) -> Value {
-    serde_json::to_value(value).unwrap_or(Value::Null)
+    // Lane I (CP1 finding 3): receipt form, not the derived serde.
+    crate::receipt::plain_value(value)
 }
 
 /// The goal-seek blocks: workbook-scope names with the import prefix
@@ -529,6 +530,42 @@ pub fn goal_seek_blocks(ranges: &[DefinedRange]) -> Vec<DefinedRange> {
         .collect();
     blocks.sort_by(|left, right| left.name.cmp(&right.name));
     blocks
+}
+
+/// `sessions.solver_written_cells`' cell set (Lane I): every cell a goal
+/// seek can write, sorted `(sheet, row, col)`: each block's rectangle and, for
+/// a two-column block, its `By changing` cell when it resolves (the last
+/// `by changing` label row wins, as in Python). Blocks without a bounded
+/// rectangle are passed over; an unresolvable reference is skipped (the goal
+/// seek skips that block for the same reason).
+pub fn goal_seek_written_cells(model: &dyn SolveModel) -> Result<Vec<(String, u32, u32)>, ModelCallError> {
+    let ranges = model.defined_ranges()?;
+    let mut cells: Vec<(String, u32, u32)> = Vec::new();
+    for block in goal_seek_blocks(&ranges) {
+        let Some(range) = block.range.as_ref() else { continue };
+        for row in range.start_row..=range.end_row {
+            for col in range.start_col..=range.end_col {
+                cells.push((range.sheet.clone(), row, col));
+            }
+        }
+        if i64::from(range.end_col) - i64::from(range.start_col) != 1 {
+            continue;
+        }
+        let mut change = None;
+        for row in range.start_row..=range.end_row {
+            let label = model.get_value(&range.sheet, row, range.start_col).ok().and_then(|value| normalized_label(&value));
+            if label == Some("by changing") {
+                change = Some(Location::cell(&range.sheet, row, range.start_col + 1));
+            }
+        }
+        let Some(change) = change else { continue };
+        if let Ok(location) = resolve_reference(model, &ranges, &change, &range.sheet) {
+            cells.push((location.sheet, location.row, location.col));
+        }
+    }
+    cells.sort();
+    cells.dedup();
+    Ok(cells)
 }
 
 /// Run every goal-seek block of an evaluated workbook, in name order.
