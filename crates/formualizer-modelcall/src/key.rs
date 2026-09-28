@@ -94,7 +94,7 @@ pub fn callback_inputs(block: &LiteralValue, tail: &[LiteralValue]) -> Result<In
             pairs.push((folded, value.clone()));
         }
     }
-    if tail.len() % 2 != 0 {
+    if !tail.len().is_multiple_of(2) {
         return Err(ModelCallError::routing("child tail must contain name/value pairs"));
     }
     let mut seen: Vec<String> = Vec::new();
