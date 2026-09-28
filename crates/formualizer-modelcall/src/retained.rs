@@ -122,6 +122,27 @@ pub(crate) struct Acquired {
     pub(crate) warm_invocations: Vec<ModelCallEvent>,
 }
 
+/// What the run records about an acquire once the re-entry succeeded.
+pub(crate) struct ReuseNote {
+    serial: u64,
+    identity: String,
+    warmed: bool,
+    inherited: bool,
+    warm_invocations: Vec<ModelCallEvent>,
+}
+
+impl Acquired {
+    pub(crate) fn note(&self) -> ReuseNote {
+        ReuseNote {
+            serial: self.serial,
+            identity: self.identity.clone(),
+            warmed: self.warmed,
+            inherited: self.inherited,
+            warm_invocations: self.warm_invocations.clone(),
+        }
+    }
+}
+
 /// What `admit` records for a fresh load.
 pub(crate) struct Admission {
     pub(crate) workbook: SharedWorkbook,
@@ -533,17 +554,19 @@ impl ReuseState {
         self.track_evaluations(serial, identity, false, &[]);
     }
 
-    pub(crate) fn note_reused(&mut self, acquired: &Acquired) {
-        self.acquired.push(acquired.serial);
-        self.entered.push((acquired.serial, acquired.identity.clone()));
-        if acquired.inherited {
-            self.inherited.push(acquired.warm_invocations.clone());
+    /// After a successful re-entry (`load`'s pool branch).
+    pub(crate) fn note_reused(&mut self, acquired: ReuseNote) {
+        let ReuseNote { serial, identity, warmed, inherited, warm_invocations } = acquired;
+        self.acquired.push(serial);
+        self.entered.push((serial, identity.clone()));
+        self.track_evaluations(serial, &identity, inherited, &warm_invocations);
+        if inherited {
+            self.inherited.push(warm_invocations);
         }
-        self.track_evaluations(acquired.serial, &acquired.identity, acquired.inherited, &acquired.warm_invocations);
-        if acquired.warmed {
-            self.warmed.push(acquired.identity.clone());
+        if warmed {
+            self.warmed.push(identity);
         } else {
-            self.reused.push(acquired.identity.clone());
+            self.reused.push(identity);
         }
     }
 

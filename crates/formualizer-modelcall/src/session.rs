@@ -382,14 +382,14 @@ impl RunCore {
             && let Some(acquired) = pool.acquire(spec, self.context.random_seed)?
         {
             let serial = acquired.serial;
-            self.state().reuse.note_reused(&acquired);
+            let note = acquired.note();
             match self.reenter(acquired, spec, stack) {
                 Ok(loaded) => {
+                    self.state().reuse.note_reused(note);
                     self.add_seconds("load_seconds", started);
                     return Ok(loaded);
                 }
                 Err(error) => {
-                    self.state().reuse.note_released(serial);
                     pool.discard(serial);
                     return Err(error);
                 }
