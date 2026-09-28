@@ -32,6 +32,7 @@ fn a1(row: u32, col: u32) -> String {
     format!("'{SHEET}'!{}{row}", (b'A' + u8::try_from(col - 1).unwrap()) as char)
 }
 
+#[expect(clippy::too_many_arguments, reason = "one argument per location field")]
 fn location(row: u32, col: u32, end_row: u32, end_col: u32, name: &str, key: &str, port_id: &str, shape: &str) -> Value {
     json!({"sheet": SHEET, "start_row": row, "start_col": col, "end_row": end_row, "end_col": end_col,
            "name": name, "key": key, "port_id": port_id, "shape": shape, "date_system": 1900, "date_fields": []})

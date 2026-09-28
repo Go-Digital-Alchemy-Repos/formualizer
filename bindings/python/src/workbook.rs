@@ -368,6 +368,7 @@ impl PyWorkbook {
     ///     print(wb.sheet_names)
     /// ```
     #[classmethod]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (path, strategy=None, backend=None, *, path_source=None, mode=None, config=None, span_evaluation=None))]
     pub fn load_path(
         _cls: &Bound<'_, pyo3::types::PyType>,
