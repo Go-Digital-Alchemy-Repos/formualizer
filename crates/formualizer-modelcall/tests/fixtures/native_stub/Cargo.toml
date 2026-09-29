@@ -1,0 +1,15 @@
+[package]
+name = "native_stub"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Hand-written CV_NATIVE_ABI 1 module for formualizer-modelcall's native_compiled tests (no pyo3, no generated code)"
+
+# Its own workspace: the fork's default build never compiles it. The test
+# `tests/native_compiled.rs` builds it with `cargo build --manifest-path` into
+# CARGO_TARGET_TMPDIR, once per workbook identity (STUB_WORKBOOK_SHA).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"

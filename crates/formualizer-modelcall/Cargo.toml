@@ -22,3 +22,5 @@ sheetport-spec = { path = "../sheetport-spec" }
 sha2 = "0.10"
 # Lane B: sibling-plan formula scan (tokenizer).
 formualizer-parse = { path = "../formualizer-parse" }
+# Architecture B (GOD-383 WP2): native compiled modules (pyo3-free cdylibs).
+libloading = "0.8"
