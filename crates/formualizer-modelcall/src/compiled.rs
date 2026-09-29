@@ -1099,11 +1099,19 @@ fn default_literal(value: &Value) -> Option<LiteralValue> {
 }
 
 /// adapter.py `eligible_ports` (the checks that need no module tables).
-fn eligible(spec: &ModelSpec) -> Result<(), &'static str> {
+///
+/// `parent`: a whole-model parent run (`CompiledParent::run`) skips the
+/// `descriptor_edits` check, as parity `whole_model.ParentArtifact.refusal`
+/// does: a parent module is gated in parent mode against the engine parent
+/// with the descriptor's normalization edits applied (the compiler emits the
+/// same edits as literals), so its manifest's clean gate already covers
+/// them. A child keeps the check (adapter.py: the generator compiled the raw
+/// bytes).
+fn eligible(spec: &ModelSpec, parent: bool) -> Result<(), &'static str> {
     if spec.date_system() != Some(1900) {
         return Err("date_system");
     }
-    if spec.descriptor.get("calculation_normalizations").is_some_and(truthy) {
+    if !parent && spec.descriptor.get("calculation_normalizations").is_some_and(truthy) {
         return Err("descriptor_edits");
     }
     if !spec.goal_seek.is_empty() {
@@ -1417,7 +1425,7 @@ impl NativeCompiledHook {
         output: Option<&PortLocation>,
     ) -> Result<Prepared, &'static str> {
         let module = self.module(&spec.workbook_sha256).map_err(|decline| decline.reason())?;
-        eligible(spec)?;
+        eligible(spec, output.is_none())?;
         let plan = port_plan(spec, &module.meta)?;
         let outputs = match output {
             Some(location) => vec![(casefold(&location.key), output_rect(&module.meta, location)?)],

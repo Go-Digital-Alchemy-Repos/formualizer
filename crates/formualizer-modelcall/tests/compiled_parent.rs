@@ -361,11 +361,9 @@ fn report_run_prepares_only_an_engine_parent_and_captures_compiled_cells() {
 
 #[test]
 fn static_refusals_record_an_engine_route_without_running_the_module() {
-    let normalization = json!({"descriptor": {"calculation_normalizations": [{"sheet": SHEET, "row": 9, "col": 9, "formula": "=1"}]}});
-    let cases: [(Operation, bool, Value, &str); 3] = [
+    let cases: [(Operation, bool, Value, &str); 2] = [
         (Operation::Report, false, json!({}), "engine:report_conditions"),
         (Operation::Diagnostic, true, json!({}), "engine:operation:diagnostic"),
-        (Operation::Client, true, normalization, "engine:calculation_normalizations"),
     ];
     for (operation, conditions_ok, extra, route) in cases {
         let package = package(&extra);
@@ -380,6 +378,20 @@ fn static_refusals_record_an_engine_route_without_running_the_module() {
         assert_eq!(compiled.get("parent_loaded"), Some(&json!(true)), "{route}");
         assert_eq!(stub.runs.load(Ordering::SeqCst), 0, "{route}");
     }
+}
+
+#[test]
+fn descriptor_normalizations_do_not_refuse_a_compiled_parent() {
+    // The parent module is gated against the engine parent with the edits applied
+    // (parity whole_model serves such a parent too); only a child refuses them.
+    let normalization = json!({"descriptor": {"calculation_normalizations": [{"sheet": SHEET, "row": 9, "col": 9, "formula": "=1"}]}});
+    let package = package(&normalization);
+    let source = Arc::new(Source::default());
+    let stub = Arc::new(StubParent::new());
+    let result =
+        session(&package, Operation::Client, &source).with_compiled_parent(stub.clone()).calculate(&inputs()).unwrap();
+    assert_eq!(result.compiled.get("parent"), Some(&json!("compiled")));
+    assert_eq!(stub.runs.load(Ordering::SeqCst), 1);
 }
 
 #[test]

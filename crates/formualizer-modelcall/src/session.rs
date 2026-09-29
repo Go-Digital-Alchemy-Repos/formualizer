@@ -1236,10 +1236,11 @@ impl ModelSession {
         if spec.date_system() != Some(1900) {
             return refused("date_system");
         }
-        let normalizations = spec.descriptor.get("calculation_normalizations").and_then(Value::as_array);
-        if normalizations.is_some_and(|edits| !edits.is_empty()) {
-            return refused("calculation_normalizations");
-        }
+        // No `calculation_normalizations` refusal (integration, 2026-09-29): a
+        // compiled parent is gated in parent mode against the engine parent
+        // with the descriptor's edits applied, as parity whole_model serves a
+        // gated parent artifact; the edits stay a child refusal
+        // (`descriptor_edits`, compiled.rs `eligible`).
         let admitted_inputs = spec.inputs.iter().all(|(_, location)| matches!(location.shape.as_str(), "scalar" | "range"));
         let readable_outputs =
             spec.outputs.iter().all(|(_, location)| matches!(location.shape.as_str(), "scalar" | "record" | "range"));

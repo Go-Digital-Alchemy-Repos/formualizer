@@ -501,8 +501,9 @@ A compiled parent serves `report` only when the template's `condition_plans`
 has no non-simple-equality expressions (then `conditional_results` is `{}` per
 sheet); otherwise it falls back with `engine:report_conditions`. `diagnostic`
 runs fall back too (no compiled `inspect_cell`). Compiled parents are admitted
-only without goal seek, without `calculation_normalizations`, with
-`date_system == 1900`; any decline discards the attempt, records
+only without goal seek and with `date_system == 1900` (descriptor
+`calculation_normalizations` do not refuse a parent: see "Compiled parent in the
+session"); any decline discards the attempt, records
 `fallback:<reason>` under a `parent` key of `compiled.routes` and builds a
 fresh engine `RunCore`. A compiled parent takes no pool entry.
 
@@ -532,8 +533,7 @@ before any engine parent is loaded, in this order:
    only report rule, there is no per-call override), or with
    a report hook that cannot capture compiled cells -> `report_capture`;
    operation `diagnostic` -> `operation:diagnostic`; `date_system` (not
-   1900); `calculation_normalizations` (the descriptor lists edits the module
-   was not built with); `port_contract` (a record or table input, or a
+   1900); `port_contract` (a record or table input, or a
    `table` output). A range input is passed as an array of its full declared
    rectangle (the host's ranged-port law).
 3. Admission without a workbook (`ports::admit_scenario`, the engine path's
@@ -656,7 +656,11 @@ names another workbook `key_mismatch`. A hook remembers each sha's outcome.
 
 **Eligibility and admission** (adapter.py order, `engine:<reason>`):
 `date_system` (not 1900), `descriptor_edits` (truthy
-`calculation_normalizations`), `solvers` (goal seek), `port_contract` (the
+`calculation_normalizations`; child calls only: a parent module is gated in
+parent mode against the engine parent with the edits applied, as parity
+`whole_model` serves a gated parent, so neither the session plan nor
+`CompiledParent::run` refuses a parent on them; integration 2026-09-29),
+`solvers` (goal seek), `port_contract` (the
 declared inputs are not exactly the module's `port_names` case-folded one to
 one, each a scalar `{"type": "any"}` port, or a ranged port with schema
 `{"kind": "range", "cell_type": "any"}`, no headers, whose rectangle is the
