@@ -564,16 +564,24 @@ before any engine parent is loaded, in this order:
    read -> `fallback:projection`.
 
 **Temporal typing rule (F6).** The compiled store holds serials; the engine's
-`get_value` types a date-formatted cell through its temporal egress. For the
-receipt the session types a Number as the engine would where the spec says
-what the cell is: an input the admission wrote as a `date` / `datetime` reads
-back as `Date` / `DateTime` (the engine formats the cell on that write); a
-Number in a location's `date_fields` (cells with a date number format,
-`package.py`) is `Date` for a whole serial and `DateTime` otherwise, through
-the engine's own `try_serial_to_date_for` / `try_serial_to_datetime_for`
-(`ports::engine_temporal`). Known gaps: the format's class (Date, DateTime,
-Time) is not in the spec, and a formula cell whose date format the engine
-derives (no style) is not in `date_fields`; such cells stay Numbers. Lane D's
+`get_value` types a Number through its temporal egress by the cell's
+effective format class. That class is not the cell's style: a value cell uses
+its loaded number format, a formula cell only the format its formula derives
+(its own style is ignored: `=DATE(...)` in a General cell is a date, `=Name`
+in an `mm-dd-yy` cell is a Number), and a write sets it (a `date` / `datetime`
+write formats the cell, any other write clears its style). The session
+reproduces this (`ports::type_temporal`): a cell the admission wrote
+(`ports::written_cells`, the native write's split) reads back as the written
+kind; every other cell follows the location's `engine_temporal_fields`
+(parity `engine_temporal.py`, derived from the workbook at package compile:
+`date` -> `Date`, `datetime` -> `DateTime` through the engine's own
+`try_serial_to_date_for` / `try_serial_to_datetime_for`, and a Number in an
+`unknown` cell, whose class depends on values (`IF` picks a branch's format)
+or is a time, declines with `fallback:projection`). A written `time`, or a
+temporal in a value the native write cannot split, declines too. A location
+without `engine_temporal_fields` (an older package) keeps the style rule:
+a Number in `date_fields` is `Date` for a whole serial and `DateTime`
+otherwise (`TemporalHint::DateCell`). Lane D's
 serial counts from 1899-12-30 for every date, so a date before 1900-03-01
 reaches the module one day above the engine's serial.
 

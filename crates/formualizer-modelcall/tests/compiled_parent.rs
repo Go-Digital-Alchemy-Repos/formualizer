@@ -449,3 +449,68 @@ fn admission_split_matches_write_scenario() {
     let from_write = written.write_scenario(&mut left, spec, &bad, true).unwrap_err();
     assert_eq!(admit_scenario(spec, &bad, true).unwrap_err(), from_write);
 }
+
+/// The package with the parent's `amount` input and `result` output styled
+/// as dates (`date_fields`), and `result`'s `engine_temporal_fields` set.
+fn styled_package(result_fields: Option<Value>) -> Arc<ModelPackage> {
+    let mut parent = spec_json("parent", true, &json!({}));
+    parent["inputs"]["amount"]["date_fields"] = json!([[0, 0]]);
+    parent["outputs"]["result"]["date_fields"] = json!([[0, 0]]);
+    if let Some(fields) = result_fields {
+        parent["outputs"]["result"]["engine_temporal_fields"] = fields;
+    }
+    Arc::new(
+        serde_json::from_value(json!({
+            "package_id": "synthetic",
+            "parent": parent,
+            "children": {"child": spec_json("child", false, &json!({}))},
+            "child_routes": {"rates/child": "child"},
+        }))
+        .unwrap(),
+    )
+}
+
+fn arms(package: &Arc<ModelPackage>) -> (CalculationResult, CalculationResult) {
+    let compiled = session(package, Operation::Client, &Arc::new(Source::default()))
+        .with_compiled_parent(Arc::new(StubParent::new()))
+        .calculate(&inputs())
+        .expect("compiled arm");
+    let engine = session(package, Operation::Client, &Arc::new(Source::default())).calculate(&inputs()).expect("engine arm");
+    (compiled, engine)
+}
+
+/// Engine typing (GOD-383 archB lane X): a Number written into a date-styled
+/// input clears the style, so it reads back a Number; a formula output takes
+/// the format its formula derives (`engine_temporal_fields`), not its style.
+#[test]
+fn compiled_typing_follows_the_engine_not_the_cell_style() {
+    let package = styled_package(Some(json!({"date": [], "datetime": [], "unknown": []})));
+    let (compiled, engine) = arms(&package);
+    assert_eq!(compiled.compiled.get("parent"), Some(&json!("compiled")));
+    assert_same_values(&compiled, &engine);
+    assert_eq!(compiled.effective_inputs.get("amount"), Some(&PortValue::Scalar(LiteralValue::Number(3.0))));
+    assert_eq!(compiled.outputs.get("result"), Some(&PortValue::Scalar(LiteralValue::Number(12.0))));
+    let start = chrono::NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+    assert_eq!(compiled.effective_inputs.get("start"), Some(&PortValue::Scalar(LiteralValue::Date(start))));
+}
+
+/// A Number in a cell whose engine class depends on values declines the
+/// compiled attempt; the engine parent serves the request.
+#[test]
+fn an_unknown_temporal_class_holding_a_number_declines() {
+    let package = styled_package(Some(json!({"unknown": [[0, 0]]})));
+    let (compiled, engine) = arms(&package);
+    assert_eq!(compiled.compiled.get("parent"), Some(&json!("fallback:projection")));
+    assert_same_values(&compiled, &engine);
+}
+
+/// An older package (no `engine_temporal_fields`) keeps the style rule.
+#[test]
+fn a_package_without_engine_temporal_fields_keeps_the_style_rule() {
+    let package = styled_package(None);
+    let (compiled, _) = arms(&package);
+    let day = chrono::NaiveDate::from_ymd_opt(1900, 1, 12).unwrap();
+    assert_eq!(compiled.outputs.get("result"), Some(&PortValue::Scalar(LiteralValue::Date(day))));
+    // The written input follows the write, with or without the field.
+    assert_eq!(compiled.effective_inputs.get("amount"), Some(&PortValue::Scalar(LiteralValue::Number(3.0))));
+}

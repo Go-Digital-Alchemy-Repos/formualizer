@@ -1838,6 +1838,103 @@ fn record_field_names(spec: &ModelSpec, port_id: &str) -> Option<Vec<String>> {
     Some(fields.keys().cloned().collect())
 }
 
+/// Cells of one port rectangle the admission wrote, as `(row, col)` offsets,
+/// each with the temporal hint of the written value (`None`: not a date).
+pub type WrittenCells = HashMap<(usize, usize), Option<TemporalHint>>;
+
+/// The cells a write of `value` to `location` sets, with their hints
+/// (`PortSession::write_changed`'s `port_cells`). A value `port_cells` cannot
+/// split is written whole by SheetPort: every cell of the rectangle, and
+/// `None` (decline) when it holds a temporal. A written `time` is `None`: the
+/// engine types it `Time`, which the compiled typing does not produce.
+pub fn written_cells(location: &PortLocation, value: &WireValue) -> Option<WrittenCells> {
+    let range = &location.range;
+    let Some(cells) = port_cells(location, &location.shape, value) else {
+        if contains_temporal(value) {
+            return None;
+        }
+        return Some(
+            (0..range.rows() as usize).flat_map(|r| (0..range.cols() as usize).map(move |c| ((r, c), None))).collect(),
+        );
+    };
+    let mut written = WrittenCells::with_capacity(cells.len());
+    for ((_, row, col), _, cell) in cells {
+        let hint = match cell {
+            WireValue::Date(_) => Some(TemporalHint::Date),
+            WireValue::DateTime(_) => Some(TemporalHint::DateTime),
+            WireValue::Time(_) => return None,
+            _ => None,
+        };
+        written.insert(((row - range.start_row) as usize, (col - range.start_col) as usize), hint);
+    }
+    Some(written)
+}
+
+fn contains_temporal(value: &WireValue) -> bool {
+    match value {
+        WireValue::Date(_) | WireValue::DateTime(_) | WireValue::Time(_) => true,
+        WireValue::List(items) => items.iter().any(contains_temporal),
+        WireValue::Dict(fields) => fields.0.iter().any(|(_, item)| contains_temporal(item)),
+        _ => false,
+    }
+}
+
+/// `(row, col)` offsets of one class list of `engine_temporal_fields`.
+fn temporal_offsets(fields: &Value, class: &str) -> Option<Vec<(usize, usize)>> {
+    let Some(list) = fields.get(class) else { return Some(Vec::new()) };
+    list.as_array()?
+        .iter()
+        .map(|cell| {
+            let cell = cell.as_array()?;
+            Some((usize::try_from(cell.first()?.as_u64()?).ok()?, usize::try_from(cell.get(1)?.as_u64()?).ok()?))
+        })
+        .collect()
+}
+
+/// Type a compiled grid's serials as the engine's temporal egress would.
+/// Written cells take the written value's kind. The other cells follow the
+/// location's `engine_temporal_fields` (`engine_temporal.py`: the engine's
+/// format class per cell, a formula cell's derived format and not its style):
+/// `date` / `datetime` type a Number, and a Number in an `unknown` cell
+/// declines (`None`): the class there depends on values. A location without
+/// that field (an older package) keeps the style rule: `date_fields` ->
+/// [`TemporalHint::DateCell`].
+fn type_temporal(location: &PortLocation, grid: &mut ChildMatrix, written: &WrittenCells) -> Option<()> {
+    let apply = |grid: &mut ChildMatrix, (r, c): (usize, usize), hint: TemporalHint| {
+        if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+            *cell = engine_temporal(std::mem::replace(cell, LiteralValue::Empty), hint);
+        }
+    };
+    for (&cell, hint) in written {
+        if let Some(hint) = hint {
+            apply(grid, cell, *hint);
+        }
+    }
+    let Some(fields) = location.extra.get("engine_temporal_fields") else {
+        for &(r, c) in &location.date_fields {
+            let cell = (r as usize, c as usize);
+            if !written.contains_key(&cell) {
+                apply(grid, cell, TemporalHint::DateCell);
+            }
+        }
+        return Some(());
+    };
+    for cell in temporal_offsets(fields, "unknown")? {
+        let number = matches!(grid.get(cell.0).and_then(|row| row.get(cell.1)), Some(LiteralValue::Number(_)));
+        if number && !written.contains_key(&cell) {
+            return None;
+        }
+    }
+    for (class, hint) in [("date", TemporalHint::Date), ("datetime", TemporalHint::DateTime)] {
+        for cell in temporal_offsets(fields, class)? {
+            if !written.contains_key(&cell) {
+                apply(grid, cell, hint);
+            }
+        }
+    }
+    Some(())
+}
+
 /// A port's cells (read from a store that is not a workbook, e.g. a compiled
 /// run) as the value SheetPort reads for that port: a scalar is its one
 /// cell, a record its declared `r{r}_c{c}` fields (in the name order SheetPort
@@ -1846,21 +1943,25 @@ fn record_field_names(spec: &ModelSpec, port_id: &str) -> Option<Vec<String>> {
 /// offset inside the rectangle, is `None` (the caller declines).
 ///
 /// Temporal typing (the compiled store holds serials, the engine's
-/// `get_value` types a date-formatted cell through its temporal egress): a
-/// Number in one of the location's `date_fields` (cells whose number format
-/// is a date format, `package.py`) is typed as the engine reads it, see
-/// [`engine_temporal`].
+/// `get_value` types a cell through its temporal egress): see
+/// `type_temporal`; `written` are the cells the admission wrote.
 pub fn port_value_from_grid(spec: &ModelSpec, location: &PortLocation, grid: &ChildMatrix) -> Option<PortValue> {
+    port_value_from_written_grid(spec, location, grid, &WrittenCells::new())
+}
+
+/// [`port_value_from_grid`] for an input rectangle the admission wrote.
+pub fn port_value_from_written_grid(
+    spec: &ModelSpec,
+    location: &PortLocation,
+    grid: &ChildMatrix,
+    written: &WrittenCells,
+) -> Option<PortValue> {
     let range = &location.range;
     if grid.len() != range.rows() as usize || grid.iter().any(|row| row.len() != range.cols() as usize) {
         return None;
     }
     let mut grid = grid.clone();
-    for (r, c) in &location.date_fields {
-        if let Some(cell) = grid.get_mut(*r as usize).and_then(|row| row.get_mut(*c as usize)) {
-            *cell = engine_temporal(std::mem::replace(cell, LiteralValue::Empty), TemporalHint::DateCell);
-        }
-    }
+    type_temporal(location, &mut grid, written)?;
     let cell = |r: usize, c: usize| grid.get(r).and_then(|row| row.get(c)).cloned();
     match location.shape.as_str() {
         "scalar" => cell(0, 0).map(PortValue::Scalar),
@@ -2324,6 +2425,61 @@ mod tests {
         );
         assert!(parent_port_literal(&WireValue::List(vec![WireValue::Int(1)])).is_err());
         assert!(parent_port_literal(&WireValue::Dict(OrderedMap::default())).is_err());
+    }
+
+    #[test]
+    fn type_temporal_follows_engine_temporal_fields_and_writes() {
+        let mut location: PortLocation = serde_json::from_value(serde_json::json!({
+            "sheet": "S", "start_row": 1, "start_col": 1, "end_row": 1, "end_col": 4, "name": "Xoutput_Row",
+            "key": "Row", "port_id": "output_row", "shape": "range", "date_system": 1900,
+            "date_fields": [[0, 0], [0, 1], [0, 2], [0, 3]],
+            "engine_temporal_fields": {"date": [[0, 1]], "datetime": [[0, 2]], "unknown": [[0, 3]]}
+        }))
+        .unwrap();
+        let day = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+        let row = |last: LiteralValue| vec![vec![LiteralValue::Number(45352.0), LiteralValue::Number(45352.5), LiteralValue::Number(45352.0), last]];
+        // Style alone (date_fields) types nothing once the engine classes are known.
+        let mut grid = row(LiteralValue::Text("x".into()));
+        type_temporal(&location, &mut grid, &WrittenCells::new()).unwrap();
+        assert_eq!(grid[0][0], LiteralValue::Number(45352.0));
+        assert_eq!(grid[0][1], LiteralValue::Date(day), "Date class truncates like try_serial_to_date_for");
+        assert_eq!(grid[0][2], LiteralValue::DateTime(day.and_hms_opt(0, 0, 0).unwrap()));
+        // A Number where the class depends on values: decline.
+        assert!(type_temporal(&location, &mut row(LiteralValue::Number(1.0)), &WrittenCells::new()).is_none());
+        // Written cells follow the write, whatever the workbook says.
+        let written: WrittenCells = [((0, 1), None), ((0, 3), None), ((0, 0), Some(TemporalHint::Date))].into_iter().collect();
+        let mut grid = row(LiteralValue::Number(1.0));
+        type_temporal(&location, &mut grid, &written).unwrap();
+        assert_eq!(grid[0][0], LiteralValue::Date(day));
+        assert_eq!(grid[0][1], LiteralValue::Number(45352.5));
+        assert_eq!(grid[0][3], LiteralValue::Number(1.0));
+        // An older location: the style rule.
+        location.extra.remove("engine_temporal_fields");
+        let mut grid = row(LiteralValue::Number(1.0));
+        type_temporal(&location, &mut grid, &WrittenCells::new()).unwrap();
+        assert_eq!(grid[0][0], LiteralValue::Date(day));
+        assert_eq!(grid[0][1], LiteralValue::DateTime(day.and_hms_opt(12, 0, 0).unwrap()));
+    }
+
+    #[test]
+    fn written_cells_split_like_the_native_write() {
+        let location: PortLocation = serde_json::from_value(serde_json::json!({
+            "sheet": "S", "start_row": 2, "start_col": 3, "end_row": 3, "end_col": 4, "name": "Xinput_Grid",
+            "key": "Grid", "port_id": "grid", "shape": "range", "date_system": 1900, "date_fields": []
+        }))
+        .unwrap();
+        let day = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+        let value = WireValue::List(vec![WireValue::List(vec![WireValue::Int(1), WireValue::Date(day)])]);
+        let written = written_cells(&location, &value).unwrap();
+        assert_eq!(written.len(), 2);
+        assert_eq!(written.get(&(0, 0)), Some(&None));
+        assert_eq!(written.get(&(0, 1)), Some(&Some(TemporalHint::Date)));
+        // Not splittable (a row wider than the port): written whole; a date in it declines.
+        let wide = |cell: WireValue| WireValue::List(vec![WireValue::List(vec![WireValue::Int(1), WireValue::Int(2), cell])]);
+        assert_eq!(written_cells(&location, &wide(WireValue::Int(3))).unwrap().len(), 4);
+        assert!(written_cells(&location, &wide(WireValue::Date(day))).is_none());
+        let time = WireValue::List(vec![WireValue::List(vec![WireValue::Time(NaiveTime::MIN)])]);
+        assert!(written_cells(&location, &time).is_none());
     }
 
     #[test]

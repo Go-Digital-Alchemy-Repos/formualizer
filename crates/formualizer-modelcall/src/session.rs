@@ -43,7 +43,8 @@ use crate::goal_seek::run_goal_seeks;
 use crate::import_boundary::GOAL_SEEK_BLOCK_PREFIX;
 use crate::memo::ModelCallMemo;
 use crate::ports::{
-    Admitted, PortError, PortSession, TemporalHint, WireValue, admit_scenario, engine_temporal, parent_port_literal, port_value_from_grid, project_inputs,
+    Admitted, PortError, PortSession, WireValue, WrittenCells, admit_scenario, parent_port_literal, port_value_from_grid,
+    port_value_from_written_grid, project_inputs, written_cells,
     project_outputs, py_repr, read_typed_matrix, wire_to_port_value,
 };
 use crate::prefetch::{Prefetcher, sibling_plan};
@@ -1599,18 +1600,16 @@ fn project_compiled(
     }
     let mut inputs = std::collections::BTreeMap::new();
     for (_, location) in spec.inputs.iter() {
-        let mut values = cells.read_cells(&rectangle(location)).ok()?;
-        // A date the admission wrote reads back typed, as the engine formats
-        // the cell on the write (`ports::engine_temporal`).
-        let hint = admitted.by_port.iter().find(|(id, _)| *id == location.port_id).and_then(|(_, value)| match value {
-            WireValue::Date(_) => Some(TemporalHint::Date),
-            WireValue::DateTime(_) => Some(TemporalHint::DateTime),
-            _ => None,
-        });
-        if let (Some(hint), [first, ..]) = (hint, values.as_mut_slice()) {
-            *first = engine_temporal(std::mem::replace(first, LiteralValue::Empty), hint);
-        }
-        inputs.insert(location.port_id.clone(), port_value_from_grid(spec, location, &grid(location, values))?);
+        let values = cells.read_cells(&rectangle(location)).ok()?;
+        // A cell the admission wrote reads back as the engine types the write:
+        // a date / datetime formats it, anything else clears its style
+        // (`ports::written_cells`, `ports::engine_temporal`).
+        let written = match admitted.by_port.iter().find(|(id, _)| *id == location.port_id) {
+            Some((_, value)) => written_cells(location, value)?,
+            None => WrittenCells::new(),
+        };
+        let value = port_value_from_written_grid(spec, location, &grid(location, values), &written)?;
+        inputs.insert(location.port_id.clone(), value);
     }
     let (typed, client) = project_outputs(spec, &outputs, trim).ok()?;
     let effective = project_inputs(spec, &inputs).ok()?;
