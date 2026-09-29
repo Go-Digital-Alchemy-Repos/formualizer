@@ -262,10 +262,11 @@ fn every_decline_reason_is_recorded() {
         ("fallback:non_finite", inputs(num(1.0), "nonfinite"), ok()),
         ("fallback:output_lane", inputs(num(1.0), "err_div"), ok()),
         ("fallback:xcall_lane", inputs(num(1.0), "nested"), FixedXcall::new(Ok(vec![vec![LiteralValue::Int(1)]]))),
+        // A nested error kind outside the lane (lane = #N/A, #NUM!) still declines.
         (
             "fallback:xcall_error",
             inputs(num(1.0), "nested"),
-            FixedXcall::new(Ok(vec![vec![LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))]])),
+            FixedXcall::new(Ok(vec![vec![LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div))]])),
         ),
         ("fallback:xcall_error", inputs(num(1.0), "nested"), FixedXcall::new(Ok(vec![vec![LiteralValue::Pending]]))),
         ("fallback:xcall_error", inputs(num(1.0), "nested"), FixedXcall::new(Err(ModelCallError::routing("no route")))),
@@ -275,6 +276,21 @@ fn every_decline_reason_is_recorded() {
         let attempt = child(&hook, &base, &inputs, &mut xcall).unwrap();
         assert_eq!(route(&attempt), expected, "{inputs:?}");
         assert!(attempt.matrix.is_none());
+    }
+
+    // A nested #N/A or #NUM! is in the nested error lane: served kind-only.
+    for kind in [ExcelErrorKind::Na, ExcelErrorKind::Num] {
+        let mut xcall = FixedXcall::new(Ok(vec![vec![LiteralValue::Error(ExcelError::new(kind))]]));
+        let attempt = child(&hook, &base, &inputs(num(1.0), "nested"), &mut xcall).unwrap();
+        assert_eq!(route(&attempt), "compiled", "{kind:?}");
+        assert_eq!(
+            attempt.matrix,
+            Some(vec![
+                vec![LiteralValue::Error(ExcelError::new(kind)), num(1.0)],
+                vec![num(1.0), LiteralValue::Empty],
+            ]),
+            "{kind:?}"
+        );
     }
 
     let mut edits: Vec<(&str, Value)> = Vec::new();
