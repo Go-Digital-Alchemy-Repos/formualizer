@@ -258,8 +258,8 @@ fn child_only_registry_records_no_parent_route() {
     let hook = hook_of(&[(CHILD, entry(CHILD, "child", true)), (PARENT, entry(PARENT, "child", true))]);
     assert!(!CompiledParent::serves(&*hook, PARENT));
     assert!(!CompiledParent::serves(&*hook, CHILD));
-    let mut session = session(Operation::Client, &source, &hook);
-    let result = session.calculate(&inputs("twice")).expect("engine parent");
+    let mut client_session = session(Operation::Client, &source, &hook);
+    let result = client_session.calculate(&inputs("twice")).expect("engine parent");
     assert_eq!(result.compiled.get("parent"), None, "no parent route for a child-only registry");
     assert_eq!(*source.loads.lock().unwrap(), [PARENT]);
     assert!(result.invocations.iter().all(|event| event.route == Some(json!("compiled"))));
@@ -280,16 +280,16 @@ fn registry_json_role_and_report_rule_decide_the_parent() {
     // A report run on a parent whose rule does not hold: engine parent, prepared and captured there.
     let source = Arc::new(Source::default());
     let report = Arc::new(RecordingHook::default());
-    let mut session = session(Operation::Report, &source, &hook).with_report_hook(report.clone());
-    let result = session.calculate(&inputs("twice")).expect("engine parent");
+    let mut report_session = session(Operation::Report, &source, &hook).with_report_hook(report.clone());
+    let result = report_session.calculate(&inputs("twice")).expect("engine parent");
     assert_eq!(result.compiled.get("parent"), Some(&json!("engine:report_conditions")));
     assert_eq!(*source.loads.lock().unwrap(), [PARENT]);
     assert_eq!(*report.calls.lock().unwrap(), ["prepare:workbook", "capture:workbook:Some(Number(24.0))"]);
 
     // The same parent on a client run is compiled (the rule concerns reports only).
     let source = Arc::new(Source::default());
-    let mut session = session(Operation::Client, &source, &hook);
-    let result = session.calculate(&inputs("twice")).expect("compiled parent");
+    let mut client_session = session(Operation::Client, &source, &hook);
+    let result = client_session.calculate(&inputs("twice")).expect("compiled parent");
     assert_eq!(result.compiled.get("parent"), Some(&json!("compiled")));
     assert!(source.loads.lock().unwrap().is_empty());
 }
