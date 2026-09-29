@@ -2297,11 +2297,9 @@ mod tests {
         let day = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
         assert_eq!(parent_port_literal(&WireValue::Date(day)).unwrap(), LiteralValue::Number(45352.0));
         let noon = day.and_hms_micro_opt(12, 0, 0, 500_000).unwrap();
-        #[expect(clippy::float_cmp, reason = "bit-exact oracle compare")]
-        {
-            let expected = 45352.0 + (43_200.0 + 0.5) / 86_400.0;
-            assert_eq!(parent_port_literal(&WireValue::DateTime(noon)).unwrap(), LiteralValue::Number(expected));
-        }
+        let expected = 45352.0_f64 + (43_200.0 + 0.5) / 86_400.0;
+        let LiteralValue::Number(serial) = parent_port_literal(&WireValue::DateTime(noon)).unwrap() else { panic!() };
+        assert_eq!(serial.to_bits(), expected.to_bits());
         // Lane D counts from 1899-12-30 for every date (the engine skips the phantom 1900-02-29).
         let early = NaiveDate::from_ymd_opt(1900, 1, 1).unwrap();
         assert_eq!(parent_port_literal(&WireValue::Date(early)).unwrap(), LiteralValue::Number(2.0));

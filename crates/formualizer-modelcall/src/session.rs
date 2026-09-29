@@ -1299,7 +1299,9 @@ impl ModelSession {
             Ok(ParentAttempt::Compiled(run)) => run,
             Ok(ParentAttempt::Declined { route }) => return Ok(CompiledOutcome::Declined(route)),
             Err(error) => {
-                core.set_parent(ParentRecord { route: Value::from("fallback:error"), ..ParentRecord::default() });
+                let deadline = matches!(&error, ModelCallError::Infrastructure { kind, .. } if kind == "TimeoutError");
+                let route = if deadline { "fallback:deadline" } else { "fallback:error" };
+                core.set_parent(ParentRecord { route: Value::from(route), ..ParentRecord::default() });
                 return Err(error);
             }
         };

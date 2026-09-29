@@ -41,13 +41,29 @@
 //! returns `(matrix_or_None, route_or_None)`; `xcall` is a callable routing
 //! the compiled child's own calls (`xcall(target, block, output, *tail)`).
 //!
+//! Architecture B (GOD-383): `set_native_compiled(registry_json)` installs
+//! the native compiled hook (`formualizer_modelcall::compiled::
+//! NativeCompiledHook`) from the value-free registry `{workbook_sha256:
+//! {native_path, engine_commit, manifest_sha256, role}}` as both the compiled
+//! child and the compiled parent. With `flags.compiled` on, a parent the
+//! registry serves runs compiled before any engine parent is loaded;
+//! `calculate(..., report_conditions_ok=False)` carries the caller's
+//! report-conditions rule outcome (a `report` run is compiled only when it
+//! is True). For a compiled parent report run `report_capture(cells,
+//! outputs)` receives a `formualizer.CompiledCells` instead of a
+//! `Workbook` and `report_prepare` does not run; `compiled_cells()` returns
+//! it after `calculate`. The receipt's `compiled` map gains `parent`
+//! (`compiled` / `engine:<r>` / `fallback:<r>`), `parent_loaded` and, on a
+//! compiled run, `parent_xcalls`.
+//!
 //! `register_import_aliases(workbook, callback)` binds a Python callable
 //! under `MDL.CALLMODEL` and every imported name in
 //! `formualizer_modelcall::IMPORTED_CALL_NAMES`, the one table of those names.
 
 use formualizer_common::LiteralValue;
 use formualizer_modelcall::context::CalculationContextSpec;
-use formualizer_modelcall::evaluator::{CompiledAttempt, CompiledChildHook};
+use formualizer_modelcall::compiled::NativeCompiledHook;
+use formualizer_modelcall::evaluator::{CompiledAttempt, CompiledChildHook, CompiledParent, SharedCompiledCells};
 use formualizer_modelcall::event::ModelCallEvent;
 use formualizer_modelcall::ports::WireValue;
 use formualizer_modelcall::receipt::{
@@ -441,6 +457,122 @@ impl ReportHook for PyReportHook {
     fn inspects(&self) -> bool {
         self.inspect.is_some()
     }
+
+    fn capture_compiled(
+        &self,
+        cells: &SharedCompiledCells,
+        outputs: &OrderedMap<PortValue>,
+    ) -> Result<Vec<String>, ModelCallError> {
+        let Some(capture) = &self.capture else { return Ok(Vec::new()) };
+        Python::attach(|py| {
+            let run = || -> PyResult<Vec<String>> {
+                let cells = Py::new(py, PyCompiledCells { cells: cells.clone() })?;
+                let outputs = ports_to_py(py, outputs, native)?;
+                let report = capture.call1(py, (cells, outputs))?;
+                let bound = report.bind(py);
+                let mut notes = Vec::new();
+                if let Ok(dict) = bound.cast::<PyDict>() {
+                    if let Some(diagnostics) = dict.get_item("diagnostics")? {
+                        for note in diagnostics.try_iter()? {
+                            notes.push(note?.str()?.to_string());
+                        }
+                    }
+                }
+                if let Ok(mut results) = self.results.lock() {
+                    results.report = Some(report);
+                }
+                Ok(notes)
+            };
+            run().map_err(|error| from_py_err(py, &error))
+        })
+    }
+
+    fn captures_compiled(&self) -> bool {
+        true
+    }
+}
+
+/// The cells of a compiled parent run (architecture B), the report
+/// capture's stand-in for the evaluated parent `Workbook`.
+///
+/// `get_value(sheet, row, col)` returns what `Workbook.get_value` returns for
+/// the same cell as far as the compiled store can know it: None for a blank,
+/// float for a number, bool, str, and an error as the `LiteralValue` error
+/// object the engine returns. The store holds no number formats, so a cell
+/// the engine would type through its temporal egress (a date-formatted
+/// cell -> `date`/`datetime`/`time`/`timedelta`) is returned as its float
+/// serial. Normalisation rule for a gate: compare engine values through
+/// `CompiledCells.serial(value)`, which maps a `date`, `datetime`, `time` or
+/// `timedelta` to the 1900-system serial the engine stores (the engine's own
+/// conversion) and returns anything else unchanged.
+#[pyclass(name = "CompiledCells", module = "formualizer.formualizer_py")]
+pub struct PyCompiledCells {
+    cells: SharedCompiledCells,
+}
+
+#[pymethods]
+impl PyCompiledCells {
+    fn get_value(&self, py: Python<'_>, sheet: &str, row: u32, col: u32) -> PyResult<Option<Py<PyAny>>> {
+        let values = self.read(py, vec![(sheet.to_owned(), row, col)])?;
+        match values.into_iter().next() {
+            None | Some(LiteralValue::Empty) => Ok(None),
+            Some(value) => Ok(Some(literal_to_py(py, &value)?)),
+        }
+    }
+
+    /// Many cells at once: `[(sheet, row, col), ...]` -> list of values, as
+    /// `get_value` returns them (one module read per sheet rectangle).
+    fn get_values(&self, py: Python<'_>, cells: Vec<(String, u32, u32)>) -> PyResult<Py<PyAny>> {
+        let values = self.read(py, cells)?;
+        let list = PyList::empty(py);
+        for value in values {
+            match value {
+                LiteralValue::Empty => list.append(py.None())?,
+                other => list.append(literal_to_py(py, &other)?)?,
+            }
+        }
+        Ok(list.into_any().unbind())
+    }
+
+    /// The gate normalisation: a temporal engine value as its 1900 serial.
+    #[staticmethod]
+    fn serial(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let temporal = value.is_instance_of::<PyDateTime>()
+            || value.is_instance_of::<PyDate>()
+            || value.is_instance_of::<PyTime>()
+            || value.is_instance_of::<pyo3::types::PyDelta>();
+        if !temporal {
+            return Ok(value.clone().unbind());
+        }
+        let system = formualizer_common::DateSystem::Excel1900;
+        let serial = match py_to_literal(value)? {
+            LiteralValue::Date(day) => formualizer_common::date_to_serial_for(system, &day),
+            LiteralValue::DateTime(stamp) => formualizer_common::datetime_to_serial_for(system, &stamp),
+            LiteralValue::Time(clock) => formualizer_common::time_to_fraction(&clock),
+            LiteralValue::Duration(duration) => {
+                #[expect(clippy::cast_precision_loss, reason = "engine duration serial")]
+                let seconds = duration.num_nanoseconds().map_or(f64::NAN, |nanos| nanos as f64 / 1e9);
+                seconds / 86_400.0
+            }
+            _ => return Ok(value.clone().unbind()),
+        };
+        Ok(PyFloat::new(py, serial).into_any().unbind())
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "CompiledCells()"
+    }
+}
+
+impl PyCompiledCells {
+    fn read(&self, py: Python<'_>, cells: Vec<(String, u32, u32)>) -> PyResult<Vec<LiteralValue>> {
+        let shared = self.cells.clone();
+        let values = py.detach(move || {
+            let guard = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.read_cells(&cells)
+        });
+        values.map_err(to_py_err)
+    }
 }
 
 /// Add the hook keys the hooks produced to a result dict.
@@ -722,8 +854,10 @@ impl PyModelSession {
     }
 
     /// Calculate one scenario; returns the result dict or raises
-    /// `ModelCalculationError` carrying `evidence`.
-    #[pyo3(signature = (inputs, report_prepare = None, report_capture = None, inspect = None))]
+    /// `ModelCalculationError` carrying `evidence`. `report_conditions_ok`:
+    /// the caller's report-conditions rule outcome for a compiled parent
+    /// (`report` runs only; False refuses it with `engine:report_conditions`).
+    #[pyo3(signature = (inputs, report_prepare = None, report_capture = None, inspect = None, *, report_conditions_ok = false))]
     fn calculate<'py>(
         &mut self,
         py: Python<'py>,
@@ -731,8 +865,10 @@ impl PyModelSession {
         report_prepare: Option<Py<PyAny>>,
         report_capture: Option<Py<PyAny>>,
         inspect: Option<Py<PyAny>>,
+        report_conditions_ok: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let inputs = request_inputs(inputs)?;
+        self.session.set_report_conditions_ok(report_conditions_ok);
         if let Ok(mut results) = self.results.lock() {
             *results = HookResults::default();
         }
@@ -789,6 +925,34 @@ impl PyModelSession {
             .set_compiled_child(hook.map(|target| Arc::new(PyCompiledHook { target }) as Arc<dyn CompiledChildHook>));
     }
 
+    /// Install the native compiled hook (architecture B) from the value-free
+    /// registry JSON `{workbook_sha256: {native_path, engine_commit,
+    /// manifest_sha256, role}}` as the compiled child and the compiled
+    /// parent; None clears both. Consulted only when `flags.compiled` is on.
+    fn set_native_compiled(&mut self, registry_json: Option<&str>) -> PyResult<()> {
+        match registry_json {
+            None => {
+                self.session.set_compiled_child(None);
+                self.session.set_compiled_parent(None);
+            }
+            Some(text) => {
+                let hook = Arc::new(NativeCompiledHook::from_registry_json(text).map_err(to_py_err)?);
+                self.session.set_compiled_child(Some(hook.clone() as Arc<dyn CompiledChildHook>));
+                self.session.set_compiled_parent(Some(hook as Arc<dyn CompiledParent>));
+            }
+        }
+        Ok(())
+    }
+
+    /// The cells of the last `calculate`'s compiled parent run, or None
+    /// (engine parent: see `workbook()`).
+    fn compiled_cells(&self, py: Python<'_>) -> PyResult<Option<Py<PyCompiledCells>>> {
+        self.session
+            .compiled_cells()
+            .map(|cells| Py::new(py, PyCompiledCells { cells: cells.clone() }))
+            .transpose()
+    }
+
     /// Cancel every workbook this request has open (thread-safe).
     fn cancel(&self) {
         self.session.cancel();
@@ -828,6 +992,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModelSession>()?;
     m.add_class::<PyRetainedModel>()?;
     m.add_class::<PyNestedCall>()?;
+    m.add_class::<PyCompiledCells>()?;
     m.add("ModelCalculationError", m.py().get_type::<ModelCalculationError>())?;
     m.add_function(wrap_pyfunction!(register_import_aliases, m)?)?;
     m.add_function(wrap_pyfunction!(call_model_function_names, m)?)?;

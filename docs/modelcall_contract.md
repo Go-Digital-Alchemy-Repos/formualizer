@@ -506,6 +506,108 @@ only without goal seek, without `calculation_normalizations`, with
 `fallback:<reason>` under a `parent` key of `compiled.routes` and builds a
 fresh engine `RunCore`. A compiled parent takes no pool entry.
 
+### Compiled parent in the session (item (c), package C)
+
+This subsection is normative for `session.rs`, `ports.rs`, `receipt.rs` and
+the binding; it supersedes the one-line description in "read_rect and
+`CompiledCells`" above where they differ (the parent route is a `parent` key
+of the `compiled` map, a sibling of `routes`, not an entry of the `routes`
+list).
+
+**When the parent is attempted.** `ModelSession::calculate` consults the
+installed `CompiledParent` (`set_compiled_parent`; the binding's
+`set_native_compiled` installs the native hook as both child hook and parent)
+before any engine parent is loaded, in this order:
+
+1. No parent hook, `flags.compiled` off, or `hook.serves(parent.workbook_sha256)`
+   false: nothing changes (no `parent` key; the engine parent as before).
+2. Static refusals, route `engine:<reason>`, the module is not run:
+   `goal_seek` (the spec has goal-seek blocks); operation `report` without the
+   caller's rule outcome `report_conditions_ok` -> `report_conditions`, or with
+   a report hook that cannot capture compiled cells -> `report_capture`;
+   operation `diagnostic` -> `operation:diagnostic`; `date_system` (not
+   1900); `calculation_normalizations` (the descriptor lists edits the module
+   was not built with); `port_contract` (a non-scalar input, or a `table`
+   output).
+3. Admission without a workbook (`ports::admit_scenario`, the engine path's
+   admission verbatim). An admission error -> `engine:admission:invalid` (the
+   engine parent then raises the error with its own text); a value with no
+   module form -> `engine:admission:value_type`.
+4. The module runs with the session's router as its `MDL.CALLMODEL` handler
+   (`ModelCallRouter::nested(core, [parent identity])`): children are
+   compiled or engine through the child hook, memo and prefetch unchanged, so
+   invocations carry stack `[parent]` exactly as on the engine parent.
+   Module inputs follow the Lane D parent law (`ports::parent_port_literal`):
+   a `date`/`datetime` is its 1900 serial computed as Python's
+   `parent_port_value` does (`(value - 1899-12-30)` in days, seconds and
+   microseconds), an int is a float, `None` is blank.
+5. After the run: a nested-call fault recorded during the run fails the
+   request (`CallbackInfrastructureError`, route `fallback:fault`); a hook
+   error fails it too (`fallback:deadline` for a `TimeoutError`, else
+   `fallback:error`); a `Declined { route }` discards the attempt; a deadline
+   passed after the run -> `fallback:deadline` (the engine parent then fails at
+   its first deadline check).
+6. Projection: outputs from `CompiledRun.outputs` (by casefolded output key;
+   a missing key is read from the cells), effective inputs read from the
+   run's cells at the input rectangles, each turned into the value SheetPort
+   would read for the port (`ports::port_value_from_grid`) and projected with
+   the engine path's own code (`ports::project_outputs`, `project_inputs`:
+   date contracts, `_project_output`, record rows). A port that cannot be
+   read -> `fallback:projection`.
+
+**Temporal typing rule (F6).** The compiled store holds serials; the engine's
+`get_value` types a date-formatted cell through its temporal egress. For the
+receipt the session types a Number as the engine would where the spec says
+what the cell is: an input the admission wrote as a `date` / `datetime` reads
+back as `Date` / `DateTime` (the engine formats the cell on that write); a
+Number in a location's `date_fields` (cells with a date number format,
+`package.py`) is `Date` for a whole serial and `DateTime` otherwise, through
+the engine's own `try_serial_to_date_for` / `try_serial_to_datetime_for`
+(`ports::engine_temporal`). Known gaps: the format's class (Date, DateTime,
+Time) is not in the spec, and a formula cell whose date format the engine
+derives (no style) is not in `date_fields`; such cells stay Numbers. Lane D's
+serial counts from 1899-12-30 for every date, so a date before 1900-03-01
+reaches the module one day above the engine's serial.
+
+`formualizer.CompiledCells.get_value(sheet, row, col)` (report capture)
+returns None / float / bool / str / the error `Workbook.get_value` returns,
+with no temporal typing (the report cells have no `date_fields`). A gate
+comparing report cells normalises the engine side with
+`CompiledCells.serial(value)`: a `date`, `datetime`, `time` or `timedelta`
+becomes its 1900-system serial by the engine's conversion, anything else is
+returned unchanged. Compiled errors are kind-only (no message).
+
+**Decline and fallback order.** Any decline discards the attempt: its core is
+closed, its child routes are dropped from the child hook's `routes`/`calls`
+in the receipt, a fresh request core is built and the engine parent runs as
+before (retained pool, CL-097, goal seek). `report_prepare` runs only on an
+engine parent (F1): never on a compiled run, always on the fallback engine
+parent. For a compiled parent report run the report hook's `capture` receives
+the run's cells (`ReportHook::capture_compiled`; the binding passes a
+`formualizer.CompiledCells` to `report_capture`), after the output reads, as
+on the engine path.
+
+**Receipt (`compiled` map, `receipt::compiled_keys`).** When a parent hook
+serves the parent: `parent` = `compiled` | `engine:<reason>` |
+`fallback:<reason>`; `parent_loaded` = whether an engine parent was loaded
+(`false` only for `compiled`); on a compiled run `parent_xcalls` =
+`CompiledRunStats.xcalls`. A compiled parent takes no pool entry, so
+`session_reuse` has no parent entry (`fresh`/`reused` list only children),
+`load_seconds`/`evaluation_seconds` hold only child work, and the module's
+run time is in `compiled_seconds`. `ModelSession::workbook()` is `None` after
+a compiled parent run and `compiled_cells()` holds the run's cells until the
+next `calculate`.
+
+**Binding (Python).**
+`ModelSession.set_native_compiled(registry_json: str | None) -> None`
+(`{workbook_sha256: {native_path, engine_commit, manifest_sha256, role}}`,
+value-free; None clears child and parent hooks);
+`ModelSession.calculate(inputs, report_prepare=None, report_capture=None,
+inspect=None, *, report_conditions_ok=False) -> dict`;
+`ModelSession.compiled_cells() -> CompiledCells | None`;
+`CompiledCells.get_value(sheet, row, col)`, `CompiledCells.get_values([(sheet,
+row, col), ...]) -> list`, `CompiledCells.serial(value)` (static).
+
 ### Work-package file ownership (no two packages edit the same file)
 
 | WP | Files |
