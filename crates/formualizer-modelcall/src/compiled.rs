@@ -534,6 +534,34 @@ enum HostVal {
     Num(f64),
     Bool(bool),
     Str(String),
+    /// A nested-call answer cell in the error lane (kind only); ports never carry one.
+    Err(LaneError),
+}
+
+/// The error kinds of the lane (adapter.py `ERROR_LANE`): `#N/A` and `#NUM!`, kind only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneError {
+    Na,
+    Num,
+}
+
+impl LaneError {
+    /// The lane kind of an engine error, `None` outside the lane.
+    fn of(kind: ExcelErrorKind) -> Option<Self> {
+        match kind {
+            ExcelErrorKind::Na => Some(Self::Na),
+            ExcelErrorKind::Num => Some(Self::Num),
+            _ => None,
+        }
+    }
+
+    /// `CvVal.err_code` for this kind.
+    fn err_code(self) -> u32 {
+        match self {
+            Self::Na => CV_XLERR_NA,
+            Self::Num => CV_XLERR_NUM,
+        }
+    }
 }
 
 const BLANK_VAL: CvVal = CvVal { tag: CV_TAG_BLANK, num: 0.0, str_ptr: std::ptr::null(), str_len: 0, err_code: 0 };
@@ -548,6 +576,7 @@ fn cv_val(value: &HostVal) -> CvVal {
         HostVal::Num(number) => CvVal { tag: CV_TAG_NUM, num: *number, ..BLANK_VAL },
         HostVal::Bool(flag) => CvVal { tag: CV_TAG_BOOL, num: if *flag { 1.0 } else { 0.0 }, ..BLANK_VAL },
         HostVal::Str(text) => CvVal { tag: CV_TAG_STR, str_ptr: text.as_ptr(), str_len: text.len(), ..BLANK_VAL },
+        HostVal::Err(kind) => CvVal { tag: CV_TAG_ERR, err_code: kind.err_code(), ..BLANK_VAL },
     }
 }
 
@@ -576,13 +605,16 @@ fn same_value(left: &HostVal, right: &HostVal) -> bool {
 }
 
 /// adapter.py `nested_cell`: one cell of a nested call's answer, or the decline reason.
+/// An error of a lane kind (`#N/A`, `#NUM!`) passes as that kind only; any
+/// other error declines `xcall_error`.
 fn nested_cell(value: &LiteralValue) -> Result<HostVal, &'static str> {
     match value {
         LiteralValue::Empty => Ok(HostVal::Blank),
         LiteralValue::Number(number) => Ok(HostVal::Num(*number)),
         LiteralValue::Boolean(flag) => Ok(HostVal::Bool(*flag)),
         LiteralValue::Text(text) => Ok(HostVal::Str(text.clone())),
-        LiteralValue::Error(_) | LiteralValue::Pending | LiteralValue::Array(_) => Err("xcall_error"),
+        LiteralValue::Error(error) => LaneError::of(error.kind).map(HostVal::Err).ok_or("xcall_error"),
+        LiteralValue::Pending | LiteralValue::Array(_) => Err("xcall_error"),
         LiteralValue::Int(_)
         | LiteralValue::Date(_)
         | LiteralValue::DateTime(_)
@@ -1647,8 +1679,23 @@ mod tests {
     fn nested_answers_and_outputs_follow_the_value_law() {
         assert_eq!(nested_cell(&LiteralValue::Int(1)), Err("xcall_lane"));
         assert_eq!(nested_cell(&LiteralValue::Pending), Err("xcall_error"));
-        assert_eq!(nested_cell(&LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))), Err("xcall_error"));
+        assert_eq!(nested_cell(&LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))), Ok(HostVal::Err(LaneError::Na)));
+        assert_eq!(nested_cell(&LiteralValue::Error(ExcelError::new(ExcelErrorKind::Num))), Ok(HostVal::Err(LaneError::Num)));
+        assert_eq!(nested_cell(&LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div))), Err("xcall_error"));
+        assert_eq!(nested_cell(&LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))), Err("xcall_error"));
+        assert_eq!(nested_cell(&LiteralValue::Array(vec![vec![LiteralValue::Empty]])), Err("xcall_error"));
         assert_eq!(nested_cell(&LiteralValue::Number(2.0)), Ok(HostVal::Num(2.0)));
+        for (kind, code) in [(LaneError::Na, CV_XLERR_NA), (LaneError::Num, CV_XLERR_NUM)] {
+            let encoded = cv_val(&HostVal::Err(kind));
+            assert_eq!((encoded.tag, encoded.err_code), (CV_TAG_ERR, code));
+            assert!(encoded.str_ptr.is_null());
+            assert_eq!(encoded.str_len, 0);
+            // SAFETY: not a text value.
+            let decoded = unsafe { plain_literal(&encoded) };
+            let expected = if kind == LaneError::Na { ExcelErrorKind::Na } else { ExcelErrorKind::Num };
+            assert_eq!(decoded, Some(LiteralValue::Error(ExcelError::new(expected))));
+        }
+        assert_eq!((CV_XLERR_NA, CV_XLERR_NUM), (0, 5));
         let num = |num: f64| CvVal { tag: CV_TAG_NUM, num, ..BLANK_VAL };
         let err = |err_code: u32| CvVal { tag: CV_TAG_ERR, err_code, ..BLANK_VAL };
         // SAFETY: no text values.
