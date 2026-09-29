@@ -100,6 +100,17 @@ impl ModelCallRouter {
         self.core.state().fault_indices.len()
     }
 
+    /// The request context of the run this router belongs to (clock,
+    /// deadline, flags): what a native compiled child needs (package B S1).
+    pub fn context(&self) -> &crate::CalculationContext {
+        &self.core.context
+    }
+
+    /// The error of the first fault recorded after the first `before` faults.
+    pub(crate) fn fault_error_since(&self, before: usize) -> Option<String> {
+        self.core.state().fault_error_since(before)
+    }
+
     fn update(&self, index: usize, edit: impl FnOnce(&mut ModelCallEvent)) {
         if let Some(event) = self.core.state().invocations.get_mut(index) {
             edit(event);

@@ -955,7 +955,9 @@ impl ChildEvaluator for SubRequestEvaluator {
         ));
         let watchdog = core.start_watchdog();
         let output = LiteralValue::Text(request.output.clone());
-        let result = core.calculate_child(spec, &request.inputs, &output, &request.stack, None);
+        let result = crate::compiled::with_request_context(&core.context, || {
+            core.calculate_child(spec, &request.inputs, &output, &request.stack, None)
+        });
         if let Some(watchdog) = watchdog {
             watchdog.stop();
         }
@@ -1127,8 +1129,15 @@ impl ModelSession {
         self.calculate_wire(&wire)
     }
 
-    /// `calculate` over request values in their own order.
+    /// `calculate` over request values in their own order. The request
+    /// context is set for this thread (`compiled::with_request_context`) so a
+    /// native compiled child called from the engine parent has its clock.
     pub fn calculate_wire(&mut self, inputs: &[(String, WireValue)]) -> Result<CalculationResult, ModelCallError> {
+        let context = self.context.clone();
+        crate::compiled::with_request_context(&context, || self.calculate_request(inputs))
+    }
+
+    fn calculate_request(&mut self, inputs: &[(String, WireValue)]) -> Result<CalculationResult, ModelCallError> {
         self.workbook = None;
         self.compiled_cells = None;
         self.effective_inputs = OrderedMap::default();
@@ -1242,10 +1251,10 @@ impl ModelSession {
         if normalizations.is_some_and(|edits| !edits.is_empty()) {
             return refused("calculation_normalizations");
         }
-        let scalar_inputs = spec.inputs.iter().all(|(_, location)| location.shape == "scalar");
+        let admitted_inputs = spec.inputs.iter().all(|(_, location)| matches!(location.shape.as_str(), "scalar" | "range"));
         let readable_outputs =
             spec.outputs.iter().all(|(_, location)| matches!(location.shape.as_str(), "scalar" | "record" | "range"));
-        if !scalar_inputs || !readable_outputs {
+        if !admitted_inputs || !readable_outputs {
             return refused("port_contract");
         }
         ParentPlan::Compiled(hook)
@@ -1511,10 +1520,12 @@ enum CompiledOutcome {
     Declined(Value),
 }
 
-/// The router as a compiled module's `MDL.CALLMODEL` handler: the module ->
-/// router argument law is already applied by the hook; an array result is its
-/// rows, any other value (a routing `#REF!`, a fault's `#CALC!`) a 1x1 matrix
-/// the hook's value law declines.
+/// The router as a compiled module's `MDL.CALLMODEL` handler (package B S2):
+/// an array result is `Ok(rows)`; a call that recorded a router fault is an
+/// infrastructure error carrying the fault's event error (the request fails,
+/// the call is not re-fired on an engine parent); any other non-array answer
+/// (a routing `#REF!`) is `Err(Routing)`, which the hook declines
+/// `fallback:xcall_error`.
 struct RouterXcall {
     router: ModelCallRouter,
 }
@@ -1530,10 +1541,21 @@ impl CompiledXcall for RouterXcall {
         let mut args = Vec::with_capacity(3 + tail.len());
         args.extend([target.clone(), block.clone(), output.clone()]);
         args.extend(tail.iter().cloned());
-        Ok(match self.router.call(&args) {
-            LiteralValue::Array(rows) => rows,
-            other => vec![vec![other]],
-        })
+        let before = self.router.fault_count();
+        let value = self.router.call(&args);
+        if let Some(error) = self.router.fault_error_since(before) {
+            return Err(ModelCallError::infrastructure(
+                "CallbackInfrastructureError",
+                format!("child callback infrastructure fault: {error}"),
+            ));
+        }
+        match value {
+            LiteralValue::Array(rows) => Ok(rows),
+            LiteralValue::Error(error) => {
+                Err(ModelCallError::routing(error.message.unwrap_or_else(|| error.kind.to_string())))
+            }
+            other => Err(ModelCallError::routing(format!("child call returned a non-array value: {other:?}"))),
+        }
     }
 }
 

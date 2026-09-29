@@ -870,16 +870,25 @@ pub fn admit_scenario(spec: &ModelSpec, inputs: &[(String, WireValue)], decode_w
 /// date or datetime becomes its 1900 serial (`(value - 1899-12-30)` in days,
 /// seconds and microseconds as Python computes it), an int becomes a float
 /// (the engine cell stores a Number), `None` is blank; everything else is
-/// `py_to_literal`. Only scalar values are admitted here (the session
-/// declines non-scalar parents statically).
+/// `py_to_literal`. A range port's rows (a list of lists) become an array of
+/// cells under the same law; a record (dict) is refused (the session
+/// declines record inputs statically).
 pub fn parent_port_literal(value: &WireValue) -> Result<LiteralValue, PortError> {
     Ok(match value {
+        WireValue::List(rows) if rows.iter().all(|row| matches!(row, WireValue::List(_))) => {
+            let mut matrix = Vec::with_capacity(rows.len());
+            for row in rows {
+                let WireValue::List(cells) = row else { continue };
+                matrix.push(cells.iter().map(parent_port_literal).collect::<Result<Vec<_>, _>>()?);
+            }
+            LiteralValue::Array(matrix)
+        }
         WireValue::Date(day) => LiteralValue::Number(python_serial_days(day.and_time(NaiveTime::MIN))),
         WireValue::DateTime(stamp) => LiteralValue::Number(python_serial_days(*stamp)),
         #[expect(clippy::cast_precision_loss, reason = "Python float(int), round-to-nearest")]
         WireValue::Int(number) => LiteralValue::Number(*number as f64),
         WireValue::List(_) | WireValue::Dict(_) => {
-            return Err(PortError::Type("a compiled parent admits scalar inputs only".into()));
+            return Err(PortError::Type("a compiled parent admits scalar and range inputs only".into()));
         }
         other => other.to_literal()?,
     })
@@ -2308,7 +2317,13 @@ mod tests {
         assert_eq!(parent_port_literal(&WireValue::Int(7)).unwrap(), LiteralValue::Number(7.0));
         assert_eq!(parent_port_literal(&WireValue::None).unwrap(), LiteralValue::Empty);
         assert_eq!(parent_port_literal(&WireValue::Str("x".into())).unwrap(), LiteralValue::Text("x".into()));
-        assert!(parent_port_literal(&WireValue::List(vec![])).is_err());
+        let rows = WireValue::List(vec![WireValue::List(vec![WireValue::Int(1), WireValue::None])]);
+        assert_eq!(
+            parent_port_literal(&rows).unwrap(),
+            LiteralValue::Array(vec![vec![LiteralValue::Number(1.0), LiteralValue::Empty]])
+        );
+        assert!(parent_port_literal(&WireValue::List(vec![WireValue::Int(1)])).is_err());
+        assert!(parent_port_literal(&WireValue::Dict(OrderedMap::default())).is_err());
     }
 
     #[test]

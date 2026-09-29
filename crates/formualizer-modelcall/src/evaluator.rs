@@ -255,7 +255,7 @@ pub enum ParentAttempt {
 /// parent"): the session calls `serves` first and consults the parent only
 /// when it returns true, the context's `compiled` flag is on and the static
 /// checks pass (no goal seek, date system 1900, no calculation
-/// normalizations, scalar inputs, operation `client` or an admitted
+/// normalizations, scalar or range inputs, operation `client` or an admitted
 /// `report`). `inputs` are the admitted parent inputs, declared key ->
 /// value, dates as 1900 serials and ints as numbers
 /// (`ports::parent_port_literal`), in the admission's effective order.

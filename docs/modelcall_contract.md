@@ -527,8 +527,9 @@ before any engine parent is loaded, in this order:
    a report hook that cannot capture compiled cells -> `report_capture`;
    operation `diagnostic` -> `operation:diagnostic`; `date_system` (not
    1900); `calculation_normalizations` (the descriptor lists edits the module
-   was not built with); `port_contract` (a non-scalar input, or a `table`
-   output).
+   was not built with); `port_contract` (a record or table input, or a
+   `table` output). A range input is passed as an array of its full declared
+   rectangle (the host's ranged-port law).
 3. Admission without a workbook (`ports::admit_scenario`, the engine path's
    admission verbatim). An admission error -> `engine:admission:invalid` (the
    engine parent then raises the error with its own text); a value with no
@@ -540,7 +541,8 @@ before any engine parent is loaded, in this order:
    Module inputs follow the Lane D parent law (`ports::parent_port_literal`):
    a `date`/`datetime` is its 1900 serial computed as Python's
    `parent_port_value` does (`(value - 1899-12-30)` in days, seconds and
-   microseconds), an int is a float, `None` is blank.
+   microseconds), an int is a float, `None` is blank; a range port's rows
+   become a `LiteralValue::Array` under the same law.
 5. After the run: a nested-call fault recorded during the run fails the
    request (`CallbackInfrastructureError`, route `fallback:fault`); a hook
    error fails it too (`fallback:deadline` for a `TimeoutError`, else

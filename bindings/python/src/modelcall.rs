@@ -821,6 +821,9 @@ fn timings_to_py<'py>(py: Python<'py>, timings: &formualizer_modelcall::receipt:
 #[pyclass(name = "ModelSession", module = "formualizer.formualizer_py")]
 pub struct PyModelSession {
     session: ModelSession,
+    /// The native hook `set_native_compiled` installed; its routes are
+    /// cleared at the start of every `calculate` (package B S3).
+    native: Option<Arc<NativeCompiledHook>>,
     results: Arc<Mutex<HookResults>>,
     /// Keeps the retained model alive while this request runs on it.
     _retained: Option<Py<PyRetainedModel>>,
@@ -850,7 +853,7 @@ impl PyModelSession {
         if let Some(target) = compiled_child {
             session.set_compiled_child(Some(Arc::new(PyCompiledHook { target })));
         }
-        Ok(Self { session, results: Arc::new(Mutex::new(HookResults::default())), _retained: retained })
+        Ok(Self { session, native: None, results: Arc::new(Mutex::new(HookResults::default())), _retained: retained })
     }
 
     /// Calculate one scenario; returns the result dict or raises
@@ -869,6 +872,9 @@ impl PyModelSession {
     ) -> PyResult<Bound<'py, PyDict>> {
         let inputs = request_inputs(inputs)?;
         self.session.set_report_conditions_ok(report_conditions_ok);
+        if let Some(native) = &self.native {
+            native.clear_routes();
+        }
         if let Ok(mut results) = self.results.lock() {
             *results = HookResults::default();
         }
@@ -934,11 +940,13 @@ impl PyModelSession {
             None => {
                 self.session.set_compiled_child(None);
                 self.session.set_compiled_parent(None);
+                self.native = None;
             }
             Some(text) => {
                 let hook = Arc::new(NativeCompiledHook::from_registry_json(text).map_err(to_py_err)?);
                 self.session.set_compiled_child(Some(hook.clone() as Arc<dyn CompiledChildHook>));
-                self.session.set_compiled_parent(Some(hook as Arc<dyn CompiledParent>));
+                self.session.set_compiled_parent(Some(hook.clone() as Arc<dyn CompiledParent>));
+                self.native = Some(hook);
             }
         }
         Ok(())
