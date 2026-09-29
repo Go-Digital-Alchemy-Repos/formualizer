@@ -518,3 +518,80 @@ fresh engine `RunCore`. A compiled parent takes no pool entry.
 | 5 | bakeoff `tools/workbook_compiler/compiled_pins.py` |
 
 `compiled/adapter.py` and its `runtime_version` are touched by no package.
+
+### Native compiled modules
+
+WP2 host (`src/compiled.rs`, package B of round
+god-383-archb-compiled-parent-2026-09-29). Normative for the host side of
+`CV_NATIVE_ABI = 1`; the value law above is its contract.
+
+**Module cache (F4).** `NativeModule::cached(sha, entry)` keeps one loaded
+module per `workbook_sha256` for the life of the process in
+`OnceLock<Mutex<BTreeMap<sha, Arc<NativeModule>>>>`; modules are never
+unloaded, so entry points stay valid. A hit must be the same artifact (same
+`native_path` and `manifest_sha256`), else `engine:module_identity`. The
+cache lock covers lookup and `dlopen` only, never `cv_run`; a compiled
+parent's nested call may run another module, or the same one, on the same
+thread while the parent's `cv_run` is on the stack. `CompiledRun.cells`
+holds an `Arc` to its module and frees its `CvRun` on drop.
+
+**Load checks** (`engine:<reason>`): not in the registry `not_registered`;
+entry `engine_commit` differs from `NativeCompiledHook::with_engine_commit`
+`engine_mismatch`; library, symbol or `cv_meta_json` failure or inconsistent
+tables `import_error`; `cv_native_abi() != 1` `native_abi`; `cv_meta_json`
+names another workbook `key_mismatch`. A hook remembers each sha's outcome.
+
+**Eligibility and admission** (adapter.py order, `engine:<reason>`):
+`date_system` (not 1900), `descriptor_edits` (truthy
+`calculation_normalizations`), `solvers` (goal seek), `port_contract` (the
+declared inputs are not exactly the module's `port_names` case-folded one to
+one, each a scalar `{"type": "any"}` port, or a ranged port with schema
+`{"kind": "range", "cell_type": "any"}`, no headers, whose rectangle is the
+module's port rectangle), `port_defaults` (a `formula` port must be a
+`formula_input_defaults` key without a default, every other port must have a
+default; values are compared only when `cv_meta_json` carries
+`port_defaults`), `shape_mismatch` (output not exactly one module output with
+the same sheet, corners and shape), `admission` (canonical names, unknown-input
+policy, defaults merge, then the value law; a ranged port takes only a
+`LiteralValue::Array` of exactly its rectangle, cell by cell under the scalar
+law; a port the merge leaves out is `CV_PORT_NOT_SUPPLIED`).
+
+**Run outcomes.** TODAY is the UTC whole-day serial of `context.now`. After
+the run: deadline passed -> route `fallback:deadline` and
+`TimeoutError`; fault count grew (child path) -> `fallback:fault`, which the
+session turns into `CallbackInfrastructureError`. Otherwise `CV_ERR_DECLINE`
+-> `fallback:<module reason>` (a non-token reason reads `decline`);
+`CV_ERR_VIOLATION` -> `fallback:probe_violation`; `CV_ERR_XCALL` ->
+`fallback:<handler decline>` (`xcall_lane`, `xcall_error`, `xcall_result`);
+`CV_ERR_PANIC`, `CV_ERR_ARGS` or anything else -> `fallback:exception`;
+output cells under the output law (`non_finite`, `output_lane`).
+
+**Nested calls (F3).** The module's callback is an `extern "C"` trampoline
+with a per-run context. It converts the arguments (scalar -> value, rows ->
+`Array`), calls the handler inside `catch_unwind`, converts the answer under
+the nested law (a ragged or unreadable answer declines `xcall_result`) and
+keeps it alive until the next callback. A handler `Err(Routing)` declines
+`xcall_error`; any other `Err`, or a panic (`PanicException`), is stored in
+the context, the callback returns non-zero, and the host fails the attempt
+with `CallbackInfrastructureError: child callback infrastructure fault:
+<error>` (route `fallback:fault`). A stored fault wins over whatever code the
+module returns.
+
+**Entry points.** Child: `CompiledChildHook::attempt` uses the thread's
+nested router (`current_nested_router`, else `engine:no_router`), its
+`fault_count`, and the request context set by `compiled::with_request_context`
+(else `engine:no_request_context`); `NativeCompiledHook::attempt_child(spec,
+inputs, output, context, xcall, faults)` is the same with explicit parts.
+Parent: `CompiledParent::run` sets the request context for its run, reads
+every declared output in `spec.outputs` order (casefolded keys) and returns
+`CompiledRun { route: "compiled", stats, cells }`. `read_cells` groups
+addresses by sheet (exact name, then case-folded), reads each sheet's
+bounding rectangle once, and returns values under the plain law (Blank ->
+Empty, Num -> Number, Bool -> Boolean, Str -> Text, Err -> Error(kind)); an
+unknown sheet, a zero row or column, or a rectangle the module refuses is an
+error. Child and parent routes are recorded separately (`CompiledChildHook::report`,
+`CompiledParent::report`) and accumulate per hook until `clear_routes()`.
+
+**Tests.** `tests/native_compiled.rs` against `tests/fixtures/native_stub/`
+(its own workspace, built by the test into `CARGO_TARGET_TMPDIR` per
+`STUB_WORKBOOK_SHA`; the fork's default build never compiles it).
