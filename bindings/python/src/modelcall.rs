@@ -44,12 +44,12 @@
 //! Architecture B (GOD-383): `set_native_compiled(registry_json)` installs
 //! the native compiled hook (`formualizer_modelcall::compiled::
 //! NativeCompiledHook`) from the value-free registry `{workbook_sha256:
-//! {native_path, engine_commit, manifest_sha256, role}}` as both the compiled
-//! child and the compiled parent. With `flags.compiled` on, a parent the
-//! registry serves runs compiled before any engine parent is loaded;
-//! `calculate(..., report_conditions_ok=False)` carries the caller's
-//! report-conditions rule outcome (a `report` run is compiled only when it
-//! is True). For a compiled parent report run `report_capture(cells,
+//! {native_path, engine_commit, manifest_sha256, role,
+//! report_conditions_simple}}` as both the compiled child and the compiled
+//! parent. With `flags.compiled` on, a parent the registry serves (its
+//! `role: parent` entry) runs compiled before any engine parent is loaded; a
+//! `report` run is compiled only when that entry's
+//! `report_conditions_simple` is true (else `engine:report_conditions`). For a compiled parent report run `report_capture(cells,
 //! outputs)` receives a `formualizer.CompiledCells` instead of a
 //! `Workbook` and `report_prepare` does not run; `compiled_cells()` returns
 //! it after `calculate`. The receipt's `compiled` map gains `parent`
@@ -857,10 +857,10 @@ impl PyModelSession {
     }
 
     /// Calculate one scenario; returns the result dict or raises
-    /// `ModelCalculationError` carrying `evidence`. `report_conditions_ok`:
-    /// the caller's report-conditions rule outcome for a compiled parent
-    /// (`report` runs only; False refuses it with `engine:report_conditions`).
-    #[pyo3(signature = (inputs, report_prepare = None, report_capture = None, inspect = None, *, report_conditions_ok = false))]
+    /// `ModelCalculationError` carrying `evidence`. Whether a compiled parent
+    /// may serve a `report` run is the native registry's parent entry
+    /// (`report_conditions_simple`), not an argument.
+    #[pyo3(signature = (inputs, report_prepare = None, report_capture = None, inspect = None))]
     fn calculate<'py>(
         &mut self,
         py: Python<'py>,
@@ -868,10 +868,8 @@ impl PyModelSession {
         report_prepare: Option<Py<PyAny>>,
         report_capture: Option<Py<PyAny>>,
         inspect: Option<Py<PyAny>>,
-        report_conditions_ok: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let inputs = request_inputs(inputs)?;
-        self.session.set_report_conditions_ok(report_conditions_ok);
         if let Some(native) = &self.native {
             native.clear_routes();
         }
@@ -933,8 +931,10 @@ impl PyModelSession {
 
     /// Install the native compiled hook (architecture B) from the value-free
     /// registry JSON `{workbook_sha256: {native_path, engine_commit,
-    /// manifest_sha256, role}}` as the compiled child and the compiled
-    /// parent; None clears both. Consulted only when `flags.compiled` is on.
+    /// manifest_sha256, role, report_conditions_simple}}` as the compiled
+    /// child and the compiled parent (only a `role: parent` entry is served
+    /// as a parent; its `report_conditions_simple` decides report runs);
+    /// None clears both. Consulted only when `flags.compiled` is on.
     fn set_native_compiled(&mut self, registry_json: Option<&str>) -> PyResult<()> {
         match registry_json {
             None => {

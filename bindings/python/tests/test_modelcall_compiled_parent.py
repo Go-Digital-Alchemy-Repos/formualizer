@@ -1,5 +1,6 @@
 """Architecture B (GOD-383) binding smoke: ModelSession.set_native_compiled,
-the compiled parent receipt keys, report_conditions_ok and formualizer.CompiledCells.
+the compiled parent receipt keys, the registry's role and report_conditions_simple
+fields, and formualizer.CompiledCells.
 
 Synthetic parent -> child package written with ``Workbook.to_xlsx_bytes`` (no
 client content). Without a loadable native module the parent's registry entry
@@ -76,9 +77,11 @@ def _context(operation="client"):
     return {"now": "2026-09-29T00:00:00+00:00", "operation": operation, "flags": {"compiled": True}}
 
 
-def _registry(parent_sha):
-    return json.dumps({parent_sha: {"native_path": "/nonexistent/libcv_native.so", "engine_commit": "unknown",
-                                    "manifest_sha256": "0" * 64, "role": "parent"}})
+def _registry(parent_sha, role="parent", **extra):
+    entry = {"native_path": "/nonexistent/libcv_native.so", "engine_commit": "unknown",
+             "manifest_sha256": "0" * 64, "role": role}
+    entry.update(extra)
+    return json.dumps({parent_sha: entry})
 
 
 def test_native_registry_declines_to_the_engine_with_its_route(package):
@@ -104,6 +107,15 @@ def test_native_registry_declines_to_the_engine_with_its_route(package):
     assert "parent" not in session.calculate({"amount": 3})["compiled"]
 
 
+def test_child_only_registry_records_no_parent_route(package):
+    document, parent_sha = package
+    session = fz.ModelSession(document, _context())
+    session.set_native_compiled(_registry(parent_sha, role="child"))
+    result = session.calculate({"amount": 3})
+    assert "parent" not in result["compiled"]
+    assert result["outputs"] == {"result": 12.0}
+
+
 def test_report_run_refuses_without_the_conditions_rule_and_prepares_the_engine_parent(package):
     document, parent_sha = package
     seen = []
@@ -121,9 +133,12 @@ def test_report_run_refuses_without_the_conditions_rule_and_prepares_the_engine_
     assert refused["compiled"]["parent"] == "engine:report_conditions"
     assert seen == [("prepare", "Workbook"), ("capture", "Workbook")]
 
+    with pytest.raises(TypeError):
+        session.calculate({"amount": 3}, report_conditions_ok=True)   # the registry decides, not the caller
+
     seen.clear()
-    admitted = session.calculate({"amount": 3}, report_prepare=prepare, report_capture=capture,
-                                 report_conditions_ok=True)
+    session.set_native_compiled(_registry(parent_sha, report_conditions_simple=True))
+    admitted = session.calculate({"amount": 3}, report_prepare=prepare, report_capture=capture)
     # No loadable module: the attempt declines and the engine parent is prepared (F1).
     assert admitted["compiled"]["parent"] != "engine:report_conditions"
     assert admitted["outputs"] == refused["outputs"]

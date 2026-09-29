@@ -520,10 +520,16 @@ installed `CompiledParent` (`set_compiled_parent`; the binding's
 before any engine parent is loaded, in this order:
 
 1. No parent hook, `flags.compiled` off, or `hook.serves(parent.workbook_sha256)`
-   false: nothing changes (no `parent` key; the engine parent as before).
+   false: nothing changes (no `parent` key; the engine parent as before). The
+   native hook serves only a registry entry with `role: parent`, so a
+   child-only registry records no parent route.
 2. Static refusals, route `engine:<reason>`, the module is not run:
-   `goal_seek` (the spec has goal-seek blocks); operation `report` without the
-   caller's rule outcome `report_conditions_ok` -> `report_conditions`, or with
+   `goal_seek` (the spec has goal-seek blocks); operation `report` when
+   `hook.report_conditions_simple(parent.workbook_sha256)` is false ->
+   `report_conditions` (the native hook reads the parent entry's
+   `report_conditions_simple`, which the parity loader writes from
+   `pdf_export.compiled_report.conditions_rule`; absent = false; this is the
+   only report rule, there is no per-call override), or with
    a report hook that cannot capture compiled cells -> `report_capture`;
    operation `diagnostic` -> `operation:diagnostic`; `date_system` (not
    1900); `calculation_normalizations` (the descriptor lists edits the module
@@ -602,10 +608,13 @@ next `calculate`.
 
 **Binding (Python).**
 `ModelSession.set_native_compiled(registry_json: str | None) -> None`
-(`{workbook_sha256: {native_path, engine_commit, manifest_sha256, role}}`,
-value-free; None clears child and parent hooks);
+(`{workbook_sha256: {native_path, engine_commit, manifest_sha256, role,
+report_conditions_simple}}`, value-free; `role` `parent` or `child` (absent =
+child), `report_conditions_simple` a bool on the parent entry (absent =
+false); unknown fields ignored; None clears child and parent hooks);
 `ModelSession.calculate(inputs, report_prepare=None, report_capture=None,
-inspect=None, *, report_conditions_ok=False) -> dict`;
+inspect=None) -> dict` (the `report_conditions_ok` keyword of package C's
+first binding is removed: the registry entry decides);
 `ModelSession.compiled_cells() -> CompiledCells | None`;
 `CompiledCells.get_value(sheet, row, col)`, `CompiledCells.get_values([(sheet,
 row, col), ...]) -> list`, `CompiledCells.serial(value)` (static).
