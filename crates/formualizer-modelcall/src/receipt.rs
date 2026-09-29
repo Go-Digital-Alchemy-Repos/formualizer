@@ -191,6 +191,28 @@ pub mod result_keys {
     pub const HOOK_KEYS: [&str; 4] = [REPORT_CELLS, CONDITIONAL_RESULTS, FORMULA_COUNTS, INSPECTION];
 }
 
+/// Keys of the `compiled` receipt map (`result_keys::COMPILED`).
+///
+/// `calls` and `routes` are the compiled-child hook's report
+/// (`CompiledRoute.report()`). Architecture B adds the compiled parent's
+/// record when a compiled parent is installed for the request's parent
+/// workbook: `parent` is its route (`compiled`, `engine:<reason>` for a
+/// static refusal, `fallback:<reason>` for a discarded attempt) and, on a
+/// compiled parent run, `parent_xcalls` (the module's `MDL.CALLMODEL` count,
+/// `cv_run_stats.xcalls`) and `parent_loaded` (`false`: no engine parent was
+/// loaded, so `session_reuse` holds no parent entry). The child routes of a
+/// discarded parent attempt are dropped from `routes`/`calls`; the engine
+/// parent's own child calls are recorded afresh.
+pub mod compiled_keys {
+    pub const CALLS: &str = "calls";
+    pub const ROUTES: &str = "routes";
+    pub const PARENT: &str = "parent";
+    pub const PARENT_XCALLS: &str = "parent_xcalls";
+    pub const PARENT_LOADED: &str = "parent_loaded";
+    /// Route of a compiled parent run.
+    pub const ROUTE_COMPILED: &str = "compiled";
+}
+
 /// `timings` keys, in the order `CalculationSession` creates them.
 pub mod timing_keys {
     /// Always present, initialised to 0.0.

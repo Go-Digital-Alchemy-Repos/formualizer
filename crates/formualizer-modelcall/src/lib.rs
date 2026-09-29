@@ -53,7 +53,7 @@ pub use context::{CalculationContext, CalculationFlags, Operation};
 pub use error::ModelCallError;
 pub use evaluator::{
     CellAddress, ChildEvaluator, ChildMatrix, ChildRequest, CompiledCells, CompiledChildHook, CompiledParent, CompiledRun,
-    CompiledRunStats, CompiledXcall, ParentAttempt, SolveModel,
+    CompiledRunStats, CompiledXcall, ParentAttempt, SharedCompiledCells, SolveModel,
 };
 pub use event::{CallStatus, ModelCallEvent};
 pub use import_boundary::{CALL_MODEL_FUNCTION, IMPORTED_CALL_NAMES, call_function_names};

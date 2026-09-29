@@ -35,19 +35,22 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::evaluator::{
-    CancelToken, ChildEvaluator, ChildMatrix, ChildOutcome, ChildRequest, CompiledChildHook, DefinedRange, NameScope,
-    SolveModel,
+    CancelToken, CellAddress, ChildEvaluator, ChildMatrix, ChildOutcome, ChildRequest, CompiledChildHook, CompiledParent,
+    CompiledRun, CompiledXcall, DefinedRange, NameScope, ParentAttempt, SharedCompiledCells, SolveModel,
 };
 use crate::event::{CallStatus, ModelCallEvent};
 use crate::goal_seek::run_goal_seeks;
 use crate::import_boundary::GOAL_SEEK_BLOCK_PREFIX;
 use crate::memo::ModelCallMemo;
-use crate::ports::{PortError, PortSession, WireValue, py_repr, read_typed_matrix, wire_to_port_value};
+use crate::ports::{
+    Admitted, PortError, PortSession, TemporalHint, WireValue, admit_scenario, engine_temporal, parent_port_literal, port_value_from_grid, project_inputs,
+    project_outputs, py_repr, read_typed_matrix, wire_to_port_value,
+};
 use crate::prefetch::{Prefetcher, sibling_plan};
-use crate::receipt::{CalculationResult, MemoReport, PortValue, TimingValue, Timings, timing_keys};
+use crate::receipt::{CalculationResult, MemoReport, PortValue, TimingValue, Timings, compiled_keys, timing_keys};
 use crate::retained::{Acquired, Admission, RetainedModel, RetainedPool, ReuseState, restore_pinned_cells, solver_written_cells};
 use crate::router::{ModelCallRouter, RouterSlot, register_call_handler, with_nested_router};
-use crate::spec::{CellRange, ModelPackage, ModelSpec, OrderedMap};
+use crate::spec::{CellRange, ModelPackage, ModelSpec, OrderedMap, PortLocation};
 use crate::{CalculationContext, ModelCallError, Operation};
 
 /// A workbook the session shares with its caller (the Python binding wraps
@@ -142,6 +145,13 @@ pub fn apply_normalization_edits(workbook: &mut Workbook, spec: &ModelSpec) -> R
 /// by the Python binding. `prepare` runs after admission and before
 /// evaluation (`prepare_report_conditions`); `capture` runs after the outputs
 /// are read and returns the report's diagnostics.
+///
+/// Architecture B: a compiled parent run has no workbook. `prepare` never
+/// runs on it (F1: report conditions are prepared only on an engine parent,
+/// including the one a declined compiled attempt falls back to);
+/// `capture_compiled` receives the run's cells instead. A hook that does not
+/// `captures_compiled` makes a report run refuse the compiled parent
+/// (`engine:report_capture`).
 pub trait ReportHook: Send + Sync {
     fn prepare(&self, workbook: &SharedWorkbook) -> Result<(), ModelCallError>;
     fn capture(
@@ -149,6 +159,18 @@ pub trait ReportHook: Send + Sync {
         workbook: &SharedWorkbook,
         outputs: &OrderedMap<PortValue>,
     ) -> Result<Vec<String>, ModelCallError>;
+    /// `capture` over a compiled parent run's cells.
+    fn capture_compiled(
+        &self,
+        _cells: &SharedCompiledCells,
+        _outputs: &OrderedMap<PortValue>,
+    ) -> Result<Vec<String>, ModelCallError> {
+        Err(ModelCallError::infrastructure("RuntimeError", "report hook cannot capture a compiled parent"))
+    }
+    /// Whether `capture_compiled` is implemented.
+    fn captures_compiled(&self) -> bool {
+        false
+    }
     /// `capture_inspection(workbook, spec)` for operation `diagnostic`, after
     /// the report capture; timed as `inspection_seconds`. The hook keeps what
     /// it captured (the binding returns it as `inspection`).
@@ -184,6 +206,20 @@ pub(crate) struct RunState {
     pub(crate) memo: Option<ModelCallMemo>,
     /// Lane I: what this request did with the retained pool.
     pub(crate) reuse: ReuseState,
+    /// Architecture B: the compiled parent's record for `compiled` (route,
+    /// xcalls, whether an engine parent was loaded, discarded child routes).
+    pub(crate) parent: Option<ParentRecord>,
+}
+
+/// The compiled parent's part of the `compiled` receipt map.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ParentRecord {
+    route: Value,
+    xcalls: Option<u64>,
+    loaded: bool,
+    /// `routes[start..end]` of the child hook's report belong to a discarded
+    /// compiled parent attempt.
+    discarded: Option<(usize, usize)>,
 }
 
 impl RunState {
@@ -738,7 +774,7 @@ impl RunCore {
         if !self.context.flags.compiled {
             return Map::new();
         }
-        match &self.compiled {
+        let mut report = match &self.compiled {
             Some(hook) => hook.report(),
             None => {
                 let mut report = Map::new();
@@ -746,7 +782,31 @@ impl RunCore {
                 report.insert("routes".into(), Value::Array(Vec::new()));
                 report
             }
+        };
+        let parent = self.state().parent.clone();
+        if let Some(parent) = parent {
+            if let Some((start, end)) = parent.discarded
+                && let Some(Value::Array(routes)) = report.get_mut(compiled_keys::ROUTES)
+            {
+                let end = end.min(routes.len());
+                let start = start.min(end);
+                routes.drain(start..end);
+                let dropped = (end - start) as u64;
+                if let Some(calls) = report.get(compiled_keys::CALLS).and_then(Value::as_u64) {
+                    report.insert(compiled_keys::CALLS.into(), Value::from(calls.saturating_sub(dropped)));
+                }
+            }
+            report.insert(compiled_keys::PARENT.into(), parent.route);
+            if let Some(xcalls) = parent.xcalls {
+                report.insert(compiled_keys::PARENT_XCALLS.into(), Value::from(xcalls));
+            }
+            report.insert(compiled_keys::PARENT_LOADED.into(), Value::Bool(parent.loaded));
         }
+        report
+    }
+
+    fn set_parent(&self, record: ParentRecord) {
+        self.state().parent = Some(record);
     }
 
     /// `close()`: abandon flights, then leave every workbook reusable.
@@ -920,6 +980,13 @@ pub struct ModelSession {
     package: Arc<ModelPackage>,
     context: CalculationContext,
     compiled_child: Option<Arc<dyn CompiledChildHook>>,
+    /// Architecture B: the compiled parent (consulted before the engine parent).
+    compiled_parent: Option<Arc<dyn CompiledParent>>,
+    /// The caller's report-conditions rule outcome: a `report` run may use the
+    /// compiled parent only when this is true (`engine:report_conditions`).
+    report_conditions_ok: bool,
+    /// The cells of the last compiled parent run (report capture, gates).
+    compiled_cells: Option<SharedCompiledCells>,
     cancel: CancelToken,
     source: Arc<dyn WorkbookSource>,
     pool: Option<Arc<RetainedPool>>,
@@ -936,6 +1003,9 @@ impl ModelSession {
             package,
             context,
             compiled_child: None,
+            compiled_parent: None,
+            report_conditions_ok: false,
+            compiled_cells: None,
             cancel: CancelToken::new(),
             source: Arc::new(PathWorkbookSource),
             pool: None,
@@ -991,6 +1061,30 @@ impl ModelSession {
         self.compiled_child = hook;
     }
 
+    /// Architecture B: consult `hook` for the parent before loading the engine
+    /// parent (when `flags.compiled` is on and `hook.serves` the parent sha).
+    pub fn with_compiled_parent(mut self, hook: Arc<dyn CompiledParent>) -> Self {
+        self.compiled_parent = Some(hook);
+        self
+    }
+
+    pub fn set_compiled_parent(&mut self, hook: Option<Arc<dyn CompiledParent>>) {
+        self.compiled_parent = hook;
+    }
+
+    /// The report-conditions rule outcome for `report` runs (the caller
+    /// evaluates the template's `condition_plans`; `false` refuses the
+    /// compiled parent with `engine:report_conditions`). Default `false`.
+    pub fn set_report_conditions_ok(&mut self, ok: bool) {
+        self.report_conditions_ok = ok;
+    }
+
+    /// The cells of the last `calculate`'s compiled parent run, when the
+    /// parent ran compiled (`workbook()` is then `None`).
+    pub fn compiled_cells(&self) -> Option<&SharedCompiledCells> {
+        self.compiled_cells.as_ref()
+    }
+
     pub fn package(&self) -> &Arc<ModelPackage> {
         &self.package
     }
@@ -1035,19 +1129,46 @@ impl ModelSession {
 
     /// `calculate` over request values in their own order.
     pub fn calculate_wire(&mut self, inputs: &[(String, WireValue)]) -> Result<CalculationResult, ModelCallError> {
-        let core = Arc::new(RunCore::new(
-            self.package.clone(),
-            self.context.clone(),
-            self.source.clone(),
-            self.compiled_child.clone(),
-            self.pool.clone(),
-            self.cancel.clone(),
-        ));
-        core.init_prefetch(self.evaluator());
-        self.core = Some(core.clone());
         self.workbook = None;
+        self.compiled_cells = None;
         self.effective_inputs = OrderedMap::default();
         self.failure = None;
+        let mut core = self.new_core();
+        let mut parent_record: Option<ParentRecord> = None;
+        match self.parent_plan() {
+            ParentPlan::Engine => {}
+            ParentPlan::Refused(reason) => {
+                parent_record = Some(ParentRecord { route: Value::String(format!("engine:{reason}")), ..ParentRecord::default() });
+            }
+            ParentPlan::Compiled(hook) => {
+                let before = self.child_routes_len();
+                let watchdog = core.start_watchdog();
+                let outcome = self.run_compiled(&core, hook.as_ref(), inputs);
+                if let Some(watchdog) = watchdog {
+                    watchdog.stop();
+                }
+                core.close();
+                match outcome {
+                    Ok(CompiledOutcome::Served(result)) => return Ok(*result),
+                    Ok(CompiledOutcome::Declined(route)) => {
+                        // Discard the attempt: a fresh request core for the engine parent.
+                        let after = self.child_routes_len();
+                        self.compiled_cells = None;
+                        self.effective_inputs = OrderedMap::default();
+                        parent_record = Some(ParentRecord { route, discarded: Some((before, after)), ..ParentRecord::default() });
+                        core = self.new_core();
+                    }
+                    Err(error) => {
+                        self.failure = Some(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        if let Some(mut record) = parent_record {
+            record.loaded = true;
+            core.set_parent(record);
+        }
         let watchdog = core.start_watchdog();
         let mut parent: Option<Loaded> = None;
         let result = self.run(&core, inputs, &mut parent);
@@ -1062,6 +1183,182 @@ impl ModelSession {
             self.failure = Some(error.clone());
         }
         result
+    }
+
+    /// A request core for this session's package, prefetch initialised; it
+    /// becomes the core `partial_result` reads.
+    fn new_core(&mut self) -> Arc<RunCore> {
+        let core = Arc::new(RunCore::new(
+            self.package.clone(),
+            self.context.clone(),
+            self.source.clone(),
+            self.compiled_child.clone(),
+            self.pool.clone(),
+            self.cancel.clone(),
+        ));
+        core.init_prefetch(self.evaluator());
+        self.core = Some(core.clone());
+        core
+    }
+
+    /// How many child routes the compiled-child hook has reported so far.
+    fn child_routes_len(&self) -> usize {
+        if !self.context.flags.compiled {
+            return 0;
+        }
+        self.compiled_child
+            .as_ref()
+            .and_then(|hook| hook.report().get(compiled_keys::ROUTES).and_then(Value::as_array).map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    /// Whether (and why not) the parent runs compiled (architecture B item (c)).
+    fn parent_plan(&self) -> ParentPlan {
+        let Some(hook) = self.compiled_parent.clone() else { return ParentPlan::Engine };
+        let spec = &self.package.parent;
+        if !self.context.flags.compiled || !hook.serves(&spec.workbook_sha256) {
+            return ParentPlan::Engine;
+        }
+        let refused = |reason: &str| ParentPlan::Refused(reason.to_owned());
+        if !spec.goal_seek.is_empty() {
+            return refused("goal_seek");
+        }
+        match self.context.operation {
+            Operation::Client => {}
+            Operation::Report => {
+                if !self.report_conditions_ok {
+                    return refused("report_conditions");
+                }
+                if self.report_hook.as_ref().is_some_and(|hook| !hook.captures_compiled()) {
+                    return refused("report_capture");
+                }
+            }
+            Operation::Diagnostic => return refused("operation:diagnostic"),
+        }
+        if spec.date_system() != Some(1900) {
+            return refused("date_system");
+        }
+        let normalizations = spec.descriptor.get("calculation_normalizations").and_then(Value::as_array);
+        if normalizations.is_some_and(|edits| !edits.is_empty()) {
+            return refused("calculation_normalizations");
+        }
+        let scalar_inputs = spec.inputs.iter().all(|(_, location)| location.shape == "scalar");
+        let readable_outputs =
+            spec.outputs.iter().all(|(_, location)| matches!(location.shape.as_str(), "scalar" | "record" | "range"));
+        if !scalar_inputs || !readable_outputs {
+            return refused("port_contract");
+        }
+        ParentPlan::Compiled(hook)
+    }
+
+    /// One compiled parent attempt on `core` (architecture B item (c)):
+    /// admission without a workbook, the module run with the router as its
+    /// `MDL.CALLMODEL` handler (stack `[parent]`), outputs and effective
+    /// inputs read from the run's cells and projected as the engine path
+    /// projects them, report capture over the cells. A decline returns the
+    /// route; a nested-call fault or a hook error fails the request.
+    fn run_compiled(
+        &mut self,
+        core: &Arc<RunCore>,
+        hook: &dyn CompiledParent,
+        inputs: &[(String, WireValue)],
+    ) -> Result<CompiledOutcome, ModelCallError> {
+        let started = Instant::now();
+        let package = self.package.clone();
+        let spec = &package.parent;
+        let identity = spec.model_identity();
+        let declined = |route: &str| Ok(CompiledOutcome::Declined(Value::String(route.to_owned())));
+
+        let admission_started = Instant::now();
+        // The engine path raises the admission error with its own text.
+        let Ok(admitted) = admit_scenario(spec, inputs, true) else { return declined("engine:admission:invalid") };
+        let Some(module_inputs) = module_inputs(spec, &admitted) else {
+            return declined("engine:admission:value_type");
+        };
+        core.add_seconds("admission_seconds", admission_started);
+        if let Ok(returned) = admitted.returned(spec) {
+            self.effective_inputs =
+                OrderedMap(returned.iter().map(|(key, value)| (key.clone(), wire_to_port_value(value))).collect());
+        }
+
+        let mut xcall = RouterXcall { router: ModelCallRouter::nested(Arc::clone(core), vec![identity]) };
+        let attempt_started = Instant::now();
+        let attempt = hook.run(spec, &module_inputs, &core.context, &mut xcall);
+        core.add_seconds(timing_keys::COMPILED_SECONDS, attempt_started);
+        let fault = core.state().first_fault_error();
+        if let Some(error) = fault {
+            // CompiledRoute.attempt: a nested call that faulted during the
+            // compiled run fails the request, as the engine parent would.
+            core.set_parent(ParentRecord { route: Value::from("fallback:fault"), ..ParentRecord::default() });
+            return Err(ModelCallError::infrastructure(
+                "CallbackInfrastructureError",
+                format!("child callback infrastructure fault: {error}"),
+            ));
+        }
+        let run = match attempt {
+            Ok(ParentAttempt::Compiled(run)) => run,
+            Ok(ParentAttempt::Declined { route }) => return Ok(CompiledOutcome::Declined(route)),
+            Err(error) => {
+                core.set_parent(ParentRecord { route: Value::from("fallback:error"), ..ParentRecord::default() });
+                return Err(error);
+            }
+        };
+        if core.check_deadline().is_err() {
+            // No late answer: the engine path refuses at its first deadline check.
+            return declined("fallback:deadline");
+        }
+
+        let capture_started = Instant::now();
+        let CompiledRun { outputs: module_outputs, route, stats, cells } = run;
+        let Some((typed_outputs, outputs, effective_inputs)) =
+            project_compiled(spec, &admitted, &module_outputs, cells.as_ref(), self.trim_trailing_null_rows())
+        else {
+            return declined("fallback:projection");
+        };
+        let cells: SharedCompiledCells = Arc::new(Mutex::new(cells));
+        self.compiled_cells = Some(cells.clone());
+        self.effective_inputs = effective_inputs.clone();
+        {
+            let mut state = core.state();
+            state.diagnostics.extend(admitted.ignored_inputs.iter().map(|name| format!("ignored_input:{name}")));
+            if self.context.operation == Operation::Report {
+                state.diagnostics.extend(admitted.defaulted_inputs.iter().map(|name| format!("defaulted_input:{name}")));
+            }
+        }
+        let report = (self.context.operation == Operation::Report).then(|| self.report_hook.clone()).flatten();
+        if let Some(hook) = &report {
+            let notes = hook.capture_compiled(&cells, &outputs)?;
+            core.state().diagnostics.extend(notes);
+        }
+        core.add_seconds("capture_seconds", capture_started);
+        core.set_parent(ParentRecord { route, xcalls: Some(stats.xcalls), loaded: false, discarded: None });
+        core.state().timings.set(timing_keys::TOTAL_SECONDS, TimingValue::Seconds(started.elapsed().as_secs_f64()));
+        let invocations = core.sealed_invocations();
+        if let Some(pool) = &self.pool
+            && pool.retain_scenarios()
+        {
+            core.state().reuse.retain_scenario(pool, &invocations);
+        }
+        let state = core.state();
+        let result = CalculationResult {
+            outputs,
+            typed_outputs,
+            effective_inputs,
+            invocations,
+            faults: state.faults(),
+            timings: state.timings.clone(),
+            solvers: state.solvers.clone(),
+            diagnostics: state.diagnostics.clone(),
+            session_reuse: state.reuse.report(),
+            call_memo: None,
+            compiled: Map::new(),
+        };
+        drop(state);
+        Ok(CompiledOutcome::Served(Box::new(CalculationResult {
+            call_memo: core.memo_report(),
+            compiled: core.compiled_report(),
+            ..result
+        })))
     }
 
     fn trim_trailing_null_rows(&self) -> bool {
@@ -1194,6 +1491,116 @@ impl ModelSession {
             compiled: core.compiled_report(),
         }
     }
+}
+
+/// What `ModelSession::parent_plan` decided.
+enum ParentPlan {
+    /// No compiled parent for this request: the engine parent, no record.
+    Engine,
+    /// A static refusal: the engine parent, route `engine:<reason>`.
+    Refused(String),
+    Compiled(Arc<dyn CompiledParent>),
+}
+
+/// What one compiled parent attempt produced.
+enum CompiledOutcome {
+    Served(Box<CalculationResult>),
+    /// Discarded; the route (`engine:<r>` or `fallback:<r>`).
+    Declined(Value),
+}
+
+/// The router as a compiled module's `MDL.CALLMODEL` handler: the module ->
+/// router argument law is already applied by the hook; an array result is its
+/// rows, any other value (a routing `#REF!`, a fault's `#CALC!`) a 1x1 matrix
+/// the hook's value law declines.
+struct RouterXcall {
+    router: ModelCallRouter,
+}
+
+impl CompiledXcall for RouterXcall {
+    fn call(
+        &mut self,
+        target: &LiteralValue,
+        block: &LiteralValue,
+        output: &LiteralValue,
+        tail: &[LiteralValue],
+    ) -> Result<ChildMatrix, ModelCallError> {
+        let mut args = Vec::with_capacity(3 + tail.len());
+        args.extend([target.clone(), block.clone(), output.clone()]);
+        args.extend(tail.iter().cloned());
+        Ok(match self.router.call(&args) {
+            LiteralValue::Array(rows) => rows,
+            other => vec![vec![other]],
+        })
+    }
+}
+
+/// The admitted parent inputs as the module receives them: declared key ->
+/// `parent_port_literal(value)`, in the admission's effective order. `None`
+/// when a value has no module form (Lane D `admission:value_type`).
+fn module_inputs(spec: &ModelSpec, admitted: &Admitted) -> Option<Vec<(String, LiteralValue)>> {
+    let mut inputs = Vec::with_capacity(admitted.effective.len());
+    for (key, _) in &admitted.effective {
+        let location = spec.inputs.get(&crate::key::casefold(key))?;
+        let value = admitted.by_port.iter().find(|(id, _)| *id == location.port_id).map(|(_, value)| value)?;
+        inputs.push((location.key.clone(), parent_port_literal(value).ok()?));
+    }
+    Some(inputs)
+}
+
+/// Every cell of `location`'s rectangle, row-major.
+fn rectangle(location: &PortLocation) -> Vec<CellAddress> {
+    let range = &location.range;
+    (range.start_row..=range.end_row)
+        .flat_map(|row| (range.start_col..=range.end_col).map(move |col| (range.sheet.clone(), row, col)))
+        .collect()
+}
+
+fn grid(location: &PortLocation, values: Vec<LiteralValue>) -> ChildMatrix {
+    let width = location.range.cols() as usize;
+    values.chunks(width.max(1)).map(<[LiteralValue]>::to_vec).collect()
+}
+
+type Projected = (OrderedMap<PortValue>, OrderedMap<PortValue>, OrderedMap<PortValue>);
+
+/// `(typed_outputs, outputs, effective_inputs)` of a compiled parent run:
+/// the module's declared outputs, and the input rectangles read from the
+/// run's cells, projected exactly as the engine path projects its SheetPort
+/// reads. `None` when a port cannot be read (the caller declines).
+fn project_compiled(
+    spec: &ModelSpec,
+    admitted: &Admitted,
+    module_outputs: &[(String, ChildMatrix)],
+    cells: &dyn crate::evaluator::CompiledCells,
+    trim: bool,
+) -> Option<Projected> {
+    let mut outputs = std::collections::BTreeMap::new();
+    for (folded, location) in spec.outputs.iter() {
+        let matrix = module_outputs
+            .iter()
+            .find(|(key, _)| key == folded)
+            .map(|(_, matrix)| matrix.clone())
+            .map_or_else(|| cells.read_cells(&rectangle(location)).ok().map(|values| grid(location, values)), Some)?;
+        outputs.insert(location.port_id.clone(), port_value_from_grid(spec, location, &matrix)?);
+    }
+    let mut inputs = std::collections::BTreeMap::new();
+    for (_, location) in spec.inputs.iter() {
+        let mut values = cells.read_cells(&rectangle(location)).ok()?;
+        // A date the admission wrote reads back typed, as the engine formats
+        // the cell on the write (`ports::engine_temporal`).
+        let hint = admitted.by_port.iter().find(|(id, _)| *id == location.port_id).and_then(|(_, value)| match value {
+            WireValue::Date(_) => Some(TemporalHint::Date),
+            WireValue::DateTime(_) => Some(TemporalHint::DateTime),
+            _ => None,
+        });
+        if let (Some(hint), [first, ..]) = (hint, values.as_mut_slice()) {
+            *first = engine_temporal(std::mem::replace(first, LiteralValue::Empty), hint);
+        }
+        inputs.insert(location.port_id.clone(), port_value_from_grid(spec, location, &grid(location, values))?);
+    }
+    let (typed, client) = project_outputs(spec, &outputs, trim).ok()?;
+    let effective = project_inputs(spec, &inputs).ok()?;
+    Some((typed, client, effective))
 }
 
 /// One model of a `RetainedModel::warm` (the loop body of

@@ -184,6 +184,12 @@ pub trait CompiledCells: Send {
     fn read_cells(&self, cells: &[CellAddress]) -> Result<Vec<LiteralValue>, ModelCallError>;
 }
 
+/// A finished run's cells shared with a report capture that may outlive the
+/// session call (the Python binding's `formualizer.CompiledCells`). The
+/// `Mutex` makes the `Send`-only store shareable; no lock is held across a
+/// module run (the run has finished when the cells exist).
+pub type SharedCompiledCells = Arc<Mutex<Box<dyn CompiledCells>>>;
+
 /// A finished compiled run of a whole workbook (a compiled parent): its
 /// declared outputs, a handle for further cell reads (report capture), the
 /// route record and the statistics. Holding it keeps the module's run store
@@ -244,7 +250,25 @@ pub enum ParentAttempt {
 /// `ModelSession::run` before the engine parent is loaded. `Err` is an
 /// infrastructure fault (a router fault during the run, a module panic),
 /// not a decline.
+///
+/// Session contract (package C, `docs/modelcall_contract.md` "Compiled
+/// parent"): the session calls `serves` first and consults the parent only
+/// when it returns true, the context's `compiled` flag is on and the static
+/// checks pass (no goal seek, date system 1900, no calculation
+/// normalizations, scalar inputs, operation `client` or an admitted
+/// `report`). `inputs` are the admitted parent inputs, declared key ->
+/// value, dates as 1900 serials and ints as numbers
+/// (`ports::parent_port_literal`), in the admission's effective order.
+/// `run` must not record the parent's route in `CompiledChildHook::report`'s
+/// `routes`: the session records it under the receipt's `compiled.parent`.
 pub trait CompiledParent: Send + Sync {
+    /// Whether this registry holds a compiled parent for `workbook_sha256`
+    /// (an entry with `role: parent`). A `false` leaves the request exactly
+    /// as it was before architecture B: no `compiled.parent` key.
+    fn serves(&self, _workbook_sha256: &str) -> bool {
+        true
+    }
+
     fn run(
         &self,
         spec: &ModelSpec,
