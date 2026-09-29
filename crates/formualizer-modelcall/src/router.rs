@@ -93,6 +93,13 @@ impl ModelCallRouter {
         Self { stack, core, workbook_cancel: None }
     }
 
+    /// How many infrastructure faults this request has recorded so far
+    /// (`len(session.faults)`): a compiled child compares it before and after
+    /// its run, as `CompiledRoute.attempt` does.
+    pub fn fault_count(&self) -> usize {
+        self.core.state().fault_indices.len()
+    }
+
     fn update(&self, index: usize, edit: impl FnOnce(&mut ModelCallEvent)) {
         if let Some(event) = self.core.state().invocations.get_mut(index) {
             edit(event);

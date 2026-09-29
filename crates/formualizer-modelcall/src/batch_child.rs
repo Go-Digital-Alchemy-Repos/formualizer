@@ -307,10 +307,20 @@ impl Scenario<'_> {
         })?;
         if let Some(hook) = self.compiled {
             let attempt_started = Instant::now();
+            let faults_before = self.core.state().fault_indices.len();
             let nested = ModelCallRouter::nested(Arc::clone(self.core), request.stack.clone());
             let attempt = with_nested_router(nested, || hook.attempt(spec, &request.inputs, location, &request.stack));
             self.add_seconds(timing_keys::COMPILED_SECONDS, attempt_started);
-            if let Some(matrix) = attempt?.matrix {
+            let attempt = attempt?;
+            // As `RunCore::calculate_child`: a nested fault during the compiled
+            // run fails this scenario instead of re-firing on the engine.
+            if let Some(error) = self.core.state().fault_error_since(faults_before) {
+                return Err(ModelCallError::infrastructure(
+                    "CallbackInfrastructureError",
+                    format!("child callback infrastructure fault: {error}"),
+                ));
+            }
+            if let Some(matrix) = attempt.matrix {
                 self.add_seconds("child_seconds", started);
                 return Ok(matrix);
             }

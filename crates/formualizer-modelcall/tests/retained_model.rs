@@ -7,12 +7,16 @@
 
 use formualizer_common::{ExcelError, LiteralValue, RangeAddress};
 use formualizer_modelcall::context::{CalculationContextSpec, CalculationFlags};
+use formualizer_modelcall::evaluator::CompiledAttempt;
 use formualizer_modelcall::event::CallStatus;
 use formualizer_modelcall::receipt::{PortValue, TimingValue};
 use formualizer_modelcall::retained::RetainedModel;
+use formualizer_modelcall::router::current_nested_router;
 use formualizer_modelcall::session::{ModelSession, ReportHook, SharedWorkbook, WorkbookSource, runtime_workbook_config};
 use formualizer_modelcall::spec::OrderedMap;
-use formualizer_modelcall::{CalculationContext, ModelCallError, ModelPackage, ModelSpec, Operation};
+use formualizer_modelcall::{
+    CalculationContext, CompiledChildHook, ModelCallError, ModelPackage, ModelSpec, Operation, PortLocation,
+};
 use formualizer_workbook::traits::NamedRangeScope;
 use formualizer_workbook::{CustomFnOptions, Workbook};
 use serde_json::{Value, json};
@@ -484,4 +488,144 @@ fn report_and_inspect_hooks_run_at_their_steps() {
     let result = diagnostic.calculate(&inputs(3)).unwrap();
     assert_eq!(*hook.calls.lock().unwrap(), ["inspect"]);
     assert!(matches!(result.timings.get("inspection_seconds"), Some(TimingValue::Seconds(seconds)) if seconds > 0.0));
+}
+
+/// A compiled child for the synthetic `child` model: answers `amount * 2`
+/// (`route` `compiled`), declines every other model. With `nested`, it first
+/// calls that route through the nested router; with `decline`, it then
+/// declines as a module whose nested call returned an error would
+/// (`fallback:xcall_result`).
+struct DoublingHook {
+    calls: AtomicUsize,
+    nested: Option<&'static str>,
+    decline: bool,
+}
+
+impl DoublingHook {
+    fn new(nested: Option<&'static str>, decline: bool) -> Arc<Self> {
+        Arc::new(Self { calls: AtomicUsize::new(0), nested, decline })
+    }
+}
+
+impl CompiledChildHook for DoublingHook {
+    fn attempt(
+        &self,
+        spec: &ModelSpec,
+        inputs: &[(String, LiteralValue)],
+        _output: &PortLocation,
+        _stack: &[String],
+    ) -> Result<CompiledAttempt, ModelCallError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if spec.identity != "child" {
+            return Ok(CompiledAttempt { matrix: None, route: Some(json!("engine:other_child")) });
+        }
+        let amount = match inputs.iter().find(|(name, _)| name == "amount").map(|(_, value)| value) {
+            Some(LiteralValue::Number(value)) => *value,
+            Some(LiteralValue::Int(value)) => *value as f64,
+            _ => 1.0,
+        };
+        if let Some(route) = self.nested {
+            let router = current_nested_router().expect("a compiled attempt runs under a nested router");
+            let args = [
+                LiteralValue::Text(route.into()),
+                LiteralValue::Number(0.0),
+                LiteralValue::Text("result".into()),
+                LiteralValue::Text("amount".into()),
+                LiteralValue::Number(amount),
+            ];
+            let _ = router.call(&args);
+        }
+        if self.decline {
+            return Ok(CompiledAttempt { matrix: None, route: Some(json!("fallback:xcall_result")) });
+        }
+        Ok(CompiledAttempt { matrix: Some(vec![vec![LiteralValue::Number(amount * 2.0)]]), route: Some(json!("compiled")) })
+    }
+
+    fn report(&self) -> serde_json::Map<String, Value> {
+        serde_json::Map::new()
+    }
+}
+
+fn compiled_context() -> CalculationContext {
+    CalculationContext::from_spec(&CalculationContextSpec {
+        now: "2026-09-28T00:00:00+00:00".into(),
+        operation: Operation::Client,
+        random_seed: 147,
+        deadline_seconds: None,
+        max_depth: 32,
+        flags: CalculationFlags { compiled: true, ..CalculationFlags::default() },
+    })
+    .unwrap()
+}
+
+/// CP2 item 4: `RetainedModel::warm` routes the parent's calls through the
+/// compiled child it was given (Python's warm `CalculationSession` builds a
+/// `CompiledRoute`), and the warm events a request inherits carry `route`.
+#[test]
+fn warm_consults_the_compiled_child_and_inherited_events_carry_route() {
+    let (parent, child) = parent_and_child();
+    let package = package(&parent, &[("rates/child", &child)]);
+    let (memory, _) = source(&[&parent, &child]);
+    let hook = DoublingHook::new(None, false);
+    let mut retained = RetainedModel::new(package.clone(), compiled_context(), false).with_workbook_source(memory);
+    retained.set_compiled_child(Some(hook.clone()));
+    let report = retained.warm(&[], true).expect("warms");
+    assert_eq!(report.warmed(), ["child:sha-child", "parent:sha-parent"]);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1, "the parent's one call went to the compiled child");
+    let warm_events = &report.models[1].invocations;
+    assert_eq!(warm_events.len(), 1);
+    assert_eq!(warm_events[0].route, Some(json!("compiled")));
+
+    // A request whose inputs equal the warmed defaults inherits the warm's
+    // event, route included.
+    let mut session = ModelSession::new(package.clone(), compiled_context()).with_retained(&retained);
+    session.set_compiled_child(Some(hook.clone()));
+    let result = session.calculate(&inputs(1)).expect("calculates");
+    assert_eq!(number(result.outputs.get("result").unwrap()), 4.0);
+    assert_eq!(result.invocations.len(), 1);
+    assert_eq!(result.invocations[0].status, CallStatus::Inherited);
+    assert_eq!(result.invocations[0].route, Some(json!("compiled")));
+
+    // Without a hook the warm evaluates on the engine and records no route.
+    let (memory, _) = source(&[&parent, &child]);
+    let plain = RetainedModel::new(package, compiled_context(), false).with_workbook_source(memory);
+    let report = plain.warm(&[], true).expect("warms");
+    assert_eq!(report.models[1].invocations[0].route, None);
+}
+
+/// CP2 item 5b: a nested call that faults while the compiled child runs
+/// fails the request at once (`CompiledRoute.attempt`'s `fallback:fault`),
+/// instead of falling back to the engine and firing the faulting call again.
+#[test]
+fn nested_fault_during_compiled_attempt_fails_without_engine_fallback() {
+    let (parent, child) = parent_and_child();
+    let leaf = model("leaf", vec![(2, 1, "=A1+1")]);
+    let package = package(&parent, &[("rates/child", &child), ("rates/leaf", &leaf)]);
+    // The leaf is declared but cannot load: its call is an infrastructure fault.
+    let (memory, loads) = source(&[&parent, &child]);
+    let hook = DoublingHook::new(Some("rates/leaf"), true);
+    let mut session = ModelSession::new(package, compiled_context()).with_workbook_source(memory);
+    session.set_compiled_child(Some(hook.clone()));
+    let error = session.calculate(&inputs(3)).expect_err("the nested fault fails the run");
+    match &error {
+        ModelCallError::Infrastructure { kind, message } => {
+            assert_eq!(kind, "CallbackInfrastructureError");
+            assert!(message.starts_with("child callback infrastructure fault"), "{message}");
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+    // The child's attempt, and the nested leaf call's (declined, then its load faulted); no second child attempt.
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+    // The parent, and the leaf's one failed load; the engine fallback would add the child and a second leaf load.
+    assert_eq!(loads.load(Ordering::SeqCst), 2, "the child never ran on the engine");
+    let evidence = session.partial_result();
+    let child_event = evidence
+        .invocations
+        .iter()
+        .find(|event| event.child.as_deref() == Some("child:sha-child"))
+        .expect("the parent's call event");
+    assert_eq!(child_event.route, Some(json!("fallback:fault")));
+    let leaf = LiteralValue::Text("rates/leaf".into());
+    let leaf_events = evidence.invocations.iter().filter(|event| event.target == leaf).count();
+    assert_eq!(leaf_events, 1, "the faulting call fired once");
 }
