@@ -984,9 +984,6 @@ pub struct ModelSession {
     compiled_child: Option<Arc<dyn CompiledChildHook>>,
     /// Architecture B: the compiled parent (consulted before the engine parent).
     compiled_parent: Option<Arc<dyn CompiledParent>>,
-    /// The caller's report-conditions rule outcome: a `report` run may use the
-    /// compiled parent only when this is true (`engine:report_conditions`).
-    report_conditions_ok: bool,
     /// The cells of the last compiled parent run (report capture, gates).
     compiled_cells: Option<SharedCompiledCells>,
     cancel: CancelToken,
@@ -1006,7 +1003,6 @@ impl ModelSession {
             context,
             compiled_child: None,
             compiled_parent: None,
-            report_conditions_ok: false,
             compiled_cells: None,
             cancel: CancelToken::new(),
             source: Arc::new(PathWorkbookSource),
@@ -1072,13 +1068,6 @@ impl ModelSession {
 
     pub fn set_compiled_parent(&mut self, hook: Option<Arc<dyn CompiledParent>>) {
         self.compiled_parent = hook;
-    }
-
-    /// The report-conditions rule outcome for `report` runs (the caller
-    /// evaluates the template's `condition_plans`; `false` refuses the
-    /// compiled parent with `engine:report_conditions`). Default `false`.
-    pub fn set_report_conditions_ok(&mut self, ok: bool) {
-        self.report_conditions_ok = ok;
     }
 
     /// The cells of the last `calculate`'s compiled parent run, when the
@@ -1235,7 +1224,7 @@ impl ModelSession {
         match self.context.operation {
             Operation::Client => {}
             Operation::Report => {
-                if !self.report_conditions_ok {
+                if !hook.report_conditions_simple(&spec.workbook_sha256) {
                     return refused("report_conditions");
                 }
                 if self.report_hook.as_ref().is_some_and(|hook| !hook.captures_compiled()) {

@@ -289,12 +289,33 @@ impl NativeDecline {
 
 /// One entry of the value-free native registry the parity loader hands to
 /// `ModelSession.set_native_compiled` (`{sha: {native_path, engine_commit,
-/// manifest_sha256}}`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// manifest_sha256, role, report_conditions_simple}}`).
+///
+/// `role` is `parent` for the whole-model parent (the only entry
+/// [`CompiledParent::serves`] answers true for) and `child` otherwise; an
+/// absent role is a child. `report_conditions_simple` (parent entries; parity
+/// `pdf_export.compiled_report.conditions_rule`) is the one report rule: a
+/// `report` run may use the compiled parent iff it is true (absent = false,
+/// the route is then `engine:report_conditions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct NativeRegistryEntry {
     pub native_path: PathBuf,
     pub engine_commit: String,
     pub manifest_sha256: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub report_conditions_simple: bool,
+}
+
+/// The registry role of the whole-model parent entry.
+pub const ROLE_PARENT: &str = "parent";
+
+impl NativeRegistryEntry {
+    /// True for the `role: parent` entry.
+    pub fn is_parent(&self) -> bool {
+        self.role.as_deref() == Some(ROLE_PARENT)
+    }
 }
 
 // ------------------------------------------------------------------ module metadata
@@ -1340,7 +1361,8 @@ impl NativeCompiledHook {
     }
 
     /// Parse the value-free registry document (`native_registry_json`,
-    /// `{sha: {native_path, engine_commit, manifest_sha256}}`). Modules load
+    /// `{sha: {native_path, engine_commit, manifest_sha256, role,
+    /// report_conditions_simple}}`; unknown fields are ignored). Modules load
     /// lazily, on the first call for their sha.
     pub fn from_registry_json(text: &str) -> Result<Self, ModelCallError> {
         let entries: BTreeMap<String, NativeRegistryEntry> = serde_json::from_str(text)
@@ -1494,6 +1516,18 @@ impl CompiledChildHook for NativeCompiledHook {
 }
 
 impl CompiledParent for NativeCompiledHook {
+    /// True only for a `role: parent` registry entry: a child-only registry
+    /// records no parent route.
+    fn serves(&self, workbook_sha256: &str) -> bool {
+        self.entries.get(workbook_sha256).is_some_and(NativeRegistryEntry::is_parent)
+    }
+
+    /// The parent entry's `report_conditions_simple` (false when absent or
+    /// when the sha is not a parent entry).
+    fn report_conditions_simple(&self, workbook_sha256: &str) -> bool {
+        self.entries.get(workbook_sha256).is_some_and(|entry| entry.is_parent() && entry.report_conditions_simple)
+    }
+
     /// A compiled parent run (design item (c)): eligibility and admission as
     /// for a child, every declared output read under the output law. The
     /// module's nested calls go to `xcall`; the request context is set for

@@ -269,6 +269,15 @@ pub trait CompiledParent: Send + Sync {
         true
     }
 
+    /// The report-conditions rule for `workbook_sha256`: a `report` run may
+    /// use the compiled parent only when this is true (else the route is
+    /// `engine:report_conditions`). The registry decides it (the native
+    /// hook reads the parent entry's `report_conditions_simple`, written by
+    /// the parity loader); there is no per-call override. Default false.
+    fn report_conditions_simple(&self, _workbook_sha256: &str) -> bool {
+        false
+    }
+
     fn run(
         &self,
         spec: &ModelSpec,

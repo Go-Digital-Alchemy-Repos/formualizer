@@ -58,7 +58,12 @@ fn stub_library(sha: &str) -> PathBuf {
 }
 
 fn entry(sha: &str) -> NativeRegistryEntry {
-    NativeRegistryEntry { native_path: stub_library(sha), engine_commit: "stub-engine".into(), manifest_sha256: "m1".into() }
+    NativeRegistryEntry {
+        native_path: stub_library(sha),
+        engine_commit: "stub-engine".into(),
+        manifest_sha256: "m1".into(),
+        ..NativeRegistryEntry::default()
+    }
 }
 
 fn hook(shas: &[&str]) -> NativeCompiledHook {

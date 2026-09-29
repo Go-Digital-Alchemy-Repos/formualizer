@@ -51,13 +51,23 @@ fn stub_library(sha: &str) -> PathBuf {
     path
 }
 
-fn hook() -> Arc<NativeCompiledHook> {
-    let entry = |sha: &str| NativeRegistryEntry {
+fn entry(sha: &str, role: &str, report_conditions_simple: bool) -> NativeRegistryEntry {
+    NativeRegistryEntry {
         native_path: stub_library(sha),
         engine_commit: "stub-engine".into(),
         manifest_sha256: "m1".into(),
-    };
-    Arc::new(NativeCompiledHook::new([PARENT, CHILD].iter().map(|sha| ((*sha).to_owned(), entry(sha))).collect()))
+        role: Some(role.to_owned()),
+        report_conditions_simple,
+    }
+}
+
+fn hook_of(entries: &[(&str, NativeRegistryEntry)]) -> Arc<NativeCompiledHook> {
+    Arc::new(NativeCompiledHook::new(entries.iter().map(|(sha, entry)| ((*sha).to_owned(), entry.clone())).collect()))
+}
+
+/// Parent (report rule holds) and child.
+fn hook() -> Arc<NativeCompiledHook> {
+    hook_of(&[(PARENT, entry(PARENT, "parent", true)), (CHILD, entry(CHILD, "child", false))])
 }
 
 fn location(row: u32, col: u32, end_row: u32, end_col: u32, key: &str, port_id: &str, shape: &str) -> Value {
@@ -198,7 +208,6 @@ fn stub_parent_runs_compiled_with_compiled_children_through_the_router() {
     let hook = hook();
     let report = Arc::new(RecordingHook::default());
     let mut session = session(Operation::Report, &source, &hook).with_report_hook(report.clone());
-    session.set_report_conditions_ok(true);
     let result = session.calculate(&inputs("twice")).expect("compiled parent");
 
     assert_eq!(result.typed_outputs.get("Result"), Some(&PortValue::Range(vec![vec![num(30.0), num(2.0)], vec![num(2.0), num(40.0)]])));
@@ -230,7 +239,6 @@ fn forced_stub_decline_on_a_report_run_falls_back_and_prepares_the_engine_parent
     let hook = hook();
     let report = Arc::new(RecordingHook::default());
     let mut session = session(Operation::Report, &source, &hook).with_report_hook(report.clone());
-    session.set_report_conditions_ok(true);
     let result = session.calculate(&inputs("decline")).expect("engine fallback");
     assert_eq!(result.compiled.get("parent"), Some(&json!("fallback:stub_decline")));
     assert_eq!(result.compiled.get("parent_loaded"), Some(&json!(true)));
@@ -241,4 +249,47 @@ fn forced_stub_decline_on_a_report_run_falls_back_and_prepares_the_engine_parent
     assert_eq!(result.invocations[0].route, Some(json!("compiled")));
     assert_eq!(result.compiled.get("routes"), Some(&json!(["compiled"])));
     assert!(session.compiled_cells().is_none());
+}
+
+#[test]
+fn child_only_registry_records_no_parent_route() {
+    let source = Arc::new(Source::default());
+    // The parent's sha is present but as a child entry: still not a parent.
+    let hook = hook_of(&[(CHILD, entry(CHILD, "child", true)), (PARENT, entry(PARENT, "child", true))]);
+    assert!(!CompiledParent::serves(&*hook, PARENT));
+    assert!(!CompiledParent::serves(&*hook, CHILD));
+    let mut session = session(Operation::Client, &source, &hook);
+    let result = session.calculate(&inputs("twice")).expect("engine parent");
+    assert_eq!(result.compiled.get("parent"), None, "no parent route for a child-only registry");
+    assert_eq!(*source.loads.lock().unwrap(), [PARENT]);
+    assert!(result.invocations.iter().all(|event| event.route == Some(json!("compiled"))));
+}
+
+#[test]
+fn registry_json_role_and_report_rule_decide_the_parent() {
+    let registry = json!({
+        PARENT: {"native_path": stub_library(PARENT), "engine_commit": "stub-engine", "manifest_sha256": "m1",
+                 "role": "parent"},
+        CHILD: {"native_path": stub_library(CHILD), "engine_commit": "stub-engine", "manifest_sha256": "m1"},
+    });
+    let hook = Arc::new(NativeCompiledHook::from_registry_json(&registry.to_string()).unwrap());
+    assert!(CompiledParent::serves(&*hook, PARENT));
+    assert!(!CompiledParent::serves(&*hook, CHILD), "an entry without a role is a child");
+    assert!(!hook.report_conditions_simple(PARENT), "absent report_conditions_simple is false");
+
+    // A report run on a parent whose rule does not hold: engine parent, prepared and captured there.
+    let source = Arc::new(Source::default());
+    let report = Arc::new(RecordingHook::default());
+    let mut session = session(Operation::Report, &source, &hook).with_report_hook(report.clone());
+    let result = session.calculate(&inputs("twice")).expect("engine parent");
+    assert_eq!(result.compiled.get("parent"), Some(&json!("engine:report_conditions")));
+    assert_eq!(*source.loads.lock().unwrap(), [PARENT]);
+    assert_eq!(*report.calls.lock().unwrap(), ["prepare:workbook", "capture:workbook:Some(Number(24.0))"]);
+
+    // The same parent on a client run is compiled (the rule concerns reports only).
+    let source = Arc::new(Source::default());
+    let mut session = session(Operation::Client, &source, &hook);
+    let result = session.calculate(&inputs("twice")).expect("compiled parent");
+    assert_eq!(result.compiled.get("parent"), Some(&json!("compiled")));
+    assert!(source.loads.lock().unwrap().is_empty());
 }

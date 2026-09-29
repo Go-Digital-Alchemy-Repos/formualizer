@@ -150,13 +150,15 @@ impl CompiledCells for StubCells {
 struct StubParent {
     decline: Option<&'static str>,
     serves: bool,
+    /// The registry's report-conditions rule for this parent.
+    conditions: bool,
     fail: bool,
     runs: AtomicUsize,
 }
 
 impl StubParent {
     fn new() -> Self {
-        Self { decline: None, serves: true, fail: false, runs: AtomicUsize::new(0) }
+        Self { decline: None, serves: true, conditions: true, fail: false, runs: AtomicUsize::new(0) }
     }
 }
 
@@ -172,6 +174,10 @@ fn number(value: &LiteralValue) -> f64 {
 impl CompiledParent for StubParent {
     fn serves(&self, workbook_sha256: &str) -> bool {
         self.serves && workbook_sha256 == "sha-parent"
+    }
+
+    fn report_conditions_simple(&self, workbook_sha256: &str) -> bool {
+        self.conditions && self.serves(workbook_sha256)
     }
 
     fn run(
@@ -332,7 +338,6 @@ fn report_run_prepares_only_an_engine_parent_and_captures_compiled_cells() {
     let mut compiled = session(&package, Operation::Report, &source)
         .with_compiled_parent(Arc::new(StubParent::new()))
         .with_report_hook(hook.clone());
-    compiled.set_report_conditions_ok(true);
     let result = compiled.calculate(&inputs()).expect("compiled report");
     assert_same_values(&result, &engine);
     assert_eq!(result.compiled.get("parent"), Some(&json!("compiled")));
@@ -347,7 +352,6 @@ fn report_run_prepares_only_an_engine_parent_and_captures_compiled_cells() {
     let mut declined = session(&package, Operation::Report, &source)
         .with_compiled_parent(Arc::new(StubParent { decline: Some("forced"), ..StubParent::new() }))
         .with_report_hook(hook.clone());
-    declined.set_report_conditions_ok(true);
     let result = declined.calculate(&inputs()).expect("fallback report");
     assert_same_values(&result, &engine);
     assert_eq!(result.compiled.get("parent"), Some(&json!("fallback:forced")));
@@ -366,9 +370,8 @@ fn static_refusals_record_an_engine_route_without_running_the_module() {
     for (operation, conditions_ok, extra, route) in cases {
         let package = package(&extra);
         let source = Arc::new(Source::default());
-        let stub = Arc::new(StubParent::new());
+        let stub = Arc::new(StubParent { conditions: conditions_ok, ..StubParent::new() });
         let mut session = session(&package, operation, &source).with_compiled_parent(stub.clone());
-        session.set_report_conditions_ok(conditions_ok);
         let compiled = match session.calculate(&inputs()) {
             Ok(result) => result.compiled,
             Err(_) => session.partial_result().compiled,
