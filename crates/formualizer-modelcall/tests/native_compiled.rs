@@ -134,7 +134,9 @@ fn text(value: &str) -> LiteralValue {
     LiteralValue::Text(value.to_owned())
 }
 
-fn inputs(amount: LiteralValue, mode: &str) -> Vec<(String, LiteralValue)> {
+type Inputs = Vec<(String, LiteralValue)>;
+
+fn inputs(amount: LiteralValue, mode: &str) -> Inputs {
     vec![("amount".into(), amount), ("mode".into(), text(mode))]
 }
 
@@ -243,7 +245,7 @@ fn every_decline_reason_is_recorded() {
     let base = spec(PLAIN);
     let date = LiteralValue::Date(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     let ok = || FixedXcall::new(Ok(vec![vec![num(1.0)]]));
-    let cases: Vec<(&str, Vec<(String, LiteralValue)>, FixedXcall)> = vec![
+    let cases: Vec<(&str, Inputs, FixedXcall)> = vec![
         ("engine:admission", inputs(date, "plain"), ok()),
         ("engine:admission", vec![("unknown".into(), num(1.0))], ok()),
         ("engine:admission", inputs(num(f64::NAN), "plain"), ok()),
