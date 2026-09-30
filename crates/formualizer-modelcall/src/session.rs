@@ -208,7 +208,8 @@ pub(crate) struct RunState {
     /// Lane I: what this request did with the retained pool.
     pub(crate) reuse: ReuseState,
     /// Architecture B: the compiled parent's record for `compiled` (route,
-    /// xcalls, whether an engine parent was loaded, discarded child routes).
+    /// xcalls, whether an engine parent was loaded, the declined attempt's
+    /// child routes).
     pub(crate) parent: Option<ParentRecord>,
 }
 
@@ -218,9 +219,11 @@ pub(crate) struct ParentRecord {
     route: Value,
     xcalls: Option<u64>,
     loaded: bool,
-    /// `routes[start..end]` of the child hook's report belong to a discarded
-    /// compiled parent attempt.
-    discarded: Option<(usize, usize)>,
+    /// `routes[start..end]` of the child hook's report belong to a declined
+    /// compiled parent attempt. They stay out of `routes`/`calls` (which
+    /// record the engine parent's own child calls); the attempt's events,
+    /// carried into the engine pass (CL-109), keep their own route records.
+    declined_attempt_routes: Option<(usize, usize)>,
 }
 
 impl RunState {
@@ -786,7 +789,7 @@ impl RunCore {
         };
         let parent = self.state().parent.clone();
         if let Some(parent) = parent {
-            if let Some((start, end)) = parent.discarded
+            if let Some((start, end)) = parent.declined_attempt_routes
                 && let Some(Value::Array(routes)) = report.get_mut(compiled_keys::ROUTES)
             {
                 let end = end.min(routes.len());
@@ -808,6 +811,67 @@ impl RunCore {
 
     fn set_parent(&self, record: ParentRecord) {
         self.state().parent = Some(record);
+    }
+
+    /// CL-109: the declined compiled parent attempt's hand-off to this fresh
+    /// engine-pass core (the only place reuse across cores happens). Moves in
+    /// the attempt's invocation events (memo entries index into them through
+    /// `source_index` / `memo_of`), its memo, goal-seek records and
+    /// diagnostics, and adds its timings to this core's (`compiled_seconds`,
+    /// `prefetch_*`, `child_seconds`, load and evaluation time), so the request
+    /// accounts for the attempt's work. The attempt's in-line `Completed`
+    /// calls are then adopted into the carried memo with errors admitted
+    /// (`ModelCallMemo::adopt_declined_attempt`), keyed as the router keys
+    /// them: an in-line answer holding a non-lane error (what made the parent
+    /// decline) is not stored by `store`, and the engine parent would
+    /// otherwise recompute it. With every call carried, the engine parent
+    /// answers each from the memo and dispatches no flight.
+    fn carry_declined_attempt(&self, attempt: &RunCore) {
+        let (invocations, memo, timings, solvers, diagnostics) = {
+            let mut from = attempt.state();
+            (
+                std::mem::take(&mut from.invocations),
+                from.memo.take(),
+                std::mem::take(&mut from.timings),
+                std::mem::take(&mut from.solvers),
+                std::mem::take(&mut from.diagnostics),
+            )
+        };
+        let mut state = self.state();
+        let state = &mut *state;
+        for (key, value) in timings.0.0 {
+            if key == timing_keys::TOTAL_SECONDS {
+                continue;
+            }
+            match value {
+                TimingValue::Seconds(seconds) => state.timings.add_seconds(&key, seconds),
+                TimingValue::Count(count) => state.timings.add_count(&key, count),
+            }
+        }
+        if state.memo.is_some()
+            && let Some(mut memo) = memo
+        {
+            for event in &invocations {
+                if event.status != CallStatus::Completed || event.prefetch {
+                    continue;
+                }
+                let (Some(child), Some(inputs), Some(matrix)) = (&event.child, &event.inputs, &event.matrix) else {
+                    continue;
+                };
+                let Ok((_, spec)) = self.resolve_child(&event.target) else { continue };
+                if spec.model_identity() != *child {
+                    continue;
+                }
+                if let Some(key) = memo.peek_key(&event.stack, child, &event.output, inputs, Some(spec)) {
+                    memo.adopt_declined_attempt(key, event.index, matrix);
+                }
+            }
+            state.memo = Some(memo);
+        }
+        debug_assert!(state.invocations.is_empty() && state.fault_indices.is_empty());
+        state.invocations = invocations;
+        state.solvers.splice(0..0, solvers);
+        state.diagnostics.splice(0..0, diagnostics);
     }
 
     /// `close()`: abandon flights, then leave every workbook reusable.
@@ -1150,12 +1214,19 @@ impl ModelSession {
                 match outcome {
                     Ok(CompiledOutcome::Served(result)) => return Ok(*result),
                     Ok(CompiledOutcome::Declined(route)) => {
-                        // Discard the attempt: a fresh request core for the engine parent.
+                        // A fresh request core for the engine parent, carrying
+                        // the attempt's finished child calls (CL-109).
                         let after = self.child_routes_len();
                         self.compiled_cells = None;
                         self.effective_inputs = OrderedMap::default();
-                        parent_record = Some(ParentRecord { route, discarded: Some((before, after)), ..ParentRecord::default() });
+                        parent_record = Some(ParentRecord {
+                            route,
+                            declined_attempt_routes: Some((before, after)),
+                            ..ParentRecord::default()
+                        });
+                        let attempt = core;
                         core = self.new_core();
+                        core.carry_declined_attempt(&attempt);
                     }
                     Err(error) => {
                         self.failure = Some(error.clone());
@@ -1333,7 +1404,7 @@ impl ModelSession {
             core.state().diagnostics.extend(notes);
         }
         core.add_seconds("capture_seconds", capture_started);
-        core.set_parent(ParentRecord { route, xcalls: Some(stats.xcalls), loaded: false, discarded: None });
+        core.set_parent(ParentRecord { route, xcalls: Some(stats.xcalls), loaded: false, declined_attempt_routes: None });
         core.state().timings.set(timing_keys::TOTAL_SECONDS, TimingValue::Seconds(started.elapsed().as_secs_f64()));
         let invocations = core.sealed_invocations();
         if let Some(pool) = &self.pool

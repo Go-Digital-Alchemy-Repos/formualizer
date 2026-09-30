@@ -138,6 +138,16 @@ impl ModelCallMemo {
         true
     }
 
+    /// CL-109: at a declined compiled parent's hand-off only, adopt a call the
+    /// attempt completed in line under its own key, errors admitted
+    /// (`matrix_is_finished`), as a finished prefetch flight is. Same request,
+    /// same key, deterministic child: the attempt's answer is the answer the
+    /// engine parent would compute. Never overwrites and never counts; `store`
+    /// keeps rejecting errors everywhere else.
+    pub fn adopt_declined_attempt(&mut self, key: MemoKey, source_index: usize, matrix: &ChildMatrix) -> bool {
+        self.adopt(key, source_index, matrix, true)
+    }
+
     /// A missed call that failed instead of completing.
     pub fn not_stored(&mut self) {
         self.not_stored_error += 1;
@@ -190,13 +200,17 @@ mod tests {
         assert!(!memo.adopt(other.clone(), 1, &error, false));
         assert!(memo.adopt(other.clone(), 1, &error, true));
         assert!(!memo.adopt(other, 2, &matrix, false), "adopt never overwrites");
+        let third = memo.key(&stack, "child:c", &text("third"), &inputs, None).unwrap();
+        assert!(!memo.store(third.clone(), 3, &error), "store still rejects errors");
+        assert!(memo.adopt_declined_attempt(third.clone(), 3, &error), "the hand-off admits a finished error");
+        assert!(!memo.adopt_declined_attempt(third, 4, &matrix), "and never overwrites");
         let nan = vec![("a".to_owned(), LiteralValue::Number(f64::NAN))];
         assert!(memo.key(&stack, "child:c", &text("out"), &nan, None).is_none());
         memo.not_stored();
         let report = memo.report().unwrap();
         assert_eq!(
             (report.hits, report.misses, report.stores, report.bypassed, report.not_stored_error, report.port_keyed),
-            (1, 1, 1, 1, 2, 0)
+            (1, 1, 1, 1, 3, 0)
         );
     }
 }

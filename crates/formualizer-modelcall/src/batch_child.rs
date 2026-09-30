@@ -252,7 +252,13 @@ impl BatchChildEvaluator {
                 Err(cancelled_error(&core, &fired))
             } else {
                 let scenario = Scenario { core: &core, compiled: compiled.as_ref(), fired: &fired, spec, request };
-                scenario.run(&mut loaded)
+                // The whole scenario under the request context on this
+                // (possibly scoped prefetch) thread, as
+                // `SubRequestEvaluator::evaluate_child` wraps `calculate_child`:
+                // the compiled attempt and the engine fallthrough, so a native
+                // grandchild an engine-served child calls reads TODAY and the
+                // deadline from it instead of declining `no_request_context`.
+                crate::compiled::with_request_context(&core.context, || scenario.run(&mut loaded))
             };
             let state = core.state();
             outcomes.push(ChildOutcome {
@@ -309,13 +315,9 @@ impl Scenario<'_> {
             let attempt_started = Instant::now();
             let faults_before = self.core.state().fault_indices.len();
             let nested = ModelCallRouter::nested(Arc::clone(self.core), request.stack.clone());
-            // The request context on this (possibly scoped prefetch) thread,
-            // as `SubRequestEvaluator::evaluate_child` sets it: a native
-            // compiled child reads TODAY and the deadline from it and
-            // declines `no_request_context` without it.
-            let attempt = crate::compiled::with_request_context(&self.core.context, || {
-                with_nested_router(nested, || hook.attempt(spec, &request.inputs, location, &request.stack))
-            });
+            // The request context is set by `run_group` around the whole
+            // scenario (A.1).
+            let attempt = with_nested_router(nested, || hook.attempt(spec, &request.inputs, location, &request.stack));
             self.add_seconds(timing_keys::COMPILED_SECONDS, attempt_started);
             let attempt = attempt?;
             // As `RunCore::calculate_child`: a nested fault during the compiled
