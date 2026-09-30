@@ -309,7 +309,13 @@ impl Scenario<'_> {
             let attempt_started = Instant::now();
             let faults_before = self.core.state().fault_indices.len();
             let nested = ModelCallRouter::nested(Arc::clone(self.core), request.stack.clone());
-            let attempt = with_nested_router(nested, || hook.attempt(spec, &request.inputs, location, &request.stack));
+            // The request context on this (possibly scoped prefetch) thread,
+            // as `SubRequestEvaluator::evaluate_child` sets it: a native
+            // compiled child reads TODAY and the deadline from it and
+            // declines `no_request_context` without it.
+            let attempt = crate::compiled::with_request_context(&self.core.context, || {
+                with_nested_router(nested, || hook.attempt(spec, &request.inputs, location, &request.stack))
+            });
             self.add_seconds(timing_keys::COMPILED_SECONDS, attempt_started);
             let attempt = attempt?;
             // As `RunCore::calculate_child`: a nested fault during the compiled
