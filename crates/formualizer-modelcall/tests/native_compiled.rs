@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 const PARENT: &str = "stub-parent";
 const CHILD: &str = "stub-child";
 const PLAIN: &str = "stub-a";
+/// A stub built with `goal_seek_block_count: 1` in its `cv_meta_json`.
+const GOAL_SEEK: &str = "stub-goal-seek";
 
 // ------------------------------------------------------------------ fixture
 
@@ -46,6 +48,8 @@ fn stub_library(sha: &str) -> PathBuf {
         .arg("--target-dir")
         .arg(&target)
         .env("STUB_WORKBOOK_SHA", sha)
+        .env_remove("STUB_GOAL_SEEK_BLOCKS")
+        .envs((sha == GOAL_SEEK).then_some(("STUB_GOAL_SEEK_BLOCKS", "1")))
         .env_remove("RUSTFLAGS")
         .output()
         .expect("cargo runs");
@@ -337,6 +341,36 @@ fn every_decline_reason_is_recorded() {
     let output = base.resolve_output("result").unwrap();
     let attempt = CompiledChildHook::attempt(&hook, &base, &inputs(num(1.0), "plain"), output, &[]).unwrap();
     assert_eq!(route(&attempt), "engine:no_router");
+}
+
+/// Deploy 4 (c), P3: a child spec with goal-seek blocks runs compiled only
+/// when the module declares the same `goal_seek_block_count`; a
+/// pre-goal-seek module (no count) or a different count declines
+/// `engine:solvers`, and a parent with goal-seek blocks still declines.
+#[test]
+fn goal_seek_children_run_compiled_only_when_the_module_counts_the_same_blocks() {
+    let block = json!({"name": "Xsolve_Rate", "sheet": "Calc", "start_row": 15, "start_col": 1, "end_row": 18, "end_col": 2});
+    let with_blocks = |sha: &str, blocks: usize| -> ModelSpec {
+        let mut value = spec_json(sha);
+        value["goal_seek"] = Value::Array(vec![block.clone(); blocks]);
+        serde_json::from_value(value).unwrap()
+    };
+    let hook = hook(&[PLAIN, GOAL_SEEK]);
+    let plain_inputs = inputs(num(3.0), "plain");
+    let cases = [
+        (GOAL_SEEK, 1, "compiled"),
+        (GOAL_SEEK, 0, "compiled"),
+        (GOAL_SEEK, 2, "engine:solvers"),
+        (PLAIN, 1, "engine:solvers"),
+        (PLAIN, 0, "compiled"),
+    ];
+    for (sha, blocks, expected) in cases {
+        let attempt = child(&hook, &with_blocks(sha, blocks), &plain_inputs, &mut no_xcall()).unwrap();
+        assert_eq!(route(&attempt), expected, "{sha} with {blocks} blocks");
+        assert_eq!(attempt.matrix.is_some(), expected == "compiled", "{sha} with {blocks} blocks");
+    }
+    let parent = CompiledParent::run(&hook, &with_blocks(GOAL_SEEK, 1), &plain_inputs, &context(), &mut no_xcall()).unwrap();
+    assert!(matches!(parent, ParentAttempt::Declined { ref route } if route == "engine:solvers"));
 }
 
 #[test]

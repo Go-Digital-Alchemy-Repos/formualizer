@@ -367,6 +367,11 @@ struct NativeMeta {
     /// then `port_defaults` also compares values (adapter.py `port_defaults`).
     #[serde(default)]
     port_defaults: Option<BTreeMap<String, Value>>,
+    /// Goal-seek blocks the module runs itself (`cv_meta.json`
+    /// `goal_seek_block_count`, written by the compiler only for a block
+    /// workbook). Absent (a pre-goal-seek module): 0.
+    #[serde(default)]
+    goal_seek_block_count: usize,
 }
 
 impl NativeMeta {
@@ -1139,14 +1144,22 @@ fn default_literal(value: &Value) -> Option<LiteralValue> {
 /// same edits as literals), so its manifest's clean gate already covers
 /// them. A child keeps the check (adapter.py: the generator compiled the raw
 /// bytes).
-fn eligible(spec: &ModelSpec, parent: bool) -> Result<(), &'static str> {
+///
+/// Goal seek: a child whose spec declares goal-seek blocks is eligible only
+/// when the module runs the same number of blocks itself (`meta`
+/// `goal_seek_block_count`; parity `loader.py` `Registry.lookup` uses the
+/// same equality for the pyo3 route). A module without the count (built
+/// before the compiler emitted goal seek) would serve first-evaluation
+/// values, so it declines `solvers`. A parent with goal-seek blocks still
+/// declines `solvers`: no parent module has been gated with goal seek.
+fn eligible(spec: &ModelSpec, parent: bool, meta: &NativeMeta) -> Result<(), &'static str> {
     if spec.date_system() != Some(1900) {
         return Err("date_system");
     }
     if !parent && spec.descriptor.get("calculation_normalizations").is_some_and(truthy) {
         return Err("descriptor_edits");
     }
-    if !spec.goal_seek.is_empty() {
+    if !spec.goal_seek.is_empty() && (parent || spec.goal_seek.len() != meta.goal_seek_block_count) {
         return Err("solvers");
     }
     Ok(())
@@ -1457,7 +1470,7 @@ impl NativeCompiledHook {
         output: Option<&PortLocation>,
     ) -> Result<Prepared, &'static str> {
         let module = self.module(&spec.workbook_sha256).map_err(|decline| decline.reason())?;
-        eligible(spec, output.is_none())?;
+        eligible(spec, output.is_none(), &module.meta)?;
         let plan = port_plan(spec, &module.meta)?;
         let outputs = match output {
             Some(location) => vec![(casefold(&location.key), output_rect(&module.meta, location)?)],

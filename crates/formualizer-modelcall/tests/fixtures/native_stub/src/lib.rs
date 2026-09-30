@@ -114,15 +114,26 @@ impl CvRun {
     }
 }
 
-static META: &str = concat!(
+const META_BASE: &str = concat!(
     r#"{"schema": "god383-rs-cv-meta-1", "workbook_sha256": ""#,
     env!("STUB_WORKBOOK_SHA"),
     r#"", "artifact_format": 3, "sheets": ["Calc", "Report"], "port_names": ["amount", "mode", "table"], "#,
     r#""ports": {"amount": [0, 1, 1, 1, 1], "mode": [0, 2, 1, 2, 1], "table": [0, 10, 1, 11, 3]}, "#,
     r#""port_default_kind": ["constant", "constant", "constant"], "#,
     r#""outputs": {"result": [0, 1, 3, 2, 4], "total": [0, 5, 1, 5, 1]}, "#,
-    r#""output_shape": {"result": [2, 2], "total": [1, 1]}}"#
+    r#""output_shape": {"result": [2, 2], "total": [1, 1]}"#
 );
+
+/// `cv_meta_json`. `STUB_GOAL_SEEK_BLOCKS` at build time adds
+/// `goal_seek_block_count` (as the compiler does for a block workbook);
+/// without it the stub is a pre-goal-seek module.
+fn meta() -> &'static str {
+    static META: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    META.get_or_init(|| match option_env!("STUB_GOAL_SEEK_BLOCKS") {
+        Some(count) => format!("{META_BASE}, \"goal_seek_block_count\": {count}}}"),
+        None => format!("{META_BASE}}}"),
+    })
+}
 
 enum Failure {
     Code(u32, i64, &'static str),
@@ -321,9 +332,9 @@ pub extern "C" fn cv_native_abi() -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn cv_meta_json(len: *mut usize) -> *const u8 {
     if !len.is_null() {
-        *len = META.len();
+        *len = meta().len();
     }
-    META.as_ptr()
+    meta().as_ptr()
 }
 
 #[no_mangle]
