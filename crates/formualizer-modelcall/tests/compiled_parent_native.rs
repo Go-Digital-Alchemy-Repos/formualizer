@@ -293,3 +293,51 @@ fn registry_json_role_and_report_rule_decide_the_parent() {
     assert_eq!(result.compiled.get("parent"), Some(&json!("compiled")));
     assert!(source.loads.lock().unwrap().is_empty());
 }
+
+/// Deploy 4 (a): a prefetched sibling batch (`BatchChildEvaluator`) runs its
+/// native compiled child attempts with the request context on the thread,
+/// as the per-flight path (`SubRequestEvaluator`) does. Before the fix the
+/// batch attempt declined `engine:no_request_context` and fell to the engine
+/// child (which this test's source cannot load), so every scenario failed.
+#[test]
+fn prefetched_batch_child_attempt_sees_the_request_context() {
+    use formualizer_modelcall::batch_child::BatchChildEvaluator;
+    use formualizer_modelcall::evaluator::{CancelToken, ChildEvaluator, ChildRequest};
+    use formualizer_modelcall::prefetch::ChildBatchEvaluator;
+    use formualizer_modelcall::session::SubRequestEvaluator;
+
+    let package = package();
+    let request = |amount: f64, prefetch_max: u32| {
+        let mut context = context(Operation::Client);
+        context.flags.prefetch_max = prefetch_max;
+        ChildRequest {
+            package: package.clone(),
+            child_version: "child".into(),
+            inputs: vec![("Amount".into(), num(amount)), ("Mode".into(), LiteralValue::Text("plain".into()))],
+            output: "result".into(),
+            stack: vec![package.parent.model_identity()],
+            context,
+            cancel: CancelToken::new(),
+        }
+    };
+    // prefetch_max 1: one chunk on the calling thread; 2: one scoped thread per chunk.
+    for prefetch_max in [1, 2] {
+        let requests: Vec<ChildRequest> = [30.0, 40.0].iter().map(|&amount| request(amount, prefetch_max)).collect();
+        let source = Arc::new(Source::default());
+        let child_hook = hook_of(&[(CHILD, entry(CHILD, "child", false))]);
+        let batch = BatchChildEvaluator::new(source.clone(), Some(child_hook.clone() as Arc<dyn CompiledChildHook>));
+        let outcomes = batch.evaluate_children(&requests);
+        let routes = CompiledChildHook::report(&*child_hook);
+        assert_eq!(routes.get("routes"), Some(&json!(["compiled", "compiled"])), "prefetch_max {prefetch_max}: {routes:?}");
+        assert!(source.loads.lock().unwrap().is_empty(), "prefetch_max {prefetch_max}: no engine child loaded");
+
+        // The same answers as the per-flight path.
+        let flight_hook = hook_of(&[(CHILD, entry(CHILD, "child", false))]);
+        let flight = SubRequestEvaluator::new(Arc::new(Source::default()), Some(flight_hook as Arc<dyn CompiledChildHook>));
+        for (outcome, request) in outcomes.iter().zip(&requests) {
+            let expected = flight.evaluate_child(request);
+            let matrix = outcome.result.as_ref().expect("batch scenario answers");
+            assert_eq!(Some(matrix), expected.result.as_ref().ok(), "prefetch_max {prefetch_max}");
+        }
+    }
+}
