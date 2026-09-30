@@ -20,7 +20,7 @@ use formualizer_modelcall::event::CallStatus;
 use formualizer_modelcall::receipt::{CalculationResult, PortValue};
 use formualizer_modelcall::session::{ModelSession, ReportHook, SharedWorkbook, WorkbookSource, runtime_workbook_config};
 use formualizer_modelcall::spec::OrderedMap;
-use formualizer_modelcall::{CalculationContext, ModelCallError, ModelPackage, ModelSpec, Operation};
+use formualizer_modelcall::{CalculationContext, ModelCallError, ModelCallEvent, ModelPackage, ModelSpec, Operation};
 use formualizer_workbook::Workbook;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -267,14 +267,25 @@ fn assert_same_values(compiled: &CalculationResult, engine: &CalculationResult) 
     assert_eq!(compiled.outputs, engine.outputs);
     assert_eq!(compiled.typed_outputs, engine.typed_outputs);
     assert_eq!(compiled.effective_inputs, engine.effective_inputs);
-    let calls = |result: &CalculationResult| {
-        result
-            .invocations
+    let calls = |events: &[ModelCallEvent]| {
+        events
             .iter()
             .map(|event| (event.status, event.stack.clone(), event.matrix.clone(), event.inputs.clone()))
             .collect::<Vec<_>>()
     };
-    assert_eq!(calls(compiled), calls(engine));
+    let answers = |events: &[ModelCallEvent]| {
+        events.iter().map(|event| (event.stack.clone(), event.matrix.clone(), event.inputs.clone())).collect::<Vec<_>>()
+    };
+    let declined = compiled.compiled.get("parent").and_then(Value::as_str).is_some_and(|route| route.starts_with("fallback:"));
+    if declined {
+        // CL-109: a declined attempt's events are carried ahead of the engine
+        // parent's own, which answer from the carried memo: same answers.
+        assert!(compiled.invocations.len() >= engine.invocations.len());
+        let tail = &compiled.invocations[compiled.invocations.len() - engine.invocations.len()..];
+        assert_eq!(answers(tail), answers(&engine.invocations));
+    } else {
+        assert_eq!(calls(&compiled.invocations), calls(&engine.invocations));
+    }
 }
 
 #[test]
@@ -320,8 +331,14 @@ fn a_declined_attempt_falls_back_to_a_fresh_engine_parent() {
     assert_eq!(result.compiled.get("parent"), Some(&json!("fallback:forced")));
     assert_eq!(result.compiled.get("parent_loaded"), Some(&json!(true)));
     assert!(result.compiled.get("parent_xcalls").is_none());
-    // The discarded attempt's calls are not in the receipt: two, from the engine parent.
-    assert_eq!(result.invocations.len(), 2);
+    // CL-109: the attempt's two calls are carried ahead of the engine parent's
+    // two, which answer from the carried memo (no second child evaluation).
+    let statuses: Vec<_> = result.invocations.iter().map(|event| event.status).collect();
+    assert_eq!(statuses, [CallStatus::Completed, CallStatus::Memoized, CallStatus::Memoized, CallStatus::Memoized]);
+    assert!(result.invocations[1..].iter().all(|event| event.memo_of == Some(0)));
+    let memo = result.call_memo.as_ref().expect("memo report");
+    assert_eq!((memo.hits, memo.misses, memo.stores), (3, 1, 1));
+    assert_eq!(source.loads("child"), 1);
     assert_eq!(source.loads("parent"), 1);
     assert!(session.workbook().is_some());
     assert!(session.compiled_cells().is_none());
@@ -513,4 +530,150 @@ fn a_package_without_engine_temporal_fields_keeps_the_style_rule() {
     assert_eq!(compiled.outputs.get("result"), Some(&PortValue::Scalar(LiteralValue::Date(day))));
     // The written input follows the write, with or without the field.
     assert_eq!(compiled.effective_inputs.get("amount"), Some(&PortValue::Scalar(LiteralValue::Number(3.0))));
+}
+
+// ---------------------------------------------------------------------------
+// CL-109: a declined parent's finished child calls carry into the engine pass
+// ---------------------------------------------------------------------------
+
+/// Parent `B1:B3` call the child with `amount` A1, A1+1, A1+2 (three keys);
+/// `result` A2 = IFERROR(B1,-1)+B2+B3. The child's `result` A2 is `#DIV/0!`
+/// for amount 3 (a non-lane error, as the Income overrun child's answer) and
+/// `2 * amount` otherwise.
+const CALLS3: [&str; 3] = [
+    "=MDL.CALLMODEL(\"rates/child\",0,\"result\",\"amount\",A1)",
+    "=MDL.CALLMODEL(\"rates/child\",0,\"result\",\"amount\",A1+1)",
+    "=MDL.CALLMODEL(\"rates/child\",0,\"result\",\"amount\",A1+2)",
+];
+
+#[derive(Default)]
+struct ThreeCallSource {
+    loads: Mutex<HashMap<String, usize>>,
+}
+
+impl ThreeCallSource {
+    fn loads(&self, identity: &str) -> usize {
+        self.loads.lock().unwrap().get(identity).copied().unwrap_or(0)
+    }
+}
+
+impl WorkbookSource for ThreeCallSource {
+    fn load(&self, spec: &ModelSpec, context: &CalculationContext) -> Result<Workbook, ModelCallError> {
+        *self.loads.lock().unwrap().entry(spec.identity.clone()).or_insert(0) += 1;
+        let mut workbook = Workbook::new_with_config(runtime_workbook_config(context.random_seed));
+        workbook.add_sheet(SHEET).unwrap();
+        workbook.set_value(SHEET, 1, 1, LiteralValue::Number(1.0)).unwrap();
+        if spec.identity == "parent" {
+            for (row, formula) in (1..).zip(CALLS3) {
+                workbook.set_formula(SHEET, row, 2, formula).unwrap();
+            }
+            workbook.set_formula(SHEET, 2, 1, "=IFERROR(B1,-1)+B2+B3").unwrap();
+        } else {
+            workbook.set_formula(SHEET, 2, 1, "=IF(A1=3,1/0,A1*2)").unwrap();
+        }
+        Ok(workbook)
+    }
+}
+
+/// A compiled parent that meets the error answer: like the router's sibling
+/// join, every child answer exists before the module sees the first one;
+/// the module then declines `xcall_error` (a non-lane error in a nested
+/// answer, `compiled.rs` `nested_cell`).
+struct ErrorAnswerParent {
+    runs: AtomicUsize,
+}
+
+impl CompiledParent for ErrorAnswerParent {
+    fn serves(&self, workbook_sha256: &str) -> bool {
+        workbook_sha256 == "sha-parent"
+    }
+
+    fn report_conditions_simple(&self, _workbook_sha256: &str) -> bool {
+        true
+    }
+
+    fn run(
+        &self,
+        _spec: &ModelSpec,
+        inputs: &[(String, LiteralValue)],
+        _context: &CalculationContext,
+        xcall: &mut dyn CompiledXcall,
+    ) -> Result<ParentAttempt, ModelCallError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        let amount = number(&inputs.iter().find(|(key, _)| key == "amount").unwrap().1);
+        let target = LiteralValue::Text("rates/child".into());
+        let (block, output) = (LiteralValue::Number(0.0), LiteralValue::Text("result".into()));
+        let mut answers = Vec::new();
+        for offset in [0.0, 1.0, 2.0] {
+            let tail = [LiteralValue::Text("amount".into()), LiteralValue::Number(amount + offset)];
+            answers.push(xcall.call(&target, &block, &output, &tail)?);
+        }
+        assert!(matches!(answers[0][0][0], LiteralValue::Error(_)), "the first answer carries the error");
+        Ok(ParentAttempt::Declined { route: Value::String("fallback:xcall_error".into()) })
+    }
+
+    fn report(&self) -> Map<String, Value> {
+        Map::new()
+    }
+}
+
+#[test]
+fn a_declined_parent_carries_its_finished_child_calls_into_the_engine_pass() {
+    let package = package(&json!({}));
+    // The child-only path: the engine parent, no compiled parent installed.
+    let child_only_source = Arc::new(ThreeCallSource::default());
+    let child_only = ModelSession::new(package.clone(), context(Operation::Client))
+        .with_workbook_source(child_only_source.clone())
+        .calculate(&inputs())
+        .expect("child-only arm");
+    assert_eq!(child_only.outputs.get("result"), Some(&PortValue::Scalar(LiteralValue::Number(17.0))));
+    assert_eq!(child_only_source.loads("child"), 3);
+
+    let source = Arc::new(ThreeCallSource::default());
+    let stub = Arc::new(ErrorAnswerParent { runs: AtomicUsize::new(0) });
+    let mut session = ModelSession::new(package.clone(), context(Operation::Client))
+        .with_workbook_source(source.clone())
+        .with_compiled_parent(stub.clone());
+    let result = session.calculate(&inputs()).expect("fallback arm");
+    assert_eq!(stub.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(result.compiled.get("parent"), Some(&json!("fallback:xcall_error")));
+    assert_eq!(result.compiled.get("parent_loaded"), Some(&json!(true)));
+
+    // Answers equal to the child-only path.
+    assert_eq!(result.outputs, child_only.outputs);
+    assert_eq!(result.typed_outputs, child_only.typed_outputs);
+    assert_eq!(result.effective_inputs, child_only.effective_inputs);
+
+    // The attempt's three calls (the first an error answer) are carried; the
+    // engine parent's three calls are memo hits on them: N = 3 hits, no child
+    // recomputed (d9805989: the engine pass reloads and recomputes all three).
+    let n = 3;
+    println!(
+        "CL109 child_loads={} invocations={} statuses={:?}",
+        source.loads("child"),
+        result.invocations.len(),
+        result.invocations.iter().map(|event| event.status).collect::<Vec<_>>()
+    );
+    assert_eq!(source.loads("child"), n, "the engine pass recomputes no child");
+    assert_eq!(source.loads("parent"), 1);
+    assert_eq!(result.invocations.len(), 2 * n);
+    let (attempt, engine_pass) = result.invocations.split_at(n);
+    assert!(attempt.iter().all(|event| event.status == CallStatus::Completed && event.stack == [PARENT]));
+    assert!(engine_pass.iter().all(|event| event.status == CallStatus::Memoized && event.stack == [PARENT]));
+    for event in engine_pass {
+        let source_event = &attempt[event.memo_of.expect("memo_of")];
+        assert_eq!(source_event.inputs, event.inputs, "hit keyed on the same inputs");
+        assert_eq!(source_event.matrix, event.matrix);
+        let expected = child_only.invocations.iter().find(|call| call.inputs == event.inputs).expect("same call");
+        assert_eq!(expected.matrix, event.matrix, "answer equals the child-only path");
+    }
+    let memo = result.call_memo.as_ref().expect("memo report");
+    assert_eq!(memo.hits, n as u64);
+
+    // C3: the attempt's timings are merged into the request's.
+    let compiled_seconds = match result.timings.0.get("compiled_seconds") {
+        Some(formualizer_modelcall::receipt::TimingValue::Seconds(seconds)) => *seconds,
+        other => panic!("compiled_seconds: {other:?}"),
+    };
+    assert!(compiled_seconds > 0.0, "the attempt's compiled_seconds is kept");
 }

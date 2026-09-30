@@ -341,3 +341,103 @@ fn prefetched_batch_child_attempt_sees_the_request_context() {
         }
     }
 }
+
+/// A.1: an engine-served batch child whose `MDL.CALLMODEL` routes to a native
+/// compiled grandchild. The batch scenario's engine fallthrough runs under
+/// the request context (the whole scenario is wrapped, as the per-flight
+/// `SubRequestEvaluator` wraps `calculate_child`), so the grandchild routes
+/// `compiled`. Before the fix only `hook.attempt` was wrapped: the grandchild
+/// declined `engine:no_request_context` and fell to an engine grandchild this
+/// source cannot load, failing every scenario.
+#[test]
+fn batch_engine_child_calls_a_native_grandchild_under_the_request_context() {
+    use formualizer_modelcall::batch_child::BatchChildEvaluator;
+    use formualizer_modelcall::evaluator::{CancelToken, ChildEvaluator, ChildRequest};
+    use formualizer_modelcall::prefetch::ChildBatchEvaluator;
+    use formualizer_modelcall::session::SubRequestEvaluator;
+
+    const ENGINE_CHILD: &str = "engine-child";
+
+    /// Loads only the engine child: C1 calls the native grandchild.
+    #[derive(Default)]
+    struct EngineChildSource {
+        loads: Mutex<Vec<String>>,
+    }
+
+    impl WorkbookSource for EngineChildSource {
+        fn load(&self, spec: &ModelSpec, context: &CalculationContext) -> Result<Workbook, ModelCallError> {
+            self.loads.lock().unwrap().push(spec.workbook_sha256.clone());
+            if spec.workbook_sha256 != ENGINE_CHILD {
+                return Err(ModelCallError::infrastructure("FileNotFoundError", "no engine grandchild in this test"));
+            }
+            let mut workbook = Workbook::new_with_config(runtime_workbook_config(context.random_seed));
+            workbook.add_sheet("Calc").unwrap();
+            workbook.set_formula("Calc", 1, 3, "=MDL.CALLMODEL(\"rates/grand\",0,\"result\",\"amount\",A1*10)").unwrap();
+            workbook.set_formula("Calc", 5, 1, "=A1+SUM(A10:C11)").unwrap();
+            Ok(workbook)
+        }
+    }
+
+    let package: Arc<ModelPackage> = Arc::new(
+        serde_json::from_value(json!({
+            "package_id": "stub-a1",
+            "parent": spec_json(PARENT),
+            "children": {"child": spec_json(ENGINE_CHILD), "grand": spec_json(CHILD)},
+            "child_routes": {"rates/child": "child", "rates/grand": "grand"},
+        }))
+        .unwrap(),
+    );
+    let stack = vec![package.parent.model_identity(), package.children.get("child").unwrap().model_identity()];
+    let request = |amount: f64, prefetch_max: u32| {
+        let mut context = context(Operation::Client);
+        context.flags.prefetch_max = prefetch_max;
+        ChildRequest {
+            package: package.clone(),
+            child_version: "child".into(),
+            inputs: vec![("Amount".into(), num(amount)), ("Mode".into(), LiteralValue::Text("plain".into()))],
+            output: "result".into(),
+            stack: stack.clone(),
+            context,
+            cancel: CancelToken::new(),
+        }
+    };
+    // prefetch_max 1: one chunk on the calling thread; 2: one scoped thread per chunk.
+    for prefetch_max in [1, 2] {
+        let requests: Vec<ChildRequest> = [3.0, 4.0].iter().map(|&amount| request(amount, prefetch_max)).collect();
+        let source = Arc::new(EngineChildSource::default());
+        // Only the grandchild is native: the child is engine-served.
+        let hook = hook_of(&[(CHILD, entry(CHILD, "child", false))]);
+        let batch = BatchChildEvaluator::new(source.clone(), Some(hook.clone() as Arc<dyn CompiledChildHook>));
+        let outcomes = batch.evaluate_children(&requests);
+        let routes = CompiledChildHook::report(&*hook);
+        println!("A1 prefetch_max={prefetch_max} routes={:?}", routes.get("routes"));
+        // Per scenario: the engine child (no module: `engine:not_registered`),
+        // then its native grandchild, `compiled` (never `engine:no_request_context`);
+        // parallel chunks interleave, so compare as a sorted list.
+        let mut seen: Vec<String> = routes
+            .get("routes")
+            .and_then(Value::as_array)
+            .map(|routes| routes.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default();
+        seen.sort();
+        assert_eq!(seen, ["compiled", "compiled", "engine:not_registered", "engine:not_registered"], "prefetch_max {prefetch_max}: {routes:?}");
+        assert!(
+            source.loads.lock().unwrap().iter().all(|sha| sha == ENGINE_CHILD),
+            "prefetch_max {prefetch_max}: no engine grandchild loaded"
+        );
+
+        // The same answers and events as the per-flight path.
+        let flight_hook = hook_of(&[(CHILD, entry(CHILD, "child", false))]);
+        let flight = SubRequestEvaluator::new(
+            Arc::new(EngineChildSource::default()),
+            Some(flight_hook as Arc<dyn CompiledChildHook>),
+        );
+        for (outcome, request) in outcomes.iter().zip(&requests) {
+            let expected = flight.evaluate_child(request);
+            let matrix = outcome.result.as_ref().expect("batch scenario answers");
+            assert_eq!(Some(matrix), expected.result.as_ref().ok(), "prefetch_max {prefetch_max}");
+            assert_eq!(outcome.invocations, expected.invocations, "prefetch_max {prefetch_max}");
+            assert!(outcome.invocations.iter().all(|event| event.route == Some(json!("compiled"))));
+        }
+    }
+}
